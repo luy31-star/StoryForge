@@ -1,0 +1,113 @@
+# 全栈：Postgres、Redis、API、Celery Worker/Beat、Nginx 静态前端（反代 /api、/ws）
+# 用法：在项目根目录 vocalflow-studio/ 下准备 .env 后启动（可无密钥先 touch）
+#   cp .env.example .env && 编辑 AI302_API_KEY 等
+#   docker compose up --build -d
+# 访问：http://localhost:8080 ；API 直连调试：http://localhost:8000
+#
+# 基础镜像默认经 DaoCloud 拉取，避免直连 registry-1.docker.io 超时。
+# 能直连 Docker Hub 时可在 .env 设置：DOCKER_HUB_PREFIX=docker.io/library
+
+services:
+  postgres:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+    environment:
+      POSTGRES_DB: vocalflow
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U user -d vocalflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+
+  redis:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 8
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+      args:
+        DOCKER_HUB_PREFIX: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}
+    image: vocalflow-studio-backend
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://127.0.0.1:3000
+      # 与 Bucket 地域一致；未在 .env 写 OSS_REGION 时默认北京（华北2）
+      OSS_REGION: ${OSS_REGION:-cn-beijing}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-oss-cn-beijing.aliyuncs.com}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+    env_file:
+      - .env
+    volumes:
+      - novel_uploads:/app/backend/uploads/novels
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  celery-worker:
+    image: vocalflow-studio-backend
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app worker -l info -Q vocalflow,celery
+    environment:
+      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      REDIS_URL: redis://redis:6379/0
+      OSS_REGION: ${OSS_REGION:-cn-beijing}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-oss-cn-beijing.aliyuncs.com}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+    env_file:
+      - .env
+    volumes:
+      - novel_uploads:/app/backend/uploads/novels
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  celery-beat:
+    image: vocalflow-studio-backend
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app beat -l info
+    environment:
+      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      REDIS_URL: redis://redis:6379/0
+      OSS_REGION: ${OSS_REGION:-cn-beijing}
+      OSS_ENDPOINT: ${OSS_ENDPOINT:-oss-cn-beijing.aliyuncs.com}
+      OSS_BUCKET: ${OSS_BUCKET:-}
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        DOCKER_HUB_PREFIX: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  novel_uploads:

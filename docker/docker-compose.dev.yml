@@ -1,0 +1,84 @@
+# 基础镜像默认经 DaoCloud；海外可在项目根 .env 设 DOCKER_HUB_PREFIX=docker.io/library
+
+services:
+  frontend:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/node:20-alpine
+    working_dir: /app
+    volumes:
+      - ../frontend:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "3000:3000"
+    environment:
+      - VITE_API_BASE=
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+      args:
+        DOCKER_HUB_PREFIX: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}
+    image: vocalflow-studio-backend-dev
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - REDIS_URL=redis://redis:6379/0
+      - CORS_ORIGINS=http://localhost:3000
+    env_file:
+      - ../.env
+    volumes:
+      - ../backend/uploads/novels:/app/backend/uploads/novels
+    depends_on:
+      - postgres
+      - redis
+
+  celery-worker:
+    image: vocalflow-studio-backend-dev
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app worker -l info -Q vocalflow
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../.env
+    volumes:
+      - ../backend/uploads/novels:/app/backend/uploads/novels
+    depends_on:
+      - postgres
+      - redis
+      - backend
+
+  celery-beat:
+    image: vocalflow-studio-backend-dev
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app beat -l info
+    environment:
+      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - REDIS_URL=redis://redis:6379/0
+    env_file:
+      - ../.env
+    depends_on:
+      - redis
+      - backend
+
+  postgres:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+    environment:
+      POSTGRES_DB: vocalflow
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  redis:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/redis:alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  pgdata:

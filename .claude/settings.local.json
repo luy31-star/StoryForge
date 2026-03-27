@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -m py_compile app/services/novel_repo.py)",
+      "Bash(python3 -m py_compile app/services/novel_llm_service.py)",
+      "Bash(xxd)",
+      "Bash(python -m py_compile app/services/novel_llm_service.py)",
+      "Bash(python3 -m py_compile app/core/config.py)",
+      "Bash(cd:*)",
+      "Bash(python3:*)",
+      "Bash(git checkout:*)",
+      "Bash(# 恢复备份\ncp app/services/novel_llm_service.py.bak app/services/novel_llm_service.py\n# 验证原始文件语法\npython3 -m py_compile app/services/novel_llm_service.py && echo \"Original file OK\")"
+    ]
+  }
+}

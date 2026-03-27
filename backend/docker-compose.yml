@@ -1,0 +1,21 @@
+# 可选：项目根 .env 中 DOCKER_HUB_PREFIX=docker.io/library 使用官方源
+
+services:
+  postgres:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+    environment:
+      POSTGRES_DB: vocalflow
+      POSTGRES_USER: user
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/redis:alpine
+    ports:
+      - "6379:6379"
+
+volumes:
+  postgres_data:

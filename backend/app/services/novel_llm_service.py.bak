@@ -1,0 +1,1146 @@
+from __future__ import annotations
+
+import json
+import logging
+import re
+import time
+from collections.abc import AsyncIterator
+
+from app.core.config import settings
+from app.models.novel import Chapter, Novel
+from app.services.llm_router import LLMProvider, LLMRouter
+from app.services.novel_repo import (
+    build_hot_memory_for_prompt,
+    format_cold_recall_block,
+    format_canonical_timeline_block,
+    format_open_plots_block,
+    format_volume_event_summary,
+    format_volume_progress_anchor,
+    chapter_execution_rules_block,
+    outline_beat_hint,
+    pacing_guard_block,
+    process_chapter_suggestions_block,
+    truncate_framework_json,
+)
+from app.services.novel_storage import load_reference_text_for_llm
+
+logger = logging.getLogger(__name__)
+
+
+def _chapter_messages(
+    novel: Novel,
+    chapter_no: int,
+    chapter_title_hint: str,
+    memory_json: str,
+    continuity_excerpt: str,
+    recent_full_context: str = "",
+    chapter_plan_hint: str = "",
+    db: Any = None,
+    *,
+    use_cold_recall: bool = False,
+    cold_recall_items: int = 5,
+) -> list[dict[str, str]]:
+    bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
+    fj_block = truncate_framework_json(novel.framework_json or "", 8000)
+    beat = outline_beat_hint(chapter_no, novel.framework_json or "")
+    hot_memory_json = build_hot_memory_for_prompt(
+        memory_json,
+        timeline_hot_n=settings.novel_timeline_hot_n,
+        open_plots_hot_max=settings.novel_open_plots_hot_max,
+        characters_hot_max=settings.novel_characters_hot_max,
+    )
+    open_plots = format_open_plots_block(memory_json)
+    canonical_timeline = format_canonical_timeline_block(memory_json, chapter_no)
+    pacing_guard = pacing_guard_block(chapter_no, novel.framework_json or "", memory_json)
+    chapter_rules = chapter_execution_rules_block(chapter_no)
+    process_suggest = process_chapter_suggestions_block(
+        chapter_no, novel.framework_json or "", memory_json
+    )
+
+    # 新增：卷进度锚点和卷事件摘要
+    volume_progress = ""
+    volume_events = ""
+    if db:
+        try:
+            volume_progress = format_volume_progress_anchor(
+                db, novel.id, chapter_no, novel.framework_json or ""
+            )
+            volume_events = format_volume_event_summary(db, novel.id, chapter_no)
+        except Exception:
+            # 如果失败，不影响主流程
+            pass
+
+    sys = (
+        "你是小说作者。世界观、人物与已定设定以【框架 Markdown / 框架 JSON / 结构化记忆】为准，不得无故改写或吃书；"
+        "world_rules 与框架 JSON 中明确写死的规则优先于自由发挥。"
+        "结构化记忆里的 canonical_timeline 为规范因果链，写作时以它为准对齐关键事实。"
+        "若记忆 JSON 与更早正文冲突，以记忆与最近章节为准；若与框架 world_rules 冲突，仍以框架为准并自然收束。"
+        "若用户消息中含【本章计划】且列有禁止项（must_not）或延后解锁（reserved_for_later），其优先级高于自由发挥，正文中不得违反。"
+        "输出本章正文，不要输出元解释。"
+        "输出格式强约束：第一行必须是“第N章《章名》”（N 必须与当前章节号一致），第二行空行后再写正文。"
+    )
+    user_parts = [
+        f"【世界观与框架摘要（Markdown）】\n{bible}",
+        f"【框架 JSON（大纲/规则锚点，截断）】\n{fj_block}",
+        f"【当前结构化记忆（热层 JSON，仅注入最近关键状态）】\n{hot_memory_json}",
+    ]
+    if canonical_timeline:
+        user_parts.append(canonical_timeline)
+    if open_plots:
+        user_parts.append(open_plots)
+    if use_cold_recall:
+        cold_block = format_cold_recall_block(
+            memory_json, max_items=max(1, min(cold_recall_items, 12))
+        )
+        if cold_block:
+            user_parts.append(cold_block)
+
+    # 新增：卷级上下文（在摘录之前，提供整体视图）
+    if volume_progress:
+        user_parts.append(volume_progress)
+    if volume_events:
+        user_parts.append(volume_events)
+
+    user_parts.append(
+        f"【前文衔接摘录（含再前一章与上一章结尾，若有）】\n{continuity_excerpt or '（首章）'}"
+    )
+    if recent_full_context:
+        user_parts.append(recent_full_context)
+    user_parts.append(beat)
+    user_parts.append(pacing_guard)
+    user_parts.append(chapter_rules)
+    user_parts.append(process_suggest)
+    if chapter_plan_hint:
+        user_parts.append(chapter_plan_hint)
+    user_parts.append(
+        f"请写第 {chapter_no} 章"
+        f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}。"
+    )
+    user_parts.append(
+        "【统一输出规则】\n"
+        f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
+        "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
+        "3) 第二行留空一行，再开始正文。"
+    )
+    user = "\n\n".join(user_parts)
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def _revise_chapter_messages(
+    novel: Novel,
+    chapter: Chapter,
+    memory_json: str,
+    feedback_bodies: list[str],
+    user_prompt: str,
+) -> list[dict[str, str]]:
+    bible = novel.framework_markdown[:8000] if novel.framework_markdown else novel.background
+    fj_block = truncate_framework_json(novel.framework_json or "", 6000)
+    fb = "\n".join(f"- {b}" for b in feedback_bodies) or "（无）"
+    sys = (
+        "你是资深小说编辑。在保持世界观与人物一致的前提下，根据历史反馈意见与用户最新指令，"
+        "对章节全文进行改写。框架 JSON 中的 world_rules 与已定设定不得被改稿推翻；只输出改写后的正文，"
+        "不要前言、标题解释或 Markdown 围栏。"
+    )
+    user = (
+        f"【框架摘要（Markdown）】\n{bible}\n\n"
+        f"【框架 JSON（锚点）】\n{fj_block}\n\n"
+        f"【结构化记忆 JSON】\n{memory_json}\n\n"
+        f"第 {chapter.chapter_no} 章《{chapter.title}》\n\n"
+        f"【当前正文（正式稿）】\n{chapter.content}\n\n"
+        f"【历史改进意见】\n{fb}\n\n"
+        f"【用户本次指令】\n{user_prompt}"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def _check_and_fix_chapter_messages(
+    novel: Novel,
+    chapter_no: int,
+    chapter_title_hint: str,
+    memory_json: str,
+    continuity_excerpt: str,
+    chapter_text: str,
+) -> list[dict[str, str]]:
+    bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
+    fj_block = truncate_framework_json(novel.framework_json or "", 6000)
+    sys = (
+        "你是小说一致性编辑。你的任务是对"待核对正文"做最小修改，解决设定漂移与前后因果断裂。"
+        "严格遵守世界观与人物设定，必要时以【框架 JSON】与 world_rules 为准修正正文。"
+        "canonical_timeline 作为规范因果链：若正文与时间线关键事实冲突，必须修正正文。"
+        "输出只允许包含"修订后的正文内容本体"，不得输出标题、前言、解释或 Markdown 围栏。"
+    )
+    user = (
+        f"【框架 Markdown】\n{bible}\n\n"
+        f"【框架 JSON（锚点，截断）】\n{fj_block}\n\n"
+        f"【结构化记忆 JSON（含 canonical_timeline 与 open_plots）】\n{memory_json}\n\n"
+        f"【本章信息】第 {chapter_no} 章"
+        f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}\n\n"
+        f"【前文衔接摘录（含再前一章与上一章结尾）】\n{continuity_excerpt or '（首章）'}\n\n"
+        f"【待核对正文】\n{chapter_text}\n\n"
+        "【要求】\n"
+        "1) 若发现与 world_rules/canonical_timeline 冲突，必须修正正文；不得只做说明。\n"
+        "2) 允许做必要的因果补线、人物状态修正、伏笔承接与收束呈现，但不要大幅重写风格。\n"
+        "3) 只输出最终正文。"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+class NovelLLMService:
+    """小说相关 302 Chat；默认智谱 GLM-4.7，可按配置开启联网搜索。"""
+
+    def __init__(self) -> None:
+        self._client = None
+
+    def _router(self, *, provider: str | None = None, model: str | None = None) -> LLMRouter:
+        p = (provider or settings.llm_provider or "ai302").strip().lower()
+        if p not in ("ai302", "custom"):
+            p = "ai302"
+        return LLMRouter(provider=p, model=model)
+
+    def _novel_web_search(self) -> bool:
+        return settings.ai302_novel_web_search
+
+    @staticmethod
+    def _messages_chars(messages: list[dict[str, str]]) -> int:
+        return sum(len(m.get("content", "")) for m in messages)
+
+    async def inspiration_chat(self, messages: list[dict[str, str]]) -> str:
+        """新建小说阶段：多轮对话 + 强制联网搜索，获取创作灵感。"""
+        router = self._router()
+        system = (
+            "你是网络小说策划助手。请使用联网搜索能力，根据用户问题检索题材热点、类型套路、设定参考，"
+            "并给出可执行的创作灵感。回答尽量结构化，可包含：题材方向、核心冲突、人设建议、世界观要点、文风提示。"
+            "若用户希望填入表单，请在末段用简短列表对应：书名建议、简介要点、背景设定要点、文风关键词。"
+        )
+        out: list[dict[str, str]] = [{"role": "system", "content": system}]
+        for m in messages:
+            role = m.get("role", "user")
+            if role not in ("user", "assistant", "system"):
+                continue
+            out.append({"role": role, "content": m["content"]})
+        return await router.chat_text(
+            messages=out,
+            temperature=0.75,
+            web_search=True,
+            timeout=600.0,
+        )
+
+    async def inspiration_chat_stream(
+        self, messages: list[dict[str, str]]
+    ) -> AsyncIterator[dict[str, str]]:
+        router = self._router()
+        system = (
+            "你是网络小说策划助手。请使用联网搜索能力，根据用户问题检索题材热点、类型套路、设定参考，"
+            "并给出可执行的创作灵感。回答尽量结构化，可包含：题材方向、核心冲突、人设建议、世界观要点、文风提示。"
+            "若用户希望填入表单，请在末段用简短列表对应：书名建议、简介要点、背景设定要点、文风关键词。"
+        )
+        out: list[dict[str, str]] = [{"role": "system", "content": system}]
+        for m in messages:
+            role = m.get("role", "user")
+            if role not in ("user", "assistant", "system"):
+                continue
+            out.append({"role": role, "content": m["content"]})
+        async for evt in router.chat_text_stream(
+            messages=out,
+            temperature=0.75,
+            web_search=True,
+            timeout=600.0,
+        ):
+            yield evt
+
+    async def chapter_context_chat(
+        self,
+        novel: Novel,
+        *,
+        memory_json: str,
+        approved_chapters_summary: str,
+        continuity_excerpt: str,
+        messages: list[dict[str, str]],
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
+    ) -> str:
+        """章节侧问答：基于小说框架、记忆与已写章节上下文回答问题。"""
+        router = self._router(provider=llm_provider, model=llm_model)
+        bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
+        fj_block = truncate_framework_json(novel.framework_json or "", 8000)
+        hot_memory_json = build_hot_memory_for_prompt(
+            memory_json,
+            timeline_hot_n=settings.novel_timeline_hot_n,
+            open_plots_hot_max=settings.novel_open_plots_hot_max,
+            characters_hot_max=settings.novel_characters_hot_max,
+        )
+        sys = (
+            "你是小说章节助手。请严格基于用户提供的小说上下文回答："
+            "框架 Markdown、框架 JSON、结构化记忆、已写章节摘录。"
+            "目标：帮助用户判断设定一致性、续写方向、伏笔回收、人物动机、节奏与冲突设计。"
+            "若上下文中没有明确依据，请明确说明"当前信息不足"，并给出最小化假设选项。"
+            "不要编造未提供的硬设定。回答尽量简洁、可执行。"
+        )
+        context_user = (
+            f"【小说标题】{novel.title}\n\n"
+            f"【框架 Markdown】\n{bible}\n\n"
+            f"【框架 JSON（截断）】\n{fj_block}\n\n"
+            f"【结构化记忆（热层）】\n{hot_memory_json}\n\n"
+            f"【已审定章节摘要（近段）】\n{approved_chapters_summary or '（暂无）'}\n\n"
+            f"【连续性衔接摘录】\n{continuity_excerpt or '（暂无）'}"
+        )
+        out: list[dict[str, str]] = [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": context_user},
+        ]
+        for m in messages:
+            role = m.get("role", "user")
+            if role not in ("user", "assistant", "system"):
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            out.append({"role": role, "content": content})
+
+        return await router.chat_text(
+            messages=out,
+            temperature=0.45,
+            web_search=False,
+            timeout=600.0,
+        )
+
+    async def chapter_context_chat_stream(
+        self,
+        novel: Novel,
+        *,
+        memory_json: str,
+        approved_chapters_summary: str,
+        continuity_excerpt: str,
+        messages: list[dict[str, str]],
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
+    ) -> AsyncIterator[dict[str, str]]:
+        router = self._router(provider=llm_provider, model=llm_model)
+        bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
+        fj_block = truncate_framework_json(novel.framework_json or "", 8000)
+        hot_memory_json = build_hot_memory_for_prompt(
+            memory_json,
+            timeline_hot_n=settings.novel_timeline_hot_n,
+            open_plots_hot_max=settings.novel_open_plots_hot_max,
+            characters_hot_max=settings.novel_characters_hot_max,
+        )
+        sys = (
+            "你是小说章节助手。请严格基于用户提供的小说上下文回答："
+            "框架 Markdown、框架 JSON、结构化记忆、已写章节摘录。"
+            "目标：帮助用户判断设定一致性、续写方向、伏笔回收、人物动机、节奏与冲突设计。"
+            "若上下文中没有明确依据，请明确说明"当前信息不足"，并给出最小化假设选项。"
+            "不要编造未提供的硬设定。回答尽量简洁、可执行。"
+        )
+        context_user = (
+            f"【小说标题】{novel.title}\n\n"
+            f"【框架 Markdown】\n{bible}\n\n"
+            f"【框架 JSON（截断）】\n{fj_block}\n\n"
+            f"【结构化记忆（热层）】\n{hot_memory_json}\n\n"
+            f"【已审定章节摘要（近段）】\n{approved_chapters_summary or '（暂无）'}\n\n"
+            f"【连续性衔接摘录】\n{continuity_excerpt or '（暂无）'}"
+        )
+        out: list[dict[str, str]] = [
+            {"role": "system", "content": sys},
+            {"role": "user", "content": context_user},
+        ]
+        for m in messages:
+            role = m.get("role", "user")
+            if role not in ("user", "assistant", "system"):
+                continue
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            out.append({"role": role, "content": content})
+        async for evt in router.chat_text_stream(
+            messages=out,
+            temperature=0.45,
+            web_search=False,
+            timeout=600.0,
+        ):
+            yield evt
+
+    async def generate_framework(self, novel: Novel) -> tuple[str, str]:
+        """返回 (markdown 正文, 尽力解析的 json 字符串)。"""
+        router = self._router()
+        ref = load_reference_text_for_llm(
+            novel.reference_storage_key,
+            novel.id,
+            novel.reference_public_url,
+        )
+        sys = (
+            "你是资深网文策划与世界观编辑。输出两部分：1) 完整可读 Markdown 设定与大纲；"
+            "2) 末尾单独一个 JSON 代码块，包含 "
+            "world_rules, main_plot, arcs, characters[{name,role,traits}], themes 等键。"
+            "参考文本仅借鉴结构与文风，禁止抄袭原句。"
+        )
+        target_chapters = int(getattr(novel, "target_chapters", 0) or 0)
+        volume_size = 50
+        volume_n = (target_chapters + volume_size - 1) // volume_size if target_chapters > 0 else 0
+        user = (
+            f"书名：{novel.title}\n简介：{novel.intro}\n"
+            f"背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"目标章节数：{target_chapters}\n"
+            f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n"
+            '要求：剧情框架必须按卷拆分 arcs，每个 arc 需明确章节范围（from_chapter/to_chapter 或 chapters: "x-y"），'
+            "并确保覆盖第1章到第N章（N=目标章节数）。\n\n"
+            f"参考文本节选：\n{ref or '（无）'}"
+        )
+        text = await router.chat_text(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.6,
+            web_search=self._novel_web_search(),
+            timeout=600.0,
+        )
+        json_part = "{}"
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            try:
+                json.loads(m.group(1).strip())
+                json_part = m.group(1).strip()
+            except json.JSONDecodeError:
+                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
+        return text, json_part
+
+    async def generate_volume_chapter_plan_json(
+        self,
+        novel: Novel,
+        *,
+        volume_no: int,
+        volume_title: str,
+        from_chapter: int,
+        to_chapter: int,
+        memory_json: str,
+    ) -> str:
+        """
+        生成整卷章计划（严格 JSON 文本）。该 JSON 会由路由解析并落库。
+        采用分批生成策略，避免单次请求超时，同时保证批次间剧情连续性。
+        """
+        batch_size = max(1, settings.novel_volume_plan_batch_size)
+        total_chapters = to_chapter - from_chapter + 1
+
+        # 如果章节数不超过批次大小，直接单次生成
+        if total_chapters <= batch_size:
+            return await self._generate_single_batch_plan(
+                novel=novel,
+                volume_no=volume_no,
+                volume_title=volume_title,
+                from_chapter=from_chapter,
+                to_chapter=to_chapter,
+                memory_json=memory_json,
+                prev_batch_context="",
+            )
+
+        # 分批生成
+        all_chapters: list[dict] = []
+        prev_batch_context = ""
+        batch_num = 0
+
+        for batch_start in range(from_chapter, to_chapter + 1, batch_size):
+            batch_end = min(batch_start + batch_size - 1, to_chapter)
+            batch_num += 1
+            logger.info(
+                "generate_volume_chapter_plan batch %d | chapters %d-%d | total %d",
+                batch_num,
+                batch_start,
+                batch_end,
+                total_chapters,
+            )
+
+            batch_json_str = await self._generate_single_batch_plan(
+                novel=novel,
+                volume_no=volume_no,
+                volume_title=volume_title,
+                from_chapter=batch_start,
+                to_chapter=batch_end,
+                memory_json=memory_json,
+                prev_batch_context=prev_batch_context,
+            )
+
+            # 解析批次结果
+            try:
+                batch_data = json.loads(batch_json_str)
+            except json.JSONDecodeError:
+                # 尝试提取 JSON
+                m = re.search(r"\{[\s\S]*\}", batch_json_str)
+                if m:
+                    batch_data = json.loads(m.group(0))
+                else:
+                    raise RuntimeError(f"批次 {batch_num} 返回非法 JSON")
+
+            chapters = batch_data.get("chapters", [])
+            if not isinstance(chapters, list):
+                chapters = []
+
+            # 验证章节号连续性
+            expected_start = batch_start
+            for i, ch in enumerate(chapters):
+                if isinstance(ch, dict):
+                    ch_no = ch.get("chapter_no")
+                    if ch_no != expected_start + i:
+                        ch["chapter_no"] = expected_start + i
+
+            all_chapters.extend(chapters)
+
+            # 构建下一批次的上下文（最后2章的关键信息）
+            prev_batch_context = self._build_next_batch_context(
+                chapters=chapters,
+                volume_title=volume_title,
+            )
+
+        # 合并结果
+        result = {
+            "volume_title": volume_title,
+            "volume_summary": f"第{volume_no}卷，共{len(all_chapters)}章",
+            "chapters": all_chapters,
+        }
+        return json.dumps(result, ensure_ascii=False)
+
+    async def _generate_single_batch_plan(
+        self,
+        novel: Novel,
+        *,
+        volume_no: int,
+        volume_title: str,
+        from_chapter: int,
+        to_chapter: int,
+        memory_json: str,
+        prev_batch_context: str = "",
+    ) -> str:
+        """生成单批次章计划"""
+        router = self._router()
+        sys = (
+            "你是网络小说总策划。请为指定章节区间生成"章计划"，用于后续逐章写作。"
+            "你必须严格输出一个 JSON 对象，不要输出任何解释性文字、不要 Markdown、不要代码块围栏。"
+            "输出必须以 { 开头，以 } 结尾；除 JSON 外不得包含任何字符。"
+        )
+
+        # 构建前文上下文提示
+        continuity_hint = ""
+        if prev_batch_context:
+            continuity_hint = (
+                "\n\n【前批次剧情衔接（必须承接）】\n"
+                f"{prev_batch_context}\n"
+                "要求：本章计划必须自然承接前批次的剧情走向、人物状态和未完结线索；"
+                "open_plots_intent_added 若在前批次已出现，本章不得重复声明（除非是新的分支）。\n"
+            )
+
+        user = (
+            f"【小说标题】{novel.title}\n"
+            f"【卷信息】第{volume_no}卷《{volume_title}》，本批次章节范围：第{from_chapter}章-第{to_chapter}章\n\n"
+            f"【框架 Markdown（摘要）】\n{(novel.framework_markdown or novel.background or '')[:8000]}\n\n"
+            f"【框架 JSON】\n{novel.framework_json or '{}'}\n\n"
+            f"【结构化记忆（open_plots/canonical_timeline 等）】\n{memory_json}\n"
+            f"{continuity_hint}"
+            "【输出要求（严格 JSON）】\n"
+            "{\n"
+            '  \"volume_title\": string,\n'
+            '  \"volume_summary\": string,\n'
+            '  \"chapters\": [\n'
+            "    {\n"
+            '      \"chapter_no\": number,\n'
+            '      \"title\": string,\n'
+            '      \"beats\": {\n'
+            '        \"goal\": string,\n'
+            '        \"conflict\": string,\n'
+            '        \"turn\": string,\n'
+            '        \"hook\": string,\n'
+            '        \"plot_summary\": string,\n'
+            '        \"progress_allowed\": string 或 string[],\n'
+            '        \"must_not\": string[],\n'
+            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ]\n'
+            "      },\n"
+            '      \"open_plots_intent_added\": string[],\n'
+            '      \"open_plots_intent_resolved\": string[]\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "beats 字段说明：plot_summary 为本章剧情梗概（约 3～8 句）：场景、人物行为、读者可知信息边界、章末停笔点；"
+            "progress_allowed 写明本章允许推进的内容；must_not 列出本章绝对不得出现的情节、能力觉醒、设定点名、剧透；"
+            "reserved_for_later 列出须延后到指定章节号及之后才允许在正文成真或点名的条目（not_before_chapter 为全局章节号）。\n\n"
+            "【硬约束】\n"
+            f"1) chapters 数组必须覆盖本批次每一章（从 {from_chapter} 到 {to_chapter}），chapter_no 必须连续且从 {from_chapter} 开始；\n"
+            "2) 每章 beats 必须体现"只推进一个小节拍"（不要一章跨多个大事件）；\n"
+            "3) 每章 open_plots_intent_resolved 最多 1 条（可以为空），避免清坑过猛导致快进；\n"
+            "4) 若本批次非卷末，章末应自然过渡到下一章，但不得提前解决后续大事件；\n"
+            "5) 必须通读【框架 JSON】中的 arcs、人物、金手指/能力、主线节点；若大纲写明某能力/身份/真相"第 N 章"才觉醒或揭露，"
+            "则所有 chapter_no < N 的章，beats.must_not 必须包含对应的禁止描述（如不得觉醒、不得点名该能力真名、不得让配角知晓等），"
+            "且 plot_summary/turn/hook 不得写到该事件的结果；\n"
+            "6) 每章 plot_summary 仅允许写本章内发生的事，不得写到后续章的结局或后验信息；\n"
+            "7) 输出前自检：若某章 plot_summary、turn 或 hook 与该章 must_not、或 reserved_for_later 中 not_before_chapter 大于该章 chapter_no 的条目冲突，必须改写该章直至一致；\n"
+            "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致。\n"
+        )
+        return await router.chat_text(
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.55,
+            web_search=False,
+            timeout=settings.novel_volume_plan_batch_timeout,
+        )
+
+    def _build_next_batch_context(
+        self,
+        chapters: list[dict],
+        volume_title: str,
+    ) -> str:
+        """构建下一批次的衔接上下文"""
+        if not chapters:
+            return ""
+
+        # 取最后2章（或更少）的关键信息
+        tail_chapters = chapters[-2:] if len(chapters) >= 2 else chapters
+
+        context_parts = []
+        for ch in tail_chapters:
+            if not isinstance(ch, dict):
+                continue
+            ch_no = ch.get("chapter_no", "?")
+            title = ch.get("title", "")
+            beats = ch.get("beats", {})
+            plot_summary = beats.get("plot_summary", "") if isinstance(beats, dict) else ""
+            hook = beats.get("hook", "") if isinstance(beats, dict) else ""
+
+            # 收集新增和解决的 open_plots
+            added = ch.get("open_plots_intent_added", [])
+            resolved = ch.get("open_plots_intent_resolved", [])
+
+            context_parts.append(
+                f"第{ch_no}章《{title}》:\n"
+                f"  剧情梗概: {plot_summary[:500] if plot_summary else '（无）'}\n"
+                f"  章末钩子: {hook[:200] if hook else '（无）'}\n"
+                f"  新增线索: {json.dumps(added, ensure_ascii=False) if added else '[]'}\n"
+                f"  解决线索: {json.dumps(resolved, ensure_ascii=False) if resolved else '[]'}\n"
+            )
+
+        # 汇总当前活跃的 open_plots
+        active_plots = set()
+        for ch in chapters:
+            if isinstance(ch, dict):
+                for p in ch.get("open_plots_intent_added", []):
+                    if isinstance(p, str) and p.strip():
+                        active_plots.add(p.strip())
+                for p in ch.get("open_plots_intent_resolved", []):
+                    if isinstance(p, str) and p.strip():
+                        active_plots.discard(p.strip())
+
+        summary = "\n".join(context_parts)
+        if active_plots:
+            summary += f"\n当前批次遗留的活跃线索（后续需承接或解决）:\n{json.dumps(list(active_plots), ensure_ascii=False)}\n"
+
+        return summary
+
+    async def generate_chapter(
+        self,
+        novel: Novel,
+        chapter_no: int,
+        chapter_title_hint: str,
+        memory_json: str,
+        continuity_excerpt: str,
+        recent_full_context: str = "",
+        chapter_plan_hint: str = "",
+        db: Any = None,
+        *,
+        use_cold_recall: bool = False,
+        cold_recall_items: int = 5,
+        llm_provider: str | None = None,
+        llm_model: str | None = None,
+    ) -> str:
+        router = self._router(provider=llm_provider, model=llm_model)
+        messages = _chapter_messages(
+            novel,
+            chapter_no,
+            chapter_title_hint,
+            memory_json,
+            continuity_excerpt,
+            recent_full_context,
+            chapter_plan_hint,
+            db=db,
+            use_cold_recall=use_cold_recall,
+            cold_recall_items=cold_recall_items,
+        )
+        model = llm_model or settings.llm_model or settings.ai302_novel_model
+        web_search = self._novel_web_search()
+        timeout = 600.0
+        start = time.perf_counter()
+        logger.info(
+            "generate_chapter start | novel_id=%s chapter_no=%s model=%s web_search=%s cold_recall=%s cold_items=%s msg_chars=%s mem_chars=%s continuity_chars=%s",
+            novel.id,
+            chapter_no,
+            model,
+            web_search,
+            use_cold_recall,
+            cold_recall_items,
+            self._messages_chars(messages),
+            len(memory_json or ""),
+            len(continuity_excerpt or ""),
+        )
+        try:
+            out = await router.chat_text(
+                messages=messages,
+                temperature=0.75,
+                web_search=web_search,
+                timeout=timeout,
+            )
+            return out
+        finally:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "generate_chapter done | novel_id=%s chapter_no=%s elapsed=%.2fs",
+                novel.id,
+                chapter_no,
+                elapsed,
+            )
+
+    def generate_chapter_sync(
+        self,
+        novel: Novel,
+        chapter_no: int,
+        chapter_title_hint: str,
+        memory_json: str,
+        continuity_excerpt: str,
+        recent_full_context: str = "",
+        db: Any = None,
+        *,
+        use_cold_recall: bool = False,
+        cold_recall_items: int = 5,
+    ) -> str:
+        # 同步接口目前仅用于 Celery 侧，仍保持走 302 OpenAI 兼容以避免额外适配。
+        from app.services.ai302_client import AI302Client
+
+        c = AI302Client()
+        if not c.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+        messages = _chapter_messages(
+            novel,
+            chapter_no,
+            chapter_title_hint,
+            memory_json,
+            continuity_excerpt,
+            recent_full_context,
+            db=db,
+            use_cold_recall=use_cold_recall,
+            cold_recall_items=cold_recall_items,
+        )
+        model = settings.ai302_novel_model
+        web_search = self._novel_web_search()
+        timeout = 600.0
+        start = time.perf_counter()
+        logger.info(
+            "generate_chapter_sync start | novel_id=%s chapter_no=%s model=%s web_search=%s cold_recall=%s cold_items=%s msg_chars=%s",
+            novel.id,
+            chapter_no,
+            model,
+            web_search,
+            use_cold_recall,
+            cold_recall_items,
+            self._messages_chars(messages),
+        )
+        try:
+            return c.chat_completions_sync(
+                messages=messages,
+                model=model,
+                temperature=0.75,
+                timeout=timeout,
+                web_search=web_search,
+            )
+        finally:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "generate_chapter_sync done | novel_id=%s chapter_no=%s elapsed=%.2fs",
+                novel.id,
+                chapter_no,
+                elapsed,
+            )
+
+    async def check_and_fix_chapter(
+        self,
+        novel: Novel,
+        chapter_no: int,
+        chapter_title_hint: str,
+        memory_json: str,
+        continuity_excerpt: str,
+        chapter_text: str,
+    ) -> str:
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+        messages = _check_and_fix_chapter_messages(
+            novel,
+            chapter_no,
+            chapter_title_hint,
+            memory_json,
+            continuity_excerpt,
+            chapter_text,
+        )
+        start = time.perf_counter()
+        logger.info(
+            "check_and_fix_chapter start | novel_id=%s chapter_no=%s msg_chars=%s text_chars=%s",
+            novel.id,
+            chapter_no,
+            self._messages_chars(messages),
+            len(chapter_text or ""),
+        )
+        try:
+            return await self._client.chat_completions(
+                messages=messages,
+                model=self._model(),
+                temperature=settings.novel_consistency_check_temperature,
+                web_search=False,
+                timeout=600.0,
+            )
+        finally:
+            elapsed = time.perf_counter() - start
+            logger.info(
+                "check_and_fix_chapter done | novel_id=%s chapter_no=%s elapsed=%.2fs",
+                novel.id,
+                chapter_no,
+                elapsed,
+            )
+
+    def check_and_fix_chapter_sync(
+        self,
+        novel: Novel,
+        chapter_no: int,
+        chapter_title_hint: str,
+        memory_json: str,
+        continuity_excerpt: str,
+        chapter_text: str,
+    ) -> str:
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+        return self._client.chat_completions_sync(
+            messages=_check_and_fix_chapter_messages(
+                novel,
+                chapter_no,
+                chapter_title_hint,
+                memory_json,
+                continuity_excerpt,
+                chapter_text,
+            ),
+            model=self._model(),
+            temperature=settings.novel_consistency_check_temperature,
+            web_search=False,
+            timeout=600.0,
+        )
+
+    def _parse_refresh_memory_response(self, raw: str) -> str:
+        try:
+            json.loads(raw)
+            return raw
+        except json.JSONDecodeError:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            return m.group(0) if m else "{}"
+
+    async def refresh_memory_from_chapters(
+        self, novel: Novel, chapters_summary: str, prev_memory: str
+    ) -> str:
+        """刷新记忆，支持分批处理避免超时"""
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+
+        batch_chars = settings.novel_memory_refresh_batch_chars
+        summary_len = len(chapters_summary or "")
+
+        # 如果摘要长度不超过批次大小，直接单次处理
+        if batch_chars <= 0 or summary_len <= batch_chars:
+            return await self._refresh_memory_single_batch(
+                novel=novel,
+                chapters_summary=chapters_summary,
+                prev_memory=prev_memory,
+            )
+
+        # 分批处理
+        logger.info(
+            "refresh_memory batch mode | summary_len=%d batch_chars=%d",
+            summary_len,
+            batch_chars,
+        )
+
+        current_memory = prev_memory
+        batch_num = 0
+        pos = 0
+
+        while pos < summary_len:
+            batch_num += 1
+            # 找到合适的截断点（尽量在章节边界）
+            end = min(pos + batch_chars, summary_len)
+            if end < summary_len:
+                # 尝试在章节边界截断（找"第X章"的模式）
+                boundary = chapters_summary.rfind("\n\n第", pos, end)
+                if boundary > pos + batch_chars // 2:
+                    end = boundary
+
+            batch_summary = chapters_summary[pos:end].strip()
+            if not batch_summary:
+                pos = end
+                continue
+
+            logger.info(
+                "refresh_memory batch %d | chars %d-%d",
+                batch_num,
+                pos,
+                end,
+            )
+
+            current_memory = await self._refresh_memory_single_batch(
+                novel=novel,
+                chapters_summary=batch_summary,
+                prev_memory=current_memory,
+            )
+
+            pos = end
+
+        return current_memory
+
+    async def _refresh_memory_single_batch(
+        self,
+        novel: Novel,
+        chapters_summary: str,
+        prev_memory: str,
+    ) -> str:
+        """单批次刷新记忆"""
+        fj = truncate_framework_json(novel.framework_json or "", 6000)
+        sys = (
+            "根据章节摘要更新小说结构化记忆。只输出一个 JSON 对象，包含："
+            "characters[], relations[], inventory[], skills[], pets[], "
+            "open_plots[], canonical_timeline_hot[], canonical_timeline_cold[], "
+            "timeline_archive_summary[], notes（一致性提醒）。不要 Markdown。"
+            "canonical_timeline_hot[] 为热层（仅最近关键条目，默认保留最近 20 条）；"
+            "canonical_timeline_cold[] 为冷层（更早历史条目，默认不直接注入写章）。"
+            "timeline_archive_summary[] 用于定期压缩冷层历史的阶段摘要。"
+            "每个条目建议结构："
+            "{"
+            " chapter_no: number,"
+            " key_facts: string[]（本章确认/新增的稳定事实，尽量可被后文引用）,"
+            " causal_results: string[]（关键因果结果，如谁因为什么改变了局面）,"
+            " open_plots_added: string[]（本章新增的未完结线）,"
+            " open_plots_resolved: string[]（本章收束/解决的未完结线，若无留空）"
+            "}"
+            "合并时不得删除或弱化框架 JSON 中的 world_rules、main_plot 等已定硬约束；"
+            "open_plots 必须只保留"仍活跃未收束"的线索，凡已在 open_plots_resolved 标记解决的线应移出 open_plots。"
+            "只能在新剧情证据下增补角色状态、物品、未完结线；若正文与旧记忆矛盾，以最新审定章节为准并在 notes 中简短说明。"
+        )
+        user = (
+            f"【框架 JSON（锚点，合并后须仍与之兼容；勿删改其中 world_rules 条目，只可增补执行层细节）】\n{fj}\n\n"
+            f"旧记忆：\n{prev_memory}\n\n新章节摘要：\n{chapters_summary}\n"
+            "合并去重，修正矛盾处。"
+        )
+        raw = await self._client.chat_completions(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            model=self._model(),
+            temperature=0.3,
+            web_search=self._novel_web_search(),
+            timeout=settings.novel_memory_refresh_batch_timeout,
+        )
+        parsed = self._parse_refresh_memory_response(raw)
+        return self._postprocess_memory_layers(parsed)
+
+    def refresh_memory_from_chapters_sync(
+        self, novel: Novel, chapters_summary: str, prev_memory: str
+    ) -> str:
+        """同步版本的记忆刷新，支持分批处理"""
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+
+        batch_chars = settings.novel_memory_refresh_batch_chars
+        summary_len = len(chapters_summary or "")
+
+        # 如果摘要长度不超过批次大小，直接单次处理
+        if batch_chars <= 0 or summary_len <= batch_chars:
+            return self._refresh_memory_single_batch_sync(
+                novel=novel,
+                chapters_summary=chapters_summary,
+                prev_memory=prev_memory,
+            )
+
+        # 分批处理
+        logger.info(
+            "refresh_memory_sync batch mode | summary_len=%d batch_chars=%d",
+            summary_len,
+            batch_chars,
+        )
+
+        current_memory = prev_memory
+        batch_num = 0
+        pos = 0
+
+        while pos < summary_len:
+            batch_num += 1
+            end = min(pos + batch_chars, summary_len)
+            if end < summary_len:
+                boundary = chapters_summary.rfind("\n\n第", pos, end)
+                if boundary > pos + batch_chars // 2:
+                    end = boundary
+
+            batch_summary = chapters_summary[pos:end].strip()
+            if not batch_summary:
+                pos = end
+                continue
+
+            logger.info(
+                "refresh_memory_sync batch %d | chars %d-%d",
+                batch_num,
+                pos,
+                end,
+            )
+
+            current_memory = self._refresh_memory_single_batch_sync(
+                novel=novel,
+                chapters_summary=batch_summary,
+                prev_memory=current_memory,
+            )
+
+            pos = end
+
+        return current_memory
+
+    def _refresh_memory_single_batch_sync(
+        self,
+        novel: Novel,
+        chapters_summary: str,
+        prev_memory: str,
+    ) -> str:
+        """单批次刷新记忆（同步版本）"""
+        fj = truncate_framework_json(novel.framework_json or "", 6000)
+        sys = (
+            "根据章节摘要更新小说结构化记忆。只输出一个 JSON 对象，包含："
+            "characters[], relations[], inventory[], skills[], pets[], "
+            "open_plots[], canonical_timeline_hot[], canonical_timeline_cold[], "
+            "timeline_archive_summary[], notes（一致性提醒）。不要 Markdown。"
+            "canonical_timeline_hot[] 为热层（仅最近关键条目，默认保留最近 20 条）；"
+            "canonical_timeline_cold[] 为冷层（更早历史条目，默认不直接注入写章）。"
+            "timeline_archive_summary[] 用于定期压缩冷层历史的阶段摘要。"
+            "每个条目建议结构："
+            "{"
+            " chapter_no: number,"
+            " key_facts: string[]（本章确认/新增的稳定事实，尽量可被后文引用）,"
+            " causal_results: string[]（关键因果结果，如谁因为什么改变了局面）,"
+            " open_plots_added: string[]（本章新增的未完结线）,"
+            " open_plots_resolved: string[]（本章收束/解决的未完结线，若无留空）"
+            "}"
+            "合并时不得删除或弱化框架 JSON 中的 world_rules、main_plot 等已定硬约束；"
+            "open_plots 必须只保留"仍活跃未收束"的线索，凡已在 open_plots_resolved 标记解决的线应移出 open_plots。"
+            "只能在新剧情证据下增补角色状态、物品、未完结线；若正文与旧记忆矛盾，以最新审定章节为准并在 notes 中简短说明。"
+        )
+        user = (
+            f"【框架 JSON（锚点，合并后须仍与之兼容；勿删改其中 world_rules 条目，只可增补执行层细节）】\n{fj}\n\n"
+            f"旧记忆：\n{prev_memory}\n\n新章节摘要：\n{chapters_summary}\n"
+            "合并去重，修正矛盾处。"
+        )
+        raw = self._client.chat_completions_sync(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            model=self._model(),
+            temperature=0.3,
+            timeout=settings.novel_memory_refresh_batch_timeout,
+            web_search=self._novel_web_search(),
+        )
+        parsed = self._parse_refresh_memory_response(raw)
+        return self._postprocess_memory_layers(parsed)
+
+    def _postprocess_memory_layers(self, payload_json: str) -> str:
+        """
+        统一冷热分层结构，兼容旧字段 canonical_timeline。
+        - canonical_timeline_hot: 最近 N 条
+        - canonical_timeline_cold: 更早条目
+        - canonical_timeline: 兼容字段，等于 hot（供旧 UI/逻辑读取）
+        """
+        try:
+            data = json.loads(payload_json or "{}")
+        except json.JSONDecodeError:
+            return payload_json
+        if not isinstance(data, dict):
+            return payload_json
+
+        hot_n = max(1, int(settings.novel_timeline_hot_n))
+        hot = data.get("canonical_timeline_hot")
+        cold = data.get("canonical_timeline_cold")
+        full = data.get("canonical_timeline")
+
+        if not isinstance(hot, list):
+            if isinstance(full, list):
+                hot = full[-hot_n:] if len(full) > hot_n else full
+                cold = full[:-hot_n] if len(full) > hot_n else []
+            else:
+                hot = []
+                if not isinstance(cold, list):
+                    cold = []
+
+        if not isinstance(cold, list):
+            cold = []
+
+        # open_plots 与 resolved 自动对齐：resolved 出现的条目从 open_plots 移除
+        op = data.get("open_plots")
+        if isinstance(op, list):
+            resolved_set: set[str] = set()
+            for x in hot:
+                if isinstance(x, dict):
+                    r = x.get("open_plots_resolved")
+                    if isinstance(r, list):
+                        for item in r:
+                            if isinstance(item, str) and item.strip():
+                                resolved_set.add(item.strip())
+            data["open_plots"] = [
+                x
+                for x in op
+                if not (isinstance(x, str) and x.strip() in resolved_set)
+            ]
+
+        data["canonical_timeline_hot"] = hot
+        data["canonical_timeline_cold"] = cold
+        data["canonical_timeline"] = hot  # 兼容旧逻辑
+        return json.dumps(data, ensure_ascii=False)
+
+    async def revise_chapter(
+        self,
+        novel: Novel,
+        chapter: Chapter,
+        memory_json: str,
+        feedback_bodies: list[str],
+        user_prompt: str,
+    ) -> str:
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+        return await self._client.chat_completions(
+            messages=_revise_chapter_messages(
+                novel, chapter, memory_json, feedback_bodies, user_prompt
+            ),
+            model=self._model(),
+            temperature=0.65,
+            web_search=self._novel_web_search(),
+            timeout=600.0,
+        )
+
+    def revise_chapter_sync(
+        self,
+        novel: Novel,
+        chapter: Chapter,
+        memory_json: str,
+        feedback_bodies: list[str],
+        user_prompt: str,
+    ) -> str:
+        if not self._client.enabled:
+            raise RuntimeError("未配置 AI302_API_KEY")
+        return self._client.chat_completions_sync(
+            messages=_revise_chapter_messages(
+                novel, chapter, memory_json, feedback_bodies, user_prompt
+            ),
+            model=self._model(),
+            temperature=0.65,
+            timeout=600.0,
+            web_search=self._novel_web_search(),
+        )

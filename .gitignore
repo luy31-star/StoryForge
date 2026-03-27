@@ -1,0 +1,19 @@
+# 密钥与本地环境（切勿提交）
+.env
+backend/.env
+frontend/.env
+frontend/.env.local
+
+# Python
+**/.venv/
+**/__pycache__/
+*.py[cod]
+*.db
+
+# Node
+node_modules/
+frontend/dist/
+
+# 上传与构建产物
+uploads/
+backend/uploads/
