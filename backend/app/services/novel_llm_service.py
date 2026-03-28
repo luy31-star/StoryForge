@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from app.core.config import settings
 from app.core.database import SessionLocal
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.novel import Chapter, Novel, NovelMemory
 from app.models.novel_memory_norm import (
@@ -1540,7 +1541,9 @@ class NovelLLMService:
             "key_facts": _dedupe_str_list(entry.get("key_facts", [])),
             "causal_results": _dedupe_str_list(entry.get("causal_results", [])),
             "open_plots_added": open_plots_added_norm,
-            "open_plots_resolved": _dedupe_str_list(entry.get("open_plots_resolved", [])),
+            "open_plots_resolved": _dedupe_str_list(
+                NovelLLMService._open_plot_bodies_from_mixed(entry.get("open_plots_resolved"))
+            ),
             "emotional_state": str(entry.get("emotional_state") or "").strip(),
             "unresolved_hooks": _dedupe_str_list(uh),
         }
@@ -1598,7 +1601,10 @@ class NovelLLMService:
             base.get("open_plots_added"), incoming.get("open_plots_added")
         )
         merged["open_plots_resolved"] = _dedupe_str_list(
-            [*(base.get("open_plots_resolved") or []), *(incoming.get("open_plots_resolved") or [])]
+            [
+                *NovelLLMService._open_plot_bodies_from_mixed(base.get("open_plots_resolved")),
+                *NovelLLMService._open_plot_bodies_from_mixed(incoming.get("open_plots_resolved")),
+            ]
         )
         emo_in = str(incoming.get("emotional_state") or "").strip()
         merged["emotional_state"] = emo_in or str(base.get("emotional_state") or "").strip()
@@ -1606,6 +1612,24 @@ class NovelLLMService:
             [*(base.get("unresolved_hooks") or []), *(incoming.get("unresolved_hooks") or [])]
         )
         return merged
+
+    @staticmethod
+    def _inventory_entry_label_and_detail(entry: Any) -> tuple[str, str]:
+        """
+        inventory_changed 里 LLM 可能输出字符串或对象（含 item/name/description）。
+        label 列必须为短字符串；完整对象写入 detail_json。
+        """
+        if isinstance(entry, dict):
+            lab = str(
+                entry.get("name") or entry.get("item") or entry.get("label") or ""
+            ).strip()
+            if not lab:
+                lab = json.dumps(entry, ensure_ascii=False)[:512]
+            else:
+                lab = lab[:512]
+            return lab, json.dumps(entry, ensure_ascii=False)
+        s = str(entry or "").strip()[:512]
+        return s, "{}"
 
     @staticmethod
     def _upsert_normalized_memory_from_delta(
@@ -1657,7 +1681,11 @@ class NovelLLMService:
                     inc = item.get(field) or []
                     if not isinstance(inc, list):
                         inc = []
-                    new_list = _dedupe_str_list([*old_list, *inc])
+                    if field == "open_plots_resolved":
+                        inc_norm = NovelLLMService._open_plot_bodies_from_mixed(inc)
+                        new_list = _dedupe_str_list([*old_list, *inc_norm])
+                    else:
+                        new_list = _dedupe_str_list([*old_list, *inc])
                     setattr(entry, json_field, json.dumps(new_list, ensure_ascii=False))
 
                 oa_raw = item.get("open_plots_added") or []
@@ -1740,8 +1768,10 @@ class NovelLLMService:
                 exists.estimated_duration = est
                 exists.memory_version = memory_version
 
-        # 移除已结案的线索
-        top_resolved = _dedupe_str_list(delta.get("open_plots_resolved", []))
+        # 移除已结案的线索（与 plot.body 对齐：dict 取 body，禁止把 dict 绑进 SQL IN）
+        top_resolved = _dedupe_str_list(
+            NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
+        )
         if top_resolved:
             db.query(NovelMemoryNormPlot).filter(
                 NovelMemoryNormPlot.novel_id == novel_id,
@@ -1940,34 +1970,49 @@ class NovelLLMService:
                 rel.relation = relation
                 rel.memory_version = memory_version
 
-        # 5. 物品
+        # 5. 物品（added/removed 可能为字符串或 dict，禁止把 dict 直接绑到 label 列）
         inv_changed = delta.get("inventory_changed")
         if isinstance(inv_changed, dict):
             added = inv_changed.get("added") or []
             removed = inv_changed.get("removed") or []
-            
-            if removed:
+
+            removed_labels: list[str] = []
+            for x in removed:
+                lab, _ = NovelLLMService._inventory_entry_label_and_detail(x)
+                if lab:
+                    removed_labels.append(lab)
+            if removed_labels:
                 db.query(NovelMemoryNormItem).filter(
                     NovelMemoryNormItem.novel_id == novel_id,
-                    NovelMemoryNormItem.label.in_(removed)
+                    NovelMemoryNormItem.label.in_(removed_labels),
                 ).delete(synchronize_session=False)
-            
-            for label in added:
+
+            for raw in added:
+                label, detail_json = NovelLLMService._inventory_entry_label_and_detail(raw)
+                if not label:
+                    continue
                 exists = db.query(NovelMemoryNormItem).filter(
                     NovelMemoryNormItem.novel_id == novel_id,
-                    NovelMemoryNormItem.label == label
+                    NovelMemoryNormItem.label == label,
                 ).first()
                 if not exists:
-                    max_order = db.query(func.max(NovelMemoryNormItem.sort_order)).filter(
-                        NovelMemoryNormItem.novel_id == novel_id
-                    ).scalar() or 0
+                    max_order = (
+                        db.query(func.max(NovelMemoryNormItem.sort_order))
+                        .filter(NovelMemoryNormItem.novel_id == novel_id)
+                        .scalar()
+                        or 0
+                    )
                     new_item = NovelMemoryNormItem(
                         novel_id=novel_id,
                         label=label,
+                        detail_json=detail_json,
                         sort_order=max_order + 1,
-                        memory_version=memory_version
+                        memory_version=memory_version,
                     )
                     db.add(new_item)
+                elif isinstance(raw, dict) and detail_json != "{}":
+                    exists.detail_json = detail_json
+                    exists.memory_version = memory_version
 
         # 6. 技能
         skills_changed = delta.get("skills_changed")
@@ -2083,14 +2128,18 @@ class NovelLLMService:
         top_added_bodies = self._open_plot_bodies_from_mixed(
             raw_top_add if isinstance(raw_top_add, list) else []
         )
-        top_resolved = _dedupe_str_list(delta.get("open_plots_resolved", []))
+        top_resolved = _dedupe_str_list(
+            self._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
+        )
         added_from_entries: list[str] = []
         resolved_from_entries: list[str] = []
         for entry in ordered_timeline:
             added_from_entries.extend(
                 self._open_plot_bodies_from_mixed(entry.get("open_plots_added"))
             )
-            resolved_from_entries.extend(entry.get("open_plots_resolved", []))
+            resolved_from_entries.extend(
+                self._open_plot_bodies_from_mixed(entry.get("open_plots_resolved"))
+            )
         resolved_set = set(_dedupe_str_list([*top_resolved, *resolved_from_entries]))
         for item in _dedupe_str_list(
             [*open_plots, *top_added_bodies, *added_from_entries]
@@ -2299,7 +2348,11 @@ class NovelLLMService:
         resolved_set: set[str] = set()
         added_set: set[str] = set()
         for item in normalized_entries:
-            resolved_set.update(_dedupe_str_list(item.get("open_plots_resolved", [])))
+            resolved_set.update(
+                _dedupe_str_list(
+                    NovelLLMService._open_plot_bodies_from_mixed(item.get("open_plots_resolved"))
+                )
+            )
             added_set.update(
                 set(self._open_plot_bodies_from_mixed(item.get("open_plots_added")))
             )
@@ -2323,14 +2376,18 @@ class NovelLLMService:
         errors = []
         
         # 1. 校验 open_plots_resolved 是否确实存在于 DB 中
-        resolved = _dedupe_str_list(delta.get("open_plots_resolved", []))
+        resolved = _dedupe_str_list(
+            NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
+        )
         if resolved:
             # 获取当前 DB 中的所有活跃 plot
             db_plots = {p.body for p in db.query(NovelMemoryNormPlot).filter(
                 NovelMemoryNormPlot.novel_id == novel_id
             ).all()}
             # 允许在本批次中新增并立即解决（虽然不推荐，但逻辑上通）
-            added_in_delta = set(_dedupe_str_list(delta.get("open_plots_added", [])))
+            added_in_delta = set(
+                NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_added"))
+            )
             valid_pool = db_plots | added_in_delta
             
             for item in resolved:
@@ -2407,9 +2464,17 @@ class NovelLLMService:
         resolved = set()
         for entry in entries:
             if isinstance(entry, dict):
-                resolved.update(_dedupe_str_list(entry.get("open_plots_resolved", [])))
+                resolved.update(
+                    _dedupe_str_list(
+                        NovelLLMService._open_plot_bodies_from_mixed(entry.get("open_plots_resolved"))
+                    )
+                )
         if delta:
-            resolved.update(_dedupe_str_list(delta.get("open_plots_resolved", [])))
+            resolved.update(
+                _dedupe_str_list(
+                    NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
+                )
+            )
         unexpected_removed = removed_open - resolved
         if unexpected_removed:
             errors.append(
@@ -2509,17 +2574,36 @@ class NovelLLMService:
         new_version = 0
         if db:
             try:
-                new_version = self._get_latest_memory_version(db, novel.id) + 1
-                db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
-                # 合并统计信息
-                for k, v in db_stats.items():
-                    stats[k] = max(stats.get(k, 0), v)
-                # 真源为规范化表：快照由分表派生
-                snap_ver = sync_json_snapshot_from_normalized(
-                    db, novel.id, summary="规范化存储自动快照（batch）"
-                )
-                db.commit()
-                new_version = snap_ver
+                # 使用 Savepoint 保护事务，防止局部失败导致全局回滚（如章节审批状态丢失）
+                with db.begin_nested():
+                    new_version = self._get_latest_memory_version(db, novel.id) + 1
+                    db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
+                    # 合并统计信息
+                    for k, v in db_stats.items():
+                        stats[k] = max(stats.get(k, 0), v)
+                    
+                    # 确保大纲表存在，防止 sync 时由于缺少 outline 行导致快照为空
+                    from app.models.novel_memory_norm import NovelMemoryNormOutline
+                    outline = db.get(NovelMemoryNormOutline, novel.id)
+                    if not outline:
+                        outline = NovelMemoryNormOutline(
+                            novel_id=novel.id,
+                            memory_version=new_version,
+                            main_plot=novel.intro or "",
+                        )
+                        db.add(outline)
+                    else:
+                        outline.memory_version = new_version
+
+                    # 真源为规范化表：快照由分表派生
+                    snap_ver = sync_json_snapshot_from_normalized(
+                        db, novel.id, summary="规范化存储自动快照（batch/incremental）"
+                    )
+                    new_version = snap_ver
+                
+                # 显式 flush 确保状态可见，但由外部调用者（Router）负责最终 commit
+                db.flush()
+                
                 latest_row = (
                     db.query(NovelMemory)
                     .filter(NovelMemory.novel_id == novel.id)
@@ -2529,9 +2613,9 @@ class NovelLLMService:
                 if latest_row and latest_row.payload_json:
                     candidate_json = latest_row.payload_json
             except Exception as e:
-                db.rollback()
-                logger.exception("Failed to update normalized memory tables: %s", e)
-                # 这里不报错返回，因为 JSON 合并已经成功，但记录日志
+                # 局部回滚 Savepoint，不影响外部事务（如章节审批状态）
+                logger.exception("Failed to update normalized memory tables (savepoint rolled back): %s", e)
+                # 依然标记 ok=True，因为 JSON 合并已成功，不阻断审定流程
         
         return {
             "ok": True,
@@ -2594,16 +2678,33 @@ class NovelLLMService:
         new_version = 0
         if db:
             try:
-                new_version = self._get_latest_memory_version(db, novel.id) + 1
-                db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
-                # 合并统计信息
-                for k, v in db_stats.items():
-                    stats[k] = max(stats.get(k, 0), v)
-                snap_ver = sync_json_snapshot_from_normalized(
-                    db, novel.id, summary="规范化存储自动快照（batch_sync）"
-                )
-                db.commit()
-                new_version = snap_ver
+                with db.begin_nested():
+                    new_version = self._get_latest_memory_version(db, novel.id) + 1
+                    db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
+                    # 合并统计信息
+                    for k, v in db_stats.items():
+                        stats[k] = max(stats.get(k, 0), v)
+                    
+                    # 确保大纲表存在
+                    from app.models.novel_memory_norm import NovelMemoryNormOutline
+                    outline = db.get(NovelMemoryNormOutline, novel.id)
+                    if not outline:
+                        outline = NovelMemoryNormOutline(
+                            novel_id=novel.id,
+                            memory_version=new_version,
+                            main_plot=novel.intro or "",
+                        )
+                        db.add(outline)
+                    else:
+                        outline.memory_version = new_version
+
+                    snap_ver = sync_json_snapshot_from_normalized(
+                        db, novel.id, summary="规范化存储自动快照（batch_sync/incremental）"
+                    )
+                    new_version = snap_ver
+                
+                db.flush()
+                
                 latest_row = (
                     db.query(NovelMemory)
                     .filter(NovelMemory.novel_id == novel.id)
@@ -2613,8 +2714,7 @@ class NovelLLMService:
                 if latest_row and latest_row.payload_json:
                     candidate_json = latest_row.payload_json
             except Exception as e:
-                db.rollback()
-                logger.exception("Failed to update normalized memory tables (sync): %s", e)
+                logger.exception("Failed to update normalized memory tables (sync savepoint): %s", e)
         
         return {
             "ok": True,
@@ -2662,13 +2762,16 @@ class NovelLLMService:
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
-        return {
+        out: dict[str, Any] = {
             "ok": True,
             "payload_json": current_memory,
             "candidate_json": current_memory,
             "errors": [],
             "stats": total_stats,
         }
+        if db:
+            out["version"] = self._get_latest_memory_version(db, novel.id)
+        return out
 
     def refresh_memory_from_chapters_sync(
         self, novel: Novel, chapters_summary: str, prev_memory: str, db: Any = None
@@ -2701,13 +2804,16 @@ class NovelLLMService:
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
-        return {
+        out_sync: dict[str, Any] = {
             "ok": True,
             "payload_json": current_memory,
             "candidate_json": current_memory,
             "errors": [],
             "stats": total_stats,
         }
+        if db:
+            out_sync["version"] = self._get_latest_memory_version(db, novel.id)
+        return out_sync
 
     def consolidate_memory_archive_sync(
         self,

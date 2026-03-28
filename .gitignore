@@ -17,3 +17,6 @@ frontend/dist/
 # 上传与构建产物
 uploads/
 backend/uploads/
+
+# 本地临时安装 ruff 等工具（勿提交）
+.ruff-venv/

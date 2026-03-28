@@ -564,6 +564,25 @@ export async function getMemory(novelId: string) {
   }>;
 }
 
+/** 后端 NovelMemoryNormPlot / 时间线埋线可为字符串或 { body, plot_type, ... } */
+export function formatMemoryPlotLine(item: unknown): string {
+  if (item == null) return "";
+  if (typeof item === "string") return item;
+  if (typeof item === "object" && item !== null) {
+    const o = item as Record<string, unknown>;
+    const body = o.body;
+    if (typeof body === "string" && body.trim()) return body.trim();
+    const s = o.summary ?? o.title;
+    if (typeof s === "string" && s.trim()) return s.trim();
+    try {
+      return JSON.stringify(item);
+    } catch {
+      return String(item);
+    }
+  }
+  return String(item);
+}
+
 export type NormalizedMemoryPayload = {
   memory_version: number;
   outline: {
@@ -585,14 +604,15 @@ export type NormalizedMemoryPayload = {
     detail: Record<string, unknown>;
   }[];
   relations: { from: string; to: string; relation: string }[];
-  open_plots: string[];
+  /** 与后端一致：多为 { body, plot_type, priority, estimated_duration }[] */
+  open_plots: unknown[];
   chapters: {
     chapter_no: number;
     chapter_title: string;
     key_facts: string[];
     causal_results: string[];
-    open_plots_added: string[];
-    open_plots_resolved: string[];
+    open_plots_added: unknown[];
+    open_plots_resolved: unknown[];
   }[];
 };
 

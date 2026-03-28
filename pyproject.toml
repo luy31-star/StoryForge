@@ -1,0 +1,10 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+
+[tool.ruff.lint]
+# 聚焦「未定义名称」类错误（如用了 func 却未 from sqlalchemy import func）
+select = ["F821", "F822"]
+
+[tool.ruff.lint.per-file-ignores]
+# 迁移/脚本若存在可在此排除

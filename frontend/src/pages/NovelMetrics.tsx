@@ -9,7 +9,7 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { getNovelMetrics, manualFixMemory } from "@/services/novelApi";
+import { getNovelMetrics } from "@/services/novelApi";
 
 type NovelMetrics = Awaited<ReturnType<typeof getNovelMetrics>>;
 
@@ -92,14 +92,6 @@ export function NovelMetricsPage() {
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const [fixBusy, setFixBusy] = useState(false);
-  const [openPlotsText, setOpenPlotsText] = useState("");
-  const [keyFactsText, setKeyFactsText] = useState("");
-  const [causalResultsText, setCausalResultsText] = useState("");
-  const [openPlotsAddedText, setOpenPlotsAddedText] = useState("");
-  const [openPlotsResolvedText, setOpenPlotsResolvedText] = useState("");
-  const [notesHint, setNotesHint] = useState("");
-
   useEffect(() => {
     if (!id) return;
     setBusy(true);
@@ -109,25 +101,6 @@ export function NovelMetricsPage() {
       .catch((e: unknown) => setErr(e instanceof Error ? e.message : "加载失败"))
       .finally(() => setBusy(false));
   }, [id]);
-
-  useEffect(() => {
-    if (!metrics) return;
-    const s = metrics.summary;
-    setOpenPlotsText((s.open_plots_editable || []).join("\n"));
-    setKeyFactsText(
-      (s.canonical_timeline_last_editable?.key_facts || []).join("\n")
-    );
-    setCausalResultsText(
-      (s.canonical_timeline_last_editable?.causal_results || []).join("\n")
-    );
-    setOpenPlotsAddedText(
-      (s.canonical_timeline_last_editable?.open_plots_added || []).join("\n")
-    );
-    setOpenPlotsResolvedText(
-      (s.canonical_timeline_last_editable?.open_plots_resolved || []).join("\n")
-    );
-    setNotesHint("");
-  }, [metrics]);
 
   const riskModel = useMemo(() => {
     const s = metrics?.summary;
@@ -182,37 +155,6 @@ export function NovelMetricsPage() {
   }
 
   const { novel, config, summary } = metrics;
-
-  function splitLines(text: string): string[] {
-    return text
-      .split("\n")
-      .map((x) => x.trim())
-      .filter(Boolean);
-  }
-
-  async function onSaveManualFix() {
-    if (!id) return;
-    setFixBusy(true);
-    setErr(null);
-    try {
-      await manualFixMemory(id, {
-        open_plots: splitLines(openPlotsText),
-        canonical_last: {
-          key_facts: splitLines(keyFactsText),
-          causal_results: splitLines(causalResultsText),
-          open_plots_added: splitLines(openPlotsAddedText),
-          open_plots_resolved: splitLines(openPlotsResolvedText),
-        },
-        notes_hint: notesHint.trim(),
-      });
-      const next = await getNovelMetrics(id);
-      setMetrics(next);
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "保存纠偏失败");
-    } finally {
-      setFixBusy(false);
-    }
-  }
 
   return (
     <div className="min-h-screen bg-background p-6">
@@ -540,122 +482,6 @@ export function NovelMetricsPage() {
 
           </div>
         </div>
-
-        <Card className="bg-card/60">
-          <CardHeader>
-            <CardTitle>表单式纠偏（低风险）</CardTitle>
-            <CardDescription>
-              你可以直接改 `open_plots`（未完结线）以及 `canonical_timeline` 最后一条。保存后会生成新的记忆版本并刷新指标。
-            </CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid gap-4 xl:grid-cols-[1.1fr_1.9fr]">
-              <div className="rounded-xl border border-border bg-background/30 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-medium">open_plots（每行一条）</p>
-                  <p className="text-xs text-muted-foreground">
-                    当前条数：{summary.open_plots_count}
-                  </p>
-                </div>
-                <textarea
-                  value={openPlotsText}
-                  onChange={(e) => setOpenPlotsText(e.target.value)}
-                  className="mt-2 min-h-[260px] w-full rounded-md border border-input bg-background p-3 font-mono text-xs leading-relaxed"
-                  placeholder="例如：第X章需要承接的对话/交易/仇恨/未完成约定..."
-                />
-              </div>
-
-              <div className="rounded-xl border border-border bg-background/30 p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-sm font-medium">canonical_timeline（最后一条）</p>
-                  <p className="text-xs text-muted-foreground">
-                    覆盖到：第 {summary.canonical_timeline_last_chapter_no ?? "-"} 章
-                  </p>
-                </div>
-
-                <div className="mt-3 grid gap-3 md:grid-cols-2">
-                  <div className="space-y-2">
-                    <p className="text-xs text-muted-foreground">key_facts（每行一条）</p>
-                    <textarea
-                      value={keyFactsText}
-                      onChange={(e) => setKeyFactsText(e.target.value)}
-                      className="min-h-[120px] w-full rounded-md border border-input bg-background p-3 font-mono text-xs leading-relaxed"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <p className="text-xs text-muted-foreground">causal_results（每行一条）</p>
-                    <textarea
-                      value={causalResultsText}
-                      onChange={(e) => setCausalResultsText(e.target.value)}
-                      className="min-h-[120px] w-full rounded-md border border-input bg-background p-3 font-mono text-xs leading-relaxed"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <p className="text-xs text-muted-foreground">open_plots_added（新增未完结线）</p>
-                    <textarea
-                      value={openPlotsAddedText}
-                      onChange={(e) => setOpenPlotsAddedText(e.target.value)}
-                      className="min-h-[120px] w-full rounded-md border border-input bg-background p-3 font-mono text-xs leading-relaxed"
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <p className="text-xs text-muted-foreground">open_plots_resolved（已收束/解决线）</p>
-                    <textarea
-                      value={openPlotsResolvedText}
-                      onChange={(e) => setOpenPlotsResolvedText(e.target.value)}
-                      className="min-h-[120px] w-full rounded-md border border-input bg-background p-3 font-mono text-xs leading-relaxed"
-                    />
-                  </div>
-                </div>
-
-                <div className="mt-3">
-                  <p className="text-xs text-muted-foreground">可选备注（写给自己）</p>
-                  <input
-                    value={notesHint}
-                    onChange={(e) => setNotesHint(e.target.value)}
-                    className="mt-1 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                    placeholder="例如：补强第42章“约定未完成”的因果"
-                  />
-                </div>
-              </div>
-            </div>
-
-            {err ? <p className="text-sm text-destructive">{err}</p> : null}
-            <div className="flex flex-wrap gap-2">
-              <Button
-                type="button"
-                disabled={fixBusy || busy}
-                onClick={() => void onSaveManualFix()}
-              >
-                {fixBusy ? "保存中…" : "保存纠偏并刷新"}
-              </Button>
-              <Button
-                type="button"
-                variant="outline"
-                disabled={fixBusy || busy}
-                onClick={() => {
-                  setOpenPlotsText((summary.open_plots_editable || []).join("\n"));
-                  setKeyFactsText(
-                    (summary.canonical_timeline_last_editable?.key_facts || []).join("\n")
-                  );
-                  setCausalResultsText(
-                    (summary.canonical_timeline_last_editable?.causal_results || []).join("\n")
-                  );
-                  setOpenPlotsAddedText(
-                    (summary.canonical_timeline_last_editable?.open_plots_added || []).join("\n")
-                  );
-                  setOpenPlotsResolvedText(
-                    (summary.canonical_timeline_last_editable?.open_plots_resolved || []).join("\n")
-                  );
-                  setNotesHint("");
-                  setErr(null);
-                }}
-              >
-                撤销到当前指标值
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
       </div>
     </div>
   );

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { User, Settings, Sun, Moon, Monitor, Check } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -29,6 +29,7 @@ import {
   getMemory,
   getMemoryNormalized,
   rebuildMemoryNormalized,
+  formatMemoryPlotLine,
   listGenerationLogs,
   type NormalizedMemoryPayload,
   listVolumeChapterPlan,
@@ -44,6 +45,26 @@ import {
   getLlmConfig,
   setLlmConfig,
 } from "@/services/novelApi";
+
+const STRUCTURED_LIST_PAGE = 8;
+const CHAPTER_PAGE_SIZE = 3;
+
+function totalPages(n: number, pageSize: number): number {
+  return Math.max(1, Math.ceil(Math.max(0, n) / pageSize));
+}
+
+function slicePage<T>(items: T[], page: number, pageSize: number): T[] {
+  const start = page * pageSize;
+  return items.slice(start, start + pageSize);
+}
+
+function safeJsonStringify(data: unknown): string {
+  try {
+    return JSON.stringify(data, null, 2);
+  } catch {
+    return String(data);
+  }
+}
 
 function formatVolumePlanBeatsText(beats: unknown): string {
   if (!beats || typeof beats !== "object" || Array.isArray(beats)) {
@@ -194,6 +215,10 @@ export function NovelWorkspace() {
     errors: string[];
     version: number;
   } | null>(null);
+  const [structuredPages, setStructuredPages] = useState<Record<string, number>>({});
+  const [normDetailOpen, setNormDetailOpen] = useState(false);
+  const [normDetailTitle, setNormDetailTitle] = useState("");
+  const [normDetailBody, setNormDetailBody] = useState("");
   const [logBatchId, setLogBatchId] = useState<string>("");
   const [logBusy, setLogBusy] = useState(false);
   const [logDialogOpen, setLogDialogOpen] = useState(false);
@@ -241,6 +266,8 @@ export function NovelWorkspace() {
     next_from_chapter?: number | null;
     existing?: number;
   } | null>(null);
+  /** 为 false 时隐藏「已有正文/待审稿」的章计划卡片，便于往下续写 */
+  const [showVolumePlanWithBody, setShowVolumePlanWithBody] = useState(false);
   const [titleDraft, setTitleDraft] = useState("");
   const [titleBusy, setTitleBusy] = useState(false);
 
@@ -337,6 +364,22 @@ export function NovelWorkspace() {
     setFwJson(String(n.framework_json ?? "{}"));
   }, [id]);
 
+  const openNormDetail = useCallback((title: string, data: unknown) => {
+    setNormDetailTitle(title);
+    setNormDetailBody(
+      typeof data === "string" ? data : safeJsonStringify(data)
+    );
+    setNormDetailOpen(true);
+  }, []);
+
+  useEffect(() => {
+    setStructuredPages({});
+  }, [memoryNorm?.memory_version]);
+
+  useEffect(() => {
+    setShowVolumePlanWithBody(false);
+  }, [selectedVolumeId]);
+
   const reloadVolumes = useCallback(async () => {
     if (!id) return;
     const vs = await listVolumes(id);
@@ -416,12 +459,52 @@ export function NovelWorkspace() {
   }, [selectedChapter]);
 
   useEffect(() => {
-    if (!memory?.payload_json) {
+    const clearContinuity = () => {
       setOpenPlotsLines([]);
       setKeyFactsLines([]);
       setCausalResultsLines([]);
       setOpenPlotsAddedLines([]);
       setOpenPlotsResolvedLines([]);
+    };
+
+    /** 与「结构化记忆」同源：分表为真源；仅用快照时易与分表不一致导致承接区空白 */
+    function fillFromNormalized(norm: NormalizedMemoryPayload) {
+      const op = (norm.open_plots ?? [])
+        .map((x) => formatMemoryPlotLine(x))
+        .filter((s) => s.length > 0);
+      const chs = [...(norm.chapters ?? [])].sort(
+        (a, b) => a.chapter_no - b.chapter_no
+      );
+      const last = chs.length ? chs[chs.length - 1] : null;
+      const toLines = (arr: unknown): string[] => {
+        if (!Array.isArray(arr)) return [];
+        return arr
+          .map((x) =>
+            typeof x === "string" ? x : formatMemoryPlotLine(x)
+          )
+          .filter((s) => s.length > 0);
+      };
+      setOpenPlotsLines(op);
+      if (last) {
+        setKeyFactsLines(toLines(last.key_facts));
+        setCausalResultsLines(toLines(last.causal_results));
+        setOpenPlotsAddedLines(toLines(last.open_plots_added));
+        setOpenPlotsResolvedLines(toLines(last.open_plots_resolved));
+      } else {
+        setKeyFactsLines([]);
+        setCausalResultsLines([]);
+        setOpenPlotsAddedLines([]);
+        setOpenPlotsResolvedLines([]);
+      }
+    }
+
+    if (memoryNorm) {
+      fillFromNormalized(memoryNorm);
+      return;
+    }
+
+    if (!memory?.payload_json) {
+      clearContinuity();
       return;
     }
     try {
@@ -457,13 +540,24 @@ export function NovelWorkspace() {
         setOpenPlotsResolvedLines([]);
       }
     } catch {
-      setOpenPlotsLines([]);
-      setKeyFactsLines([]);
-      setCausalResultsLines([]);
-      setOpenPlotsAddedLines([]);
-      setOpenPlotsResolvedLines([]);
+      clearContinuity();
     }
-  }, [memory?.payload_json]);
+  }, [memory?.payload_json, memoryNorm]);
+
+  const volumePlanView = useMemo(() => {
+    const hasGeneratedBody = (chapterNo: number) => {
+      const ch = chapters.find((c) => c.chapter_no === chapterNo);
+      if (!ch) return false;
+      return (ch.content || ch.pending_content || "").trim().length > 0;
+    };
+    const withBodyCount = volumePlan.filter((p) =>
+      hasGeneratedBody(p.chapter_no)
+    ).length;
+    const visible = showVolumePlanWithBody
+      ? volumePlan
+      : volumePlan.filter((p) => !hasGeneratedBody(p.chapter_no));
+    return { visible, withBodyCount };
+  }, [volumePlan, chapters, showVolumePlanWithBody]);
 
   function normalizeLines(lines: string[]): string[] {
     return lines.map((x) => x.trim()).filter(Boolean);
@@ -487,6 +581,46 @@ export function NovelWorkspace() {
       uniq.push(raw);
     }
     return { cleaned: uniq, duplicates };
+  }
+
+  function normPager(pageKey: string, total: number, pageSize: number) {
+    const page = structuredPages[pageKey] ?? 0;
+    const tp = totalPages(total, pageSize);
+    if (total <= pageSize) return null;
+    return (
+      <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/40 pt-2 text-[11px] text-muted-foreground">
+        <span>共 {total} 条</span>
+        <div className="flex items-center gap-2">
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs"
+            disabled={page <= 0}
+            onClick={() =>
+              setStructuredPages((s) => ({ ...s, [pageKey]: page - 1 }))
+            }
+          >
+            上一页
+          </Button>
+          <span className="tabular-nums">
+            {page + 1} / {tp}
+          </span>
+          <Button
+            type="button"
+            size="sm"
+            variant="ghost"
+            className="h-7 px-2 text-xs"
+            disabled={page >= tp - 1}
+            onClick={() =>
+              setStructuredPages((s) => ({ ...s, [pageKey]: page + 1 }))
+            }
+          >
+            下一页
+          </Button>
+        </div>
+      </div>
+    );
   }
 
   function renderLineEditor(
@@ -1301,12 +1435,35 @@ export function NovelWorkspace() {
                   <p className="text-sm text-muted-foreground">请选择左侧卷。</p>
                 ) : (
                   <div className="space-y-3">
-                    <div className="flex items-center justify-between">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
                       <p className="text-sm font-medium">本卷章计划</p>
                       <p className="text-xs text-muted-foreground">
-                        {volumeBusy ? "加载中…" : `共 ${volumePlan.length} 章`}
+                        {volumeBusy
+                          ? "加载中…"
+                          : `共 ${volumePlan.length} 章 · 当前展示 ${volumePlanView.visible.length} 章`}
                       </p>
                     </div>
+                    {volumePlan.length > 0 ? (
+                      <label className="flex cursor-pointer flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                        <input
+                          type="checkbox"
+                          className="rounded border-input"
+                          checked={showVolumePlanWithBody}
+                          onChange={(e) =>
+                            setShowVolumePlanWithBody(e.target.checked)
+                          }
+                        />
+                        <span>
+                          显示已含正文的章节（默认关闭：已生成正文的章会隐藏，便于往下写）
+                          {!showVolumePlanWithBody &&
+                          volumePlanView.withBodyCount > 0 ? (
+                            <span className="ml-1 text-amber-600/90">
+                              · 已隐藏 {volumePlanView.withBodyCount} 章
+                            </span>
+                          ) : null}
+                        </span>
+                      </label>
+                    ) : null}
                     {(() => {
                       const v = volumes.find((x) => x.id === selectedVolumeId);
                       if (!v) return null;
@@ -1337,9 +1494,14 @@ export function NovelWorkspace() {
                         <p className="p-2 text-xs text-muted-foreground">
                           暂无章计划。点击“生成本卷章计划（下一批）”开始生成。
                         </p>
+                      ) : volumePlanView.visible.length === 0 ? (
+                        <p className="p-2 text-xs text-muted-foreground">
+                          当前视图下没有待写章节（本卷计划均已含正文）。
+                          请勾选上方「显示已含正文的章节」以查看与操作已生成章节。
+                        </p>
                       ) : (
                         <div className="space-y-2">
-                          {volumePlan.map((p) => (
+                          {volumePlanView.visible.map((p) => (
                             <div
                               key={p.id}
                               className="rounded-md border border-border bg-background/40 p-3 text-xs"
@@ -2016,16 +2178,32 @@ export function NovelWorkspace() {
                   暂无结构化数据（尚无记忆或尚未同步）。
                 </p>
               ) : (
-                <div className="max-h-[min(520px,60vh)] space-y-4 overflow-y-auto pr-1 text-xs">
+                <div className="space-y-4 text-xs">
                   <p className="text-[11px] text-muted-foreground">
                     规范表版本 v{memoryNorm.memory_version}
+                    <span className="ml-2 text-muted-foreground/80">
+                      （列表分页展示，点「详情」查看完整内容）
+                    </span>
                   </p>
                   <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                     <p className="font-medium text-foreground">主线 / 世界观</p>
                     {memoryNorm.outline.main_plot.trim() ? (
-                      <p className="whitespace-pre-wrap text-muted-foreground">
-                        {memoryNorm.outline.main_plot}
-                      </p>
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="line-clamp-3 flex-1 whitespace-pre-wrap break-words text-muted-foreground">
+                          {memoryNorm.outline.main_plot}
+                        </p>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-7 shrink-0 text-xs"
+                          onClick={() =>
+                            openNormDetail("主线 main_plot", memoryNorm.outline.main_plot)
+                          }
+                        >
+                          详情
+                        </Button>
+                      </div>
                     ) : (
                       <p className="text-muted-foreground">（无 main_plot）</p>
                     )}
@@ -2035,199 +2213,307 @@ export function NovelWorkspace() {
                       ["主题", memoryNorm.outline.themes],
                       ["备注 notes", memoryNorm.outline.notes],
                       ["时间线归档摘要", memoryNorm.outline.timeline_archive_summary],
-                    ].map(([label, arr]) =>
-                      Array.isArray(arr) && arr.length ? (
-                        <div key={String(label)} className="space-y-1">
+                    ].map(([label, arr]) => {
+                      if (!Array.isArray(arr) || !arr.length) return null;
+                      const lk = `outline-${String(label)}`;
+                      const page = structuredPages[lk] ?? 0;
+                      const slice = slicePage(arr, page, STRUCTURED_LIST_PAGE);
+                      return (
+                        <div key={lk} className="space-y-1 border-t border-border/30 pt-2">
                           <p className="text-[11px] font-medium text-foreground/80">
                             {String(label)}
                           </p>
-                          <ul className="list-disc space-y-0.5 pl-4 text-muted-foreground">
-                            {arr.map((x, i) => (
-                              <li key={`ol-${String(label)}-${i}`}>
-                                {typeof x === "string" ? x : JSON.stringify(x)}
-                              </li>
-                            ))}
+                          <ul className="space-y-1.5 text-muted-foreground">
+                            {slice.map((x, i) => {
+                              const globalIdx = page * STRUCTURED_LIST_PAGE + i + 1;
+                              const preview =
+                                typeof x === "string" ? x : JSON.stringify(x);
+                              return (
+                                <li
+                                  key={`${lk}-row-${globalIdx}`}
+                                  className="flex items-start justify-between gap-2 rounded border border-border/30 bg-muted/10 px-2 py-1.5"
+                                >
+                                  <span className="line-clamp-2 flex-1 break-words">
+                                    {preview}
+                                  </span>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 shrink-0 px-2 text-[11px]"
+                                    onClick={() =>
+                                      openNormDetail(
+                                        `${String(label)} · 第 ${globalIdx} 条`,
+                                        x
+                                      )
+                                    }
+                                  >
+                                    详情
+                                  </Button>
+                                </li>
+                              );
+                            })}
                           </ul>
+                          {normPager(lk, arr.length, STRUCTURED_LIST_PAGE)}
                         </div>
-                      ) : null
-                    )}
+                      );
+                    })}
                   </div>
                   {memoryNorm.skills.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">技能</p>
                       <ul className="space-y-2">
-                        {memoryNorm.skills.map((s, i) => (
+                        {slicePage(
+                          memoryNorm.skills,
+                          structuredPages.skills ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((s, i) => (
                           <li
-                            key={`sk-${i}-${s.name}`}
-                            className="rounded border border-border/40 bg-muted/20 p-2"
+                            key={`sk-${s.name}-${i}`}
+                            className="flex items-center justify-between gap-2 rounded border border-border/40 bg-muted/20 px-2 py-2"
                           >
                             <span className="font-medium text-foreground">{s.name}</span>
-                            {Object.keys(s.detail || {}).length ? (
-                              <pre className="mt-1 overflow-x-auto text-[11px] text-muted-foreground">
-                                {JSON.stringify(s.detail, null, 2)}
-                              </pre>
-                            ) : null}
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              onClick={() => openNormDetail(`技能 · ${s.name}`, s)}
+                            >
+                              详情
+                            </Button>
                           </li>
                         ))}
                       </ul>
+                      {normPager("skills", memoryNorm.skills.length, STRUCTURED_LIST_PAGE)}
                     </div>
                   ) : null}
                   {memoryNorm.inventory.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">物品</p>
                       <ul className="space-y-2">
-                        {memoryNorm.inventory.map((it, i) => (
+                        {slicePage(
+                          memoryNorm.inventory,
+                          structuredPages.inventory ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((it, i) => (
                           <li
-                            key={`inv-${i}-${it.label}`}
-                            className="rounded border border-border/40 bg-muted/20 p-2"
+                            key={`inv-${it.label}-${i}`}
+                            className="flex items-center justify-between gap-2 rounded border border-border/40 bg-muted/20 px-2 py-2"
                           >
                             <span className="font-medium text-foreground">{it.label}</span>
-                            {Object.keys(it.detail || {}).length ? (
-                              <pre className="mt-1 overflow-x-auto text-[11px] text-muted-foreground">
-                                {JSON.stringify(it.detail, null, 2)}
-                              </pre>
-                            ) : null}
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              onClick={() => openNormDetail(`物品 · ${it.label}`, it)}
+                            >
+                              详情
+                            </Button>
                           </li>
                         ))}
                       </ul>
+                      {normPager(
+                        "inventory",
+                        memoryNorm.inventory.length,
+                        STRUCTURED_LIST_PAGE
+                      )}
                     </div>
                   ) : null}
                   {memoryNorm.pets.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">宠物 / 从属</p>
                       <ul className="space-y-2">
-                        {memoryNorm.pets.map((p, i) => (
+                        {slicePage(
+                          memoryNorm.pets,
+                          structuredPages.pets ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((p, i) => (
                           <li
-                            key={`pet-${i}-${p.name}`}
-                            className="rounded border border-border/40 bg-muted/20 p-2"
+                            key={`pet-${p.name}-${i}`}
+                            className="flex items-center justify-between gap-2 rounded border border-border/40 bg-muted/20 px-2 py-2"
                           >
                             <span className="font-medium text-foreground">{p.name}</span>
-                            {Object.keys(p.detail || {}).length ? (
-                              <pre className="mt-1 overflow-x-auto text-[11px] text-muted-foreground">
-                                {JSON.stringify(p.detail, null, 2)}
-                              </pre>
-                            ) : null}
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 text-xs"
+                              onClick={() => openNormDetail(`宠物 · ${p.name}`, p)}
+                            >
+                              详情
+                            </Button>
                           </li>
                         ))}
                       </ul>
+                      {normPager("pets", memoryNorm.pets.length, STRUCTURED_LIST_PAGE)}
                     </div>
                   ) : null}
                   {memoryNorm.characters.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">人物</p>
                       <ul className="space-y-2">
-                        {memoryNorm.characters.map((c, i) => (
+                        {slicePage(
+                          memoryNorm.characters,
+                          structuredPages.characters ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((c, i) => (
                           <li
-                            key={`ch-${i}-${c.name}`}
-                            className="rounded border border-border/40 bg-muted/20 p-2"
+                            key={`ch-${c.name}-${i}`}
+                            className="flex flex-wrap items-center justify-between gap-2 rounded border border-border/40 bg-muted/20 px-2 py-2"
                           >
-                            <div className="font-medium text-foreground">{c.name}</div>
-                            {(c.role || c.status) && (
-                              <p className="text-[11px] text-muted-foreground">
-                                {[c.role, c.status].filter(Boolean).join(" · ")}
-                              </p>
-                            )}
-                            {Array.isArray(c.traits) && c.traits.length ? (
-                              <p className="mt-1 text-[11px] text-muted-foreground">
-                                特征：{c.traits.map(String).join("；")}
-                              </p>
-                            ) : null}
-                            {Object.keys(c.detail || {}).length ? (
-                              <pre className="mt-1 overflow-x-auto text-[11px] text-muted-foreground">
-                                {JSON.stringify(c.detail, null, 2)}
-                              </pre>
-                            ) : null}
+                            <div className="min-w-0 flex-1">
+                              <div className="font-medium text-foreground">{c.name}</div>
+                              {(c.role || c.status) ? (
+                                <p className="text-[11px] text-muted-foreground">
+                                  {[c.role, c.status].filter(Boolean).join(" · ")}
+                                </p>
+                              ) : null}
+                            </div>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-7 shrink-0 text-xs"
+                              onClick={() => openNormDetail(`人物 · ${c.name}`, c)}
+                            >
+                              详情
+                            </Button>
                           </li>
                         ))}
                       </ul>
+                      {normPager(
+                        "characters",
+                        memoryNorm.characters.length,
+                        STRUCTURED_LIST_PAGE
+                      )}
                     </div>
                   ) : null}
                   {memoryNorm.relations.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">人物关系</p>
-                      <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
-                        {memoryNorm.relations.map((r, i) => (
-                          <li key={`rel-${i}`}>
-                            {r.from} → {r.to}：{r.relation}
+                      <ul className="space-y-2">
+                        {slicePage(
+                          memoryNorm.relations,
+                          structuredPages.relations ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((r, i) => (
+                          <li
+                            key={`rel-${i}-${r.from}-${r.to}`}
+                            className="flex items-start justify-between gap-2 rounded border border-border/30 bg-muted/10 px-2 py-1.5"
+                          >
+                            <span className="line-clamp-2 flex-1 break-words text-muted-foreground">
+                              {r.from} → {r.to}：{r.relation}
+                            </span>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 shrink-0 text-[11px]"
+                              onClick={() =>
+                                openNormDetail(
+                                  `关系 · ${r.from} → ${r.to}`,
+                                  r
+                                )
+                              }
+                            >
+                              详情
+                            </Button>
                           </li>
                         ))}
                       </ul>
+                      {normPager(
+                        "relations",
+                        memoryNorm.relations.length,
+                        STRUCTURED_LIST_PAGE
+                      )}
                     </div>
                   ) : null}
                   {memoryNorm.open_plots.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">全书待收束线</p>
-                      <ul className="list-disc space-y-1 pl-4 text-muted-foreground">
-                        {memoryNorm.open_plots.map((line, i) => (
-                          <li key={`op-${i}`}>{line}</li>
+                      <ul className="space-y-2">
+                        {slicePage(
+                          memoryNorm.open_plots,
+                          structuredPages.open_plots ?? 0,
+                          STRUCTURED_LIST_PAGE
+                        ).map((line, i) => (
+                          <li
+                            key={`op-${i}`}
+                            className="flex items-start justify-between gap-2 rounded border border-border/30 bg-muted/10 px-2 py-1.5"
+                          >
+                            <span className="line-clamp-2 flex-1 break-words text-muted-foreground">
+                              {formatMemoryPlotLine(line)}
+                            </span>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="ghost"
+                              className="h-7 shrink-0 text-[11px]"
+                              onClick={() =>
+                                openNormDetail("待收束线（原始）", line)
+                              }
+                            >
+                              详情
+                            </Button>
+                          </li>
                         ))}
                       </ul>
+                      {normPager(
+                        "open_plots",
+                        memoryNorm.open_plots.length,
+                        STRUCTURED_LIST_PAGE
+                      )}
                     </div>
                   ) : null}
                   {memoryNorm.chapters.length > 0 ? (
                     <div className="space-y-2 rounded-md border border-border/60 bg-background/40 p-3">
                       <p className="font-medium text-foreground">分章脉络（事实与因果）</p>
-                      <div className="space-y-3">
-                        {memoryNorm.chapters.map((ch) => (
+                      <div className="space-y-2">
+                        {slicePage(
+                          memoryNorm.chapters,
+                          structuredPages.chapters ?? 0,
+                          CHAPTER_PAGE_SIZE
+                        ).map((ch) => (
                           <div
                             key={ch.chapter_no}
-                            className="rounded border border-border/40 bg-muted/10 p-2"
+                            className="flex flex-wrap items-center justify-between gap-2 rounded border border-border/40 bg-muted/10 p-3"
                           >
-                            <p className="font-medium text-foreground">
-                              第{ch.chapter_no}章
-                              {ch.chapter_title ? `《${ch.chapter_title}》` : ""}
-                            </p>
-                            {ch.key_facts.length ? (
-                              <div className="mt-1">
-                                <span className="text-[10px] uppercase text-muted-foreground">
-                                  关键事实
-                                </span>
-                                <ul className="list-disc pl-4 text-muted-foreground">
-                                  {ch.key_facts.map((x, i) => (
-                                    <li key={`kf-${i}`}>{x}</li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
-                            {ch.causal_results.length ? (
-                              <div className="mt-1">
-                                <span className="text-[10px] uppercase text-muted-foreground">
-                                  因果
-                                </span>
-                                <ul className="list-disc pl-4 text-muted-foreground">
-                                  {ch.causal_results.map((x, i) => (
-                                    <li key={`cr-${i}`}>{x}</li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
-                            {ch.open_plots_added.length ? (
-                              <div className="mt-1">
-                                <span className="text-[10px] text-emerald-600/90">
-                                  本章新埋线
-                                </span>
-                                <ul className="list-disc pl-4 text-muted-foreground">
-                                  {ch.open_plots_added.map((x, i) => (
-                                    <li key={`oa-${i}`}>{x}</li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
-                            {ch.open_plots_resolved.length ? (
-                              <div className="mt-1">
-                                <span className="text-[10px] text-amber-600/90">
-                                  本章已收束
-                                </span>
-                                <ul className="list-disc pl-4 text-muted-foreground">
-                                  {ch.open_plots_resolved.map((x, i) => (
-                                    <li key={`or-${i}`}>{x}</li>
-                                  ))}
-                                </ul>
-                              </div>
-                            ) : null}
+                            <div className="min-w-0">
+                              <p className="font-medium text-foreground">
+                                第{ch.chapter_no}章
+                                {ch.chapter_title ? `《${ch.chapter_title}》` : ""}
+                              </p>
+                              <p className="mt-1 text-[10px] text-muted-foreground">
+                                关键事实 {ch.key_facts.length} · 因果{" "}
+                                {ch.causal_results.length} · 新埋线{" "}
+                                {ch.open_plots_added.length} · 已收束{" "}
+                                {ch.open_plots_resolved.length}
+                              </p>
+                            </div>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="outline"
+                              className="h-8 shrink-0 text-xs"
+                              onClick={() =>
+                                openNormDetail(
+                                  `第${ch.chapter_no}章 · 分章脉络`,
+                                  ch
+                                )
+                              }
+                            >
+                              查看全文
+                            </Button>
                           </div>
                         ))}
                       </div>
+                      {normPager(
+                        "chapters",
+                        memoryNorm.chapters.length,
+                        CHAPTER_PAGE_SIZE
+                      )}
                     </div>
                   ) : null}
                 </div>
@@ -2329,6 +2615,30 @@ export function NovelWorkspace() {
                 </div>
               ) : null}
             </div>
+            <Dialog open={normDetailOpen} onOpenChange={setNormDetailOpen}>
+              <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+                <DialogHeader>
+                  <DialogTitle className="text-left text-base leading-snug">
+                    {normDetailTitle}
+                  </DialogTitle>
+                  <DialogDescription className="sr-only">
+                    结构化记忆条目完整内容
+                  </DialogDescription>
+                </DialogHeader>
+                <pre className="max-h-[min(60vh,520px)] overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-muted/30 p-3 text-[11px] leading-relaxed text-muted-foreground">
+                  {normDetailBody}
+                </pre>
+                <DialogFooter>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => setNormDetailOpen(false)}
+                  >
+                    关闭
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
           </TabsContent>
         </Tabs>
       </div>
