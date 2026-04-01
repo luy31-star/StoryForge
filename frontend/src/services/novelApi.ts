@@ -150,24 +150,32 @@ export async function generateVolumeChapterPlan(
     }
   );
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<{
-    status: string;
-    saved?: number;
-    reason?: string;
-    batch?: {
-      from_chapter: number;
-      to_chapter: number;
-      size: number;
-      requested_count?: number;
-      saved_count?: number;
-      partial?: boolean;
-    };
-    done?: boolean;
-    next_from_chapter?: number | null;
-    existing?: number;
-    volume_title?: string;
-    volume_summary?: string;
-  }>;
+  return r.json() as Promise<
+    | {
+        status: "queued";
+        batch_id: string;
+        task_id?: string | null;
+        message?: string;
+      }
+    | {
+        status: string;
+        saved?: number;
+        reason?: string;
+        batch?: {
+          from_chapter: number;
+          to_chapter: number;
+          size: number;
+          requested_count?: number;
+          saved_count?: number;
+          partial?: boolean;
+        };
+        done?: boolean;
+        next_from_chapter?: number | null;
+        existing?: number;
+        volume_title?: string;
+        volume_summary?: string;
+      }
+  >;
 }
 
 export async function regenerateChapterPlan(
@@ -401,6 +409,7 @@ export async function generateChapters(
     cold_recall_items?: number;
     auto_consistency_check?: boolean;
     chapter_no?: number;
+    source?: string;
   }
 ) {
   const r = await apiFetch(`${BASE}/${novelId}/chapters/generate`, {
@@ -412,6 +421,7 @@ export async function generateChapters(
       cold_recall_items: options?.cold_recall_items ?? 5,
       auto_consistency_check: Boolean(options?.auto_consistency_check),
       chapter_no: options?.chapter_no,
+      source: options?.source,
     }),
   });
   if (!r.ok) {
@@ -427,7 +437,15 @@ export async function generateChapters(
     if (!detail) detail = (await r.text()).trim();
     throw new Error(detail || `生成失败（HTTP ${r.status}）`);
   }
-  return r.json() as Promise<{ chapter_ids: string[]; batch_id?: string }>;
+  return r.json() as Promise<{
+    status: string;
+    batch_id?: string;
+    task_id?: string | null;
+    message?: string;
+    chapter_nos?: number[];
+    requested_count?: number;
+    actual_count?: number;
+  }>;
 }
 
 export async function listGenerationLogs(
@@ -451,6 +469,12 @@ export async function listGenerationLogs(
     refresh_started_at: string | null;
     refresh_elapsed_seconds: number | null;
     latest_refresh_success_version: number | null;
+    refresh_outcome?: "idle" | "ok" | "warning" | "blocked" | "failed";
+    memory_refresh_preview?: Record<string, unknown> | null;
+    latest_chapter_gen_batch_id?: string | null;
+    chapter_generation_status?: "idle" | "queued" | "started" | "done" | "failed";
+    latest_volume_plan_batch_id?: string | null;
+    volume_plan_status?: "idle" | "queued" | "started" | "done" | "failed";
     items: {
       id: string;
       batch_id: string;
@@ -462,6 +486,118 @@ export async function listGenerationLogs(
       created_at: string | null;
     }[];
   }>;
+}
+
+function sleep(ms: number) {
+  return new Promise<void>((r) => setTimeout(r, ms));
+}
+
+/** 轮询生成日志直到指定章节生成批次结束（done / failed） */
+export async function waitForChapterGenerationBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { limit: 80 });
+    if (r.latest_chapter_gen_batch_id === batchId) {
+      if (r.chapter_generation_status === "done") return "done";
+      if (r.chapter_generation_status === "failed") return "failed";
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error("等待章节生成超时，请稍后在生成日志中查看");
+}
+
+/** 轮询直到指定记忆刷新批次到达终态 */
+export async function waitForMemoryRefreshBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+) {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { limit: 120 });
+    if (r.latest_refresh_batch_id === batchId) {
+      const o = r.refresh_outcome ?? "idle";
+      if (o === "ok" || o === "warning" || o === "blocked" || o === "failed") {
+        return r;
+      }
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error("等待记忆刷新超时，请稍后在生成日志中查看");
+}
+
+export async function clearGenerationLogs(novelId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/logs/clear`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; message: string }>;
+}
+
+/** 轮询直到指定卷章计划批次结束 */
+export async function waitForVolumePlanBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { limit: 80 });
+    if (r.latest_volume_plan_batch_id === batchId) {
+      if (r.volume_plan_status === "done") return "done";
+      if (r.volume_plan_status === "failed") return "failed";
+    }
+    await sleep(intervalMs);
+  }
+  throw new Error("等待卷章计划生成超时，请稍后在生成日志中查看");
+}
+
+/** 轮询指定批次的一致性修订任务 */
+export async function waitForChapterConsistencyBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 120 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("chapter_consistency_done")) return "done";
+    if (ev.has("chapter_consistency_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待一致性修订超时，请稍后在生成日志中查看");
+}
+
+/** 轮询指定批次的改稿任务 */
+export async function waitForChapterReviseBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 120 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("chapter_revise_done")) return "done";
+    if (ev.has("chapter_revise_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待改稿超时，请稍后在生成日志中查看");
 }
 
 export async function patchChapter(
@@ -508,12 +644,31 @@ export async function approveChapter(chapterId: string) {
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{
     status: "ok";
-    incremental_memory_status?: "applied" | "failed" | "none";
+    already_approved?: boolean;
+    incremental_memory_status?:
+      | "applied"
+      | "failed"
+      | "none"
+      | "queued"
+      | "enqueue_failed";
     incremental_memory_version?: number | null;
     incremental_memory_batch_id?: string | null;
+    incremental_memory_task_id?: string | null;
     memory_refresh_status?: "queued" | "skipped" | "none";
     memory_refresh_task_id?: string | null;
     memory_refresh_batch_id?: string | null;
+  }>;
+}
+
+export async function retryChapterMemory(chapterId: string) {
+  const r = await apiFetch(`${BASE}/chapters/${chapterId}/memory-retry`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "queued";
+    batch_id: string;
+    task_id?: string | null;
   }>;
 }
 
@@ -523,7 +678,12 @@ export async function reviseChapter(chapterId: string, user_prompt: string) {
     body: JSON.stringify({ user_prompt }),
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return r.json() as Promise<{
+    status: string;
+    batch_id?: string;
+    task_id?: string | null;
+    message?: string;
+  }>;
 }
 
 export async function applyChapterRevision(chapterId: string) {
@@ -539,7 +699,12 @@ export async function consistencyFixChapter(chapterId: string) {
     method: "POST",
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  return r.json() as Promise<{
+    status: string;
+    batch_id?: string;
+    task_id?: string | null;
+    message?: string;
+  }>;
 }
 
 export async function discardChapterRevision(chapterId: string) {
@@ -561,6 +726,8 @@ export async function getMemory(novelId: string) {
     has_readable_override?: boolean;
     summary: string;
     created_at?: string | null;
+    schema_guide?: MemorySchemaGuide;
+    health?: MemoryHealth;
   }>;
 }
 
@@ -571,7 +738,31 @@ export function formatMemoryPlotLine(item: unknown): string {
   if (typeof item === "object" && item !== null) {
     const o = item as Record<string, unknown>;
     const body = o.body;
-    if (typeof body === "string" && body.trim()) return body.trim();
+    if (typeof body === "string" && body.trim()) {
+      const meta: string[] = [];
+      if (typeof o.plot_type === "string" && o.plot_type && o.plot_type !== "Transient") {
+        meta.push(String(o.plot_type));
+      }
+      if (typeof o.priority === "number" && o.priority > 0) {
+        meta.push(`prio=${o.priority}`);
+      }
+      if (typeof o.estimated_duration === "number" && o.estimated_duration > 0) {
+        meta.push(`约${o.estimated_duration}章`);
+      }
+      if (o.is_stale === true) {
+        meta.push("stale");
+      }
+      const head = meta.length ? `[${meta.join(" / ")}] ${body.trim()}` : body.trim();
+      const stage =
+        typeof o.current_stage === "string" && o.current_stage.trim()
+          ? `｜当前阶段：${o.current_stage.trim()}`
+          : "";
+      const resolveWhen =
+        typeof o.resolve_when === "string" && o.resolve_when.trim()
+          ? `｜收束条件：${o.resolve_when.trim()}`
+          : "";
+      return `${head}${stage}${resolveWhen}`;
+    }
     const s = o.summary ?? o.title;
     if (typeof s === "string" && s.trim()) return s.trim();
     try {
@@ -583,6 +774,21 @@ export function formatMemoryPlotLine(item: unknown): string {
   return String(item);
 }
 
+export type MemorySchemaGuide = {
+  open_plots?: { purpose?: string; rules?: string[]; template?: Record<string, unknown> };
+  key_facts?: { purpose?: string; rules?: string[] };
+  notes?: { purpose?: string; rules?: string[] };
+  forbidden_constraints?: { purpose?: string; rules?: string[] };
+  entity_naming?: { purpose?: string; rules?: string[] };
+  entity_scheduling?: { purpose?: string; rules?: string[] };
+};
+
+export type MemoryHealth = {
+  latest_chapter_no: number;
+  stale_plots: Array<Record<string, unknown>>;
+  overdue_plots: Array<Record<string, unknown>>;
+};
+
 export type NormalizedMemoryPayload = {
   memory_version: number;
   outline: {
@@ -592,20 +798,51 @@ export type NormalizedMemoryPayload = {
     themes: unknown[];
     notes: unknown[];
     timeline_archive_summary: unknown[];
+    forbidden_constraints: unknown[];
   };
-  skills: { name: string; detail: Record<string, unknown> }[];
-  inventory: { label: string; detail: Record<string, unknown> }[];
-  pets: { name: string; detail: Record<string, unknown> }[];
+  skills: {
+    name: string;
+    detail: Record<string, unknown>;
+    aliases: string[];
+    influence_score: number;
+    is_active: boolean;
+  }[];
+  inventory: {
+    label: string;
+    detail: Record<string, unknown>;
+    aliases: string[];
+    influence_score: number;
+    is_active: boolean;
+  }[];
+  pets: {
+    name: string;
+    detail: Record<string, unknown>;
+    aliases: string[];
+    influence_score: number;
+    is_active: boolean;
+  }[];
   characters: {
     name: string;
     role: string;
     status: string;
     traits: unknown[];
     detail: Record<string, unknown>;
+    aliases: string[];
+    influence_score: number;
+    is_active: boolean;
   }[];
   relations: { from: string; to: string; relation: string }[];
   /** 与后端一致：多为 { body, plot_type, priority, estimated_duration }[] */
-  open_plots: unknown[];
+  open_plots: Array<{
+    body: string;
+    plot_type: string;
+    priority: number;
+    estimated_duration: number;
+    current_stage?: string;
+    resolve_when?: string;
+    introduced_chapter?: number;
+    last_touched_chapter?: number;
+  }>;
   chapters: {
     chapter_no: number;
     chapter_title: string;
@@ -613,6 +850,8 @@ export type NormalizedMemoryPayload = {
     causal_results: string[];
     open_plots_added: unknown[];
     open_plots_resolved: unknown[];
+    emotional_state?: string;
+    unresolved_hooks?: string[];
   }[];
 };
 
@@ -620,7 +859,13 @@ export async function getMemoryNormalized(novelId: string) {
   const r = await apiFetch(`${BASE}/${novelId}/memory/normalized`);
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<
-    { status: "empty"; data: null } | { status: "ok"; data: NormalizedMemoryPayload | null }
+    | { status: "empty"; data: null; schema_guide?: MemorySchemaGuide; health?: MemoryHealth }
+    | {
+        status: "ok";
+        data: NormalizedMemoryPayload | null;
+        schema_guide?: MemorySchemaGuide;
+        health?: MemoryHealth;
+      }
   >;
 }
 
@@ -629,7 +874,40 @@ export async function rebuildMemoryNormalized(novelId: string) {
     method: "POST",
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<{ status: "ok"; data: NormalizedMemoryPayload | null }>;
+  return r.json() as Promise<{
+    status: "ok";
+    data: NormalizedMemoryPayload | null;
+    schema_guide?: MemorySchemaGuide;
+    health?: MemoryHealth;
+  }>;
+}
+
+export async function getMemoryHistory(novelId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/history`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<
+    {
+      version: number;
+      summary: string;
+      created_at: string | null;
+    }[]
+  >;
+}
+
+export async function clearMemory(novelId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/clear`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; version: number }>;
+}
+
+export async function rollbackMemory(novelId: string, version: number) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/rollback/${version}`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; new_version: number }>;
 }
 
 /** 保存完整 payload_json 和/或人工「中文阅读」覆盖（readable_zh_override）。 */
@@ -656,22 +934,33 @@ export async function refreshMemory(novelId: string) {
     method: "POST",
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<
-    | {
-        version: number;
-        payload_json: string;
-        readable_zh: string;
-      }
-    | {
-        status: "validation_failed";
-        version: number;
-        payload_json: string;
-        readable_zh: string;
-        candidate_json: string;
-        candidate_readable_zh: string;
-        errors: string[];
-      }
-  >;
+  return r.json() as Promise<{
+    status: "queued";
+    batch_id: string;
+    task_id?: string | null;
+    message?: string;
+  }>;
+}
+
+export async function applyRefreshMemoryCandidate(
+  novelId: string,
+  body: {
+    current_version: number;
+    candidate_json: string;
+    confirmation_token: string;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/refresh/apply`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    version: number;
+    payload_json: string;
+    readable_zh: string;
+  }>;
 }
 
 export async function getNovelMetrics(novelId: string) {
@@ -711,7 +1000,18 @@ export async function getNovelMetrics(novelId: string) {
       last_approved_chapter_no: number | null;
       prev_approved_chapter_no: number | null;
       is_consecutive_last_two_approved: boolean;
+      next_chapter_no?: number;
+      current_arc_title?: string;
+      current_arc_from?: unknown;
+      current_arc_to?: unknown;
+      current_arc_has_beats?: boolean;
+      pacing_flags?: string[];
+      volumes_count?: number;
+      planned_chapters_count?: number;
+      has_next_chapter_plan?: boolean;
+      memory_health?: MemoryHealth;
     };
+    schema_guide?: MemorySchemaGuide;
   }>;
 }
 

@@ -21,10 +21,6 @@ class NovelMemoryNormOutline(Base):
     )
     memory_version: Mapped[int] = mapped_column(Integer, default=0)
     main_plot: Mapped[str] = mapped_column(Text, default="")
-    world_rules_json: Mapped[str] = mapped_column(Text, default="[]")
-    arcs_json: Mapped[str] = mapped_column(Text, default="[]")
-    themes_json: Mapped[str] = mapped_column(Text, default="[]")
-    notes_json: Mapped[str] = mapped_column(Text, default="[]")
     timeline_archive_json: Mapped[str] = mapped_column(Text, default="[]")
     # 全局硬约束：禁止事项/设定防火墙（JSON 字符串数组）
     forbidden_constraints_json: Mapped[str] = mapped_column(Text, default="[]")
@@ -137,6 +133,10 @@ class NovelMemoryNormPlot(Base):
     plot_type: Mapped[str] = mapped_column(String(32), default="Transient")
     priority: Mapped[int] = mapped_column(Integer, default=0)
     estimated_duration: Mapped[int] = mapped_column(Integer, default=0)
+    current_stage: Mapped[str] = mapped_column(Text, default="")
+    resolve_when: Mapped[str] = mapped_column(Text, default="")
+    introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    last_touched_chapter: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class NovelMemoryNormChapter(Base):

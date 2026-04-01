@@ -1,6 +1,7 @@
 from app.models.agent import AgentConfig
 from app.models.media import MediaAsset
 from app.models.novel import Chapter, ChapterFeedback, Novel, NovelMemory
+from app.models.user import ModelPrice, PointsTransaction, TokenUsage, User
 from app.models.novel_memory_norm import (  # noqa: F401 — metadata for create_all
     NovelMemoryNormChapter,
     NovelMemoryNormCharacter,
@@ -16,6 +17,10 @@ from app.models.project import Project
 from app.models.workflow import Workflow
 
 __all__ = [
+    "User",
+    "ModelPrice",
+    "TokenUsage",
+    "PointsTransaction",
     "Workflow",
     "Project",
     "MediaAsset",

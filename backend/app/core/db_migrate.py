@@ -157,6 +157,10 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
         ("novel_memory_norm_plots", "plot_type VARCHAR(32) DEFAULT 'Transient'"),
         ("novel_memory_norm_plots", "priority INTEGER DEFAULT 0"),
         ("novel_memory_norm_plots", "estimated_duration INTEGER DEFAULT 0"),
+        ("novel_memory_norm_plots", "current_stage TEXT DEFAULT ''"),
+        ("novel_memory_norm_plots", "resolve_when TEXT DEFAULT ''"),
+        ("novel_memory_norm_plots", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_plots", "last_touched_chapter INTEGER DEFAULT 0"),
         ("novel_memory_norm_chapters", "emotional_state TEXT DEFAULT ''"),
         ("novel_memory_norm_chapters", "unresolved_hooks_json TEXT DEFAULT '[]'"),
     ]
@@ -173,6 +177,10 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
         ("novel_memory_norm_plots", "plot_type VARCHAR(32) DEFAULT 'Transient'"),
         ("novel_memory_norm_plots", "priority INTEGER DEFAULT 0"),
         ("novel_memory_norm_plots", "estimated_duration INTEGER DEFAULT 0"),
+        ("novel_memory_norm_plots", "current_stage TEXT DEFAULT ''"),
+        ("novel_memory_norm_plots", "resolve_when TEXT DEFAULT ''"),
+        ("novel_memory_norm_plots", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_plots", "last_touched_chapter INTEGER DEFAULT 0"),
         ("novel_memory_norm_chapters", "emotional_state TEXT DEFAULT ''"),
         ("novel_memory_norm_chapters", "unresolved_hooks_json TEXT DEFAULT '[]'"),
     ]
@@ -200,4 +208,74 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
                 )
     except Exception:
         logger.exception("db migrate: ensure_novel_memory_norm_extended_columns failed")
+
+
+def ensure_user_isolation_columns(engine: Engine) -> None:
+    """
+    轻量迁移：为 novels / projects / workflows 补 user_id（多用户隔离）。
+    users 表须已由 metadata.create_all 创建。
+    """
+    sqlite_specs = [
+        ("novels", "user_id VARCHAR(36)"),
+        ("projects", "user_id VARCHAR(36)"),
+        ("workflows", "user_id VARCHAR(36)"),
+    ]
+    pg_specs = [
+        ("novels", "user_id VARCHAR(36)"),
+        ("projects", "user_id VARCHAR(36)"),
+        ("workflows", "user_id VARCHAR(36)"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "sqlite":
+                for table, ddl in sqlite_specs:
+                    col = ddl.split()[0]
+                    if _has_column_sqlite(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (sqlite)", table, col)
+            elif dialect in ("postgresql", "postgres"):
+                for table, ddl in pg_specs:
+                    col = ddl.split()[0]
+                    if _has_column_postgres(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (postgres)", table, col)
+            else:
+                logger.warning(
+                    "db migrate: ensure_user_isolation_columns unsupported dialect=%s",
+                    dialect,
+                )
+    except Exception:
+        logger.exception("db migrate: ensure_user_isolation_columns failed")
+
+
+def relax_novel_memory_norm_columns(engine: Engine) -> None:
+    """
+    轻量迁移：放宽 novel_memory_norm_outline 表中已移除字段的约束。
+    原因：代码中移除了 world_rules_json, arcs_json, themes_json, notes_json，
+    但旧数据库中这些列可能存在且为 NOT NULL，导致插入失败。
+    """
+    cols = ("world_rules_json", "arcs_json", "themes_json", "notes_json")
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect in ("postgresql", "postgres"):
+                for c in cols:
+                    if _has_column_postgres(conn, "novel_memory_norm_outline", c):
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE novel_memory_norm_outline ALTER COLUMN {c} DROP NOT NULL"
+                            )
+                        )
+                        logger.info("db migrate: relaxed novel_memory_norm_outline.%s (postgres)", c)
+            elif dialect == "sqlite":
+                # SQLite 不支持直接 DROP NOT NULL，且我们不再向这些列写数据，
+                # 如果是新创建的表，这些列根本不存在；如果是旧表，SQLite 默认允许 NULL（除非显式指定）。
+                # 实际上 SQLite 的 ALTER TABLE 限制很多，通常需要重建表。
+                # 鉴于报错主要发生在 Postgres，SQLite 暂时跳过。
+                pass
+    except Exception:
+        logger.exception("db migrate: relax_novel_memory_norm_columns failed")
 

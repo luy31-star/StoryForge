@@ -1,4 +1,4 @@
-# 基础镜像默认经 DaoCloud；海外可在项目根 .env 设 DOCKER_HUB_PREFIX=docker.io/library
+# 默认 DaoCloud Hub 镜像；海外时在项目根 .env 设 DOCKER_HUB_PREFIX=docker.io/library
 
 services:
   frontend:

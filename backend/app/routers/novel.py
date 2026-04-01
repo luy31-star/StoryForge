@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 from pathlib import Path
@@ -15,6 +16,8 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
+from app.core.deps import get_current_user, require_chapter_access, require_novel_access
+from app.models.user import User
 from app.models.novel import (
     Chapter,
     ChapterFeedback,
@@ -29,25 +32,43 @@ from app.services.memory_readable import (
 )
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_repo import (
+    build_memory_health_summary,
+    build_memory_schema_guide,
     chapter_content_metrics,
+    chapter_plan_exists,
     format_approved_chapters_summary,
     format_continuity_excerpts,
     format_recent_approved_fulltext_context,
     format_volume_event_summary,
     format_volume_progress_anchor,
+    has_any_chapter_plan,
     latest_memory_json,
     next_chapter_no_from_approved,
+    planned_chapter_numbers_needing_body,
     _select_arc_for_chapter,
 )
-from app.models.volume import NovelChapterPlan
 from app.services.memory_normalize_sync import (
     normalized_memory_to_dict,
     replace_normalized_from_payload,
     sync_json_snapshot_from_normalized,
 )
 from app.services.novel_storage import ensure_local_novel_dir, save_novel_reference
+from app.services.novel_generation_common import (
+    append_generation_log as _append_generation_log,
+    build_chapter_plan_hint as _build_chapter_plan_hint,
+    ensure_chapter_heading as _ensure_chapter_heading,
+    has_pending_chapter_consistency_batch,
+    has_pending_chapter_generation_batch,
+    has_pending_chapter_revise_batch,
+    has_pending_memory_refresh_batch,
+    memory_refresh_confirmation_token,
+)
 from app.tasks.novel_tasks import (
+    novel_chapter_approve_memory_delta,
+    novel_chapter_consistency_fix,
+    novel_chapter_revise,
     novel_consolidate_memory,
+    novel_generate_chapters_for_novel,
     novel_refresh_memory_for_novel,
     novel_sync_json_snapshot,
 )
@@ -56,137 +77,14 @@ router = APIRouter(prefix="/api/novels", tags=["novels"])
 logger = logging.getLogger(__name__)
 
 
-def _build_chapter_plan_hint(
-    chapter_no: int,
-    plan_title: str,
-    beats: dict[str, Any],
-    added: list[Any],
-    resolved: list[Any],
-) -> str:
-    """
-    构建"执行清单"格式的章节计划提示词。
+def _novel_llm(user: User) -> NovelLLMService:
+    return NovelLLMService(billing_user_id=user.id)
 
-    将原本自由的 plot_summary 转化为结构化的场景清单（如有），
-    并明确每个章节的执行检查点，确保LLM按步骤完成而非跳过。
-    """
-    lines: list[str] = [
-        "【本章执行清单（逐项勾选，禁止跳过）】",
-        f"计划章名：{plan_title}",
-        "",
-        "=== 执行检查点（完成后勾选） ===",
-    ]
 
-    # 核心 beats 转化为检查点
-    goal = beats.get("goal", "")
-    conflict = beats.get("conflict", "")
-    turn = beats.get("turn", "")
-    hook = beats.get("hook", "")
-
-    if isinstance(goal, str) and goal.strip():
-        lines.append(f"[ ] 开局目标：{goal.strip()}")
-    if isinstance(conflict, str) and conflict.strip():
-        lines.append(f"[ ] 核心冲突：{conflict.strip()}")
-    if isinstance(turn, str) and turn.strip():
-        lines.append(f"[ ] 情节转折：{turn.strip()}")
-    if isinstance(hook, str) and hook.strip():
-        lines.append(f"[ ] 结尾钩子：{hook.strip()}")
-
-    lines.append("")
-
-    # 剧情梗概 - 支持 scene list 结构
-    ps = beats.get("plot_summary")
-    scenes: list[dict[str, Any]] = []
-    if isinstance(ps, list):
-        scenes = [s for s in ps if isinstance(s, dict)]
-    elif isinstance(ps, str) and ps.strip():
-        lines.append(f"=== 本章剧情梗概 ===\n{ps.strip()}")
-
-    if scenes:
-        lines.append("=== 场景分解（必须按顺序完成，每场景约500-800字） ===")
-        total_words = 0
-        for i, scene in enumerate(scenes, 1):
-            if not isinstance(scene, dict):
-                continue
-            scene_goal = scene.get("goal", "")
-            scene_content = scene.get("content", "")
-            scene_words = scene.get("words", 600)
-            if isinstance(scene_words, int) and scene_words > 0:
-                total_words += scene_words
-            else:
-                total_words += 600
-
-            lines.append(f"\n场景{i}:")
-            if scene_goal:
-                lines.append(f"  [ ] 目标：{scene_goal}")
-            if scene_content:
-                lines.append(f"  内容：{scene_content}")
-            lines.append(f"  建议字数：约{scene_words}字")
-        lines.append(f"\n本章建议总字数：{total_words}字")
-
-    lines.append("")
-
-    # 进度边界
-    pa = beats.get("progress_allowed")
-    if isinstance(pa, str) and pa.strip():
-        lines.append(f"=== 进度边界·允许推进 ===\n{pa.strip()}")
-    elif isinstance(pa, list) and pa:
-        bullets = "\n".join(f"  · {x}" for x in pa if str(x).strip())
-        if bullets:
-            lines.append(f"=== 进度边界·允许推进 ===\n{bullets}")
-
-    # 绝对禁止
-    mn = beats.get("must_not")
-    if isinstance(mn, list) and mn:
-        bullets = "\n".join(f"  [ ] 禁止：{x}" for x in mn if str(x).strip())
-        if bullets:
-            lines.append(f"\n=== 绝对禁止（违反视为不合格） ===\n{bullets}")
-
-    # 延后解锁
-    rsv = beats.get("reserved_for_later")
-    if isinstance(rsv, list) and rsv:
-        parts: list[str] = []
-        for it in rsv:
-            if not isinstance(it, dict):
-                continue
-            item = it.get("item")
-            nb = it.get("not_before_chapter")
-            if not (isinstance(item, str) and item.strip()):
-                continue
-            item_s = item.strip()
-            if isinstance(nb, int):
-                parts.append(
-                    f"  [ ] 禁写「{item_s}」——须在第{nb}章及之后才可出现"
-                )
-            else:
-                parts.append(f"  [ ] 禁写「{item_s}」——留待后续章")
-        if parts:
-            lines.append("\n=== 延后解锁（当前章不得写出） ===\n" + "\n".join(parts))
-
-    lines.append("")
-
-    # open_plots 意图
-    if added:
-        lines.append(f"=== Open Plots 新增意图 ===")
-        for item in added:
-            lines.append(f"  [ ] 可引入：{item}")
-    if resolved:
-        lines.append(f"=== Open Plots 收束意图（最多1条） ===")
-        for item in resolved[:1]:
-            lines.append(f"  [ ] 可收束：{item}")
-
-    lines.append("")
-
-    # 交付要求
-    lines.append(
-        "=== 交付要求 ===\n"
-        "1. 必须按【场景分解】顺序写作，禁止跳过或合并场景\n"
-        "2. 每个场景必须包含：可视化行动/对话/观察，禁止总结性叙述\n"
-        "3. 结尾必须留下明确的【钩子】，使下一章立即可写\n"
-        "4. 禁止在单章内完成多个关键事件（发现→验证→解决不得连跳）\n"
-        "5. 角色动机必须在场景中自然落地，而非通过旁白说明"
-    )
-
-    return "\n".join(lines)
+class ApplyMemoryRefreshCandidateBody(BaseModel):
+    current_version: int = Field(..., ge=0)
+    candidate_json: str = Field(..., min_length=2)
+    confirmation_token: str = Field(..., min_length=16)
 
 
 def _sse(event: str, data: dict[str, Any]) -> str:
@@ -241,6 +139,7 @@ class GenerateChapterBody(BaseModel):
     auto_consistency_check: bool = False
     # 按卷驱动：允许生成指定章（用于点击章计划条目生成正文）
     chapter_no: int | None = Field(default=None, ge=1, le=20000)
+    source: str | None = Field(default=None, description="章节来源，如 manual 或 batch_auto")
 
 
 class ChapterReviseBody(BaseModel):
@@ -287,71 +186,37 @@ class ChapterContextChatBody(BaseModel):
     messages: list[InspirationChatMessage] = Field(..., min_length=1, max_length=40)
 
 
-def _append_generation_log(
-    db: Session,
-    *,
-    novel_id: str,
-    batch_id: str,
-    event: str,
-    message: str,
-    level: str = "info",
-    chapter_no: int | None = None,
-    meta: dict[str, Any] | None = None,
-) -> None:
-    row = NovelGenerationLog(
-        novel_id=novel_id,
-        batch_id=batch_id,
-        level=level,
-        event=event,
-        chapter_no=chapter_no,
-        message=message,
-        meta_json=json.dumps(meta or {}, ensure_ascii=False),
-    )
-    db.add(row)
-
-
-def _extract_title_from_generated_content(chapter_no: int, content: str) -> str:
-    first = (content or "").splitlines()[0].strip() if (content or "").strip() else ""
-    if not first:
-        return f"第{chapter_no}章"
-    m = re.match(rf"^第\s*{chapter_no}\s*章\s*[《<（(]?\s*(.+?)\s*[》>）)]?\s*$", first)
-    if m and m.group(1).strip():
-        return m.group(1).strip()
-    m2 = re.match(r"^第\s*\d+\s*章\s*[：:\-—]?\s*(.+)$", first)
-    if m2 and m2.group(1).strip():
-        return m2.group(1).strip()
-    return f"第{chapter_no}章"
-
-
-def _ensure_chapter_heading(
-    chapter_no: int, content: str, *, title_hint: str = ""
-) -> tuple[str, str]:
+def _resolve_chapter_nos_for_generate(
+    db: Session, novel_id: str, body: GenerateChapterBody
+) -> tuple[list[int], int]:
     """
-    兜底：保证正文首行为 `第N章《章名》`，并返回可用于落库的章节标题。
+    解析本次要生成的章号列表（须每章在章计划中已有条目）。
+    批量：按章号升序取前 count 个「有计划且尚缺正文」的章；单章：指定 chapter_no。
+    返回 (chapter_nos, requested_cap)；批量时实际章数可能少于 requested_cap。
     """
-    raw = (content or "").strip()
-    title = (title_hint or "").strip() or _extract_title_from_generated_content(chapter_no, raw)
-    if title.startswith(f"第{chapter_no}章"):
-        title = title.replace(f"第{chapter_no}章", "").strip(" 《》:：-—\t")
-    if not title:
-        # 最后兜底，确保永远有章名
-        title = f"第{chapter_no}章"
-    heading = f"第{chapter_no}章《{title}》"
-
-    if not raw:
-        return title, f"{heading}\n\n（本章内容为空，待补写）"
-
-    first_line = raw.splitlines()[0].strip()
-    has_heading = bool(
-        re.match(rf"^第\s*{chapter_no}\s*章", first_line)
-        and ("《" in first_line or "章" in first_line)
-    )
-    if has_heading:
-        # 已有标题行时，仅规范为统一格式
-        body = "\n".join(raw.splitlines()[1:]).strip()
-        return title, (f"{heading}\n\n{body}" if body else heading)
-
-    return title, f"{heading}\n\n{raw}"
+    requested_cap = max(1, min(body.count, 5))
+    if body.chapter_no is not None:
+        if body.count != 1:
+            raise HTTPException(400, "指定 chapter_no 时 count 必须为 1")
+        cn = int(body.chapter_no)
+        if not chapter_plan_exists(db, novel_id, cn):
+            raise HTTPException(
+                400,
+                "请先在卷章计划中生成该章计划，再生成正文",
+            )
+        return [cn], requested_cap
+    chapter_nos = planned_chapter_numbers_needing_body(db, novel_id, requested_cap)
+    if not chapter_nos:
+        if not has_any_chapter_plan(db, novel_id):
+            raise HTTPException(
+                400,
+                "请先在卷章计划中生成计划，再批量生成正文",
+            )
+        raise HTTPException(
+            400,
+            "章计划中待生成正文的章节已全部完成，请先补充卷章计划或审定已有章节",
+        )
+    return chapter_nos, requested_cap
 
 
 def _enqueue_auto_refresh_memory_from_approved(
@@ -395,10 +260,12 @@ def _enqueue_auto_refresh_memory_from_approved(
 
 @router.post("/inspiration-chat")
 async def novel_inspiration_chat(
-    body: InspirationChatBody, db: Session = Depends(get_db)
+    body: InspirationChatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     """新建小说：多轮对话 + 联网搜索，获取创作灵感（302 Chat web-search）。"""
-    llm = NovelLLMService()
+    llm = _novel_llm(user)
     msgs = [{"role": m.role, "content": m.content} for m in body.messages]
     try:
         reply = await llm.inspiration_chat(msgs, db=db)
@@ -409,9 +276,11 @@ async def novel_inspiration_chat(
 
 @router.post("/inspiration-chat/stream")
 async def novel_inspiration_chat_stream(
-    body: InspirationChatBody, db: Session = Depends(get_db)
+    body: InspirationChatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    llm = NovelLLMService()
+    llm = _novel_llm(user)
     msgs = [{"role": m.role, "content": m.content} for m in body.messages]
 
     async def event_iter():
@@ -437,11 +306,12 @@ async def novel_inspiration_chat_stream(
 
 @router.post("/{novel_id}/chapter-chat")
 async def chapter_context_chat(
-    novel_id: str, body: ChapterContextChatBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: ChapterContextChatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     mem = latest_memory_json(db, novel_id)
     approved = (
         db.query(Chapter)
@@ -457,7 +327,7 @@ async def chapter_context_chat(
         max_chapters=settings.novel_memory_refresh_chapters,
     )
     continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
-    llm = NovelLLMService()
+    llm = _novel_llm(user)
     msgs = [{"role": m.role, "content": m.content} for m in body.messages]
     try:
         reply = await llm.chapter_context_chat(
@@ -475,11 +345,12 @@ async def chapter_context_chat(
 
 @router.post("/{novel_id}/chapter-chat/stream")
 async def chapter_context_chat_stream(
-    novel_id: str, body: ChapterContextChatBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: ChapterContextChatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> StreamingResponse:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     mem = latest_memory_json(db, novel_id)
     approved = (
         db.query(Chapter)
@@ -495,7 +366,7 @@ async def chapter_context_chat_stream(
         max_chapters=settings.novel_memory_refresh_chapters,
     )
     continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
-    llm = NovelLLMService()
+    llm = _novel_llm(user)
     msgs = [{"role": m.role, "content": m.content} for m in body.messages]
 
     async def event_iter():
@@ -527,8 +398,14 @@ async def chapter_context_chat_stream(
 
 
 @router.get("")
-def list_novels(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
-    rows = db.query(Novel).order_by(Novel.updated_at.desc()).all()
+def list_novels(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    q = db.query(Novel)
+    if not user.is_admin:
+        q = q.filter(Novel.user_id == user.id)
+    rows = q.order_by(Novel.updated_at.desc()).all()
     return [
         {
             "id": n.id,
@@ -544,7 +421,11 @@ def list_novels(db: Session = Depends(get_db)) -> list[dict[str, Any]]:
 
 
 @router.post("")
-def create_novel(body: NovelCreate, db: Session = Depends(get_db)) -> dict[str, str]:
+def create_novel(
+    body: NovelCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
     n = Novel(
         title=body.title,
         intro=body.intro,
@@ -552,6 +433,7 @@ def create_novel(body: NovelCreate, db: Session = Depends(get_db)) -> dict[str, 
         style=body.style,
         target_chapters=body.target_chapters,
         daily_auto_chapters=body.daily_auto_chapters,
+        user_id=user.id,
     )
     db.add(n)
     db.commit()
@@ -560,10 +442,12 @@ def create_novel(body: NovelCreate, db: Session = Depends(get_db)) -> dict[str, 
 
 
 @router.get("/{novel_id}")
-def get_novel(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+def get_novel(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = require_novel_access(db, novel_id, user)
     return {
         "id": n.id,
         "title": n.title,
@@ -585,11 +469,12 @@ def get_novel(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
 
 @router.patch("/{novel_id}")
 def patch_novel(
-    novel_id: str, body: NovelPatch, db: Session = Depends(get_db)
+    novel_id: str,
+    body: NovelPatch,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     data = body.model_dump(exclude_unset=True)
     for k, v in data.items():
         setattr(n, k, v)
@@ -598,10 +483,12 @@ def patch_novel(
 
 
 @router.delete("/{novel_id}")
-def delete_novel(novel_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+def delete_novel(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    n = require_novel_access(db, novel_id, user)
     # 注意：部分表（如 novel_generation_logs / novel_volumes / novel_chapter_plans）
     # 通过外键引用 novels，但未配置数据库级联删除；这里按顺序手动清理避免外键错误。
     try:
@@ -640,10 +527,9 @@ async def upload_reference(
     novel_id: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     data = await file.read()
     if len(data) > settings.reference_txt_max_bytes:
         raise HTTPException(
@@ -659,9 +545,13 @@ async def upload_reference(
 
 
 @router.get("/{novel_id}/reference/file")
-def download_local_reference(novel_id: str, db: Session = Depends(get_db)):
-    n = db.get(Novel, novel_id)
-    if not n or not n.reference_storage_key.startswith("local:"):
+def download_local_reference(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    n = require_novel_access(db, novel_id, user)
+    if not n.reference_storage_key.startswith("local:"):
         raise HTTPException(404, "无本地参考文件")
     part = n.reference_storage_key.removeprefix("local:")
     path = Path(settings.novel_local_upload_dir).resolve() / part
@@ -671,11 +561,13 @@ def download_local_reference(novel_id: str, db: Session = Depends(get_db)):
 
 
 @router.post("/{novel_id}/generate-framework")
-async def generate_framework(novel_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
-    llm = NovelLLMService()
+async def generate_framework(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    n = require_novel_access(db, novel_id, user)
+    llm = _novel_llm(user)
     md, fj = await llm.generate_framework(n, db=db)
     n.framework_markdown = md
     n.framework_json = fj
@@ -686,11 +578,12 @@ async def generate_framework(novel_id: str, db: Session = Depends(get_db)) -> di
 
 @router.post("/{novel_id}/confirm-framework")
 def confirm_framework(
-    novel_id: str, body: ConfirmFrameworkBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: ConfirmFrameworkBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     try:
         json.loads(body.framework_json)
     except json.JSONDecodeError:
@@ -820,11 +713,12 @@ def _auto_fill_framework_arcs(framework: dict[str, Any], *, fill_beats: bool) ->
 
 @router.post("/{novel_id}/framework/update")
 def update_framework(
-    novel_id: str, body: FrameworkUpdateBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: FrameworkUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
     try:
         fw = json.loads(body.framework_json)
     except json.JSONDecodeError as e:
@@ -848,7 +742,12 @@ def update_framework(
 
 
 @router.get("/{novel_id}/chapters")
-def list_chapters(novel_id: str, db: Session = Depends(get_db)) -> list[dict[str, Any]]:
+def list_chapters(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    require_novel_access(db, novel_id, user)
     rows = (
         db.query(Chapter)
         .filter(Chapter.novel_id == novel_id)
@@ -883,357 +782,153 @@ def list_chapters(novel_id: str, db: Session = Depends(get_db)) -> list[dict[str
 
 @router.post("/{novel_id}/chapters/generate")
 async def generate_chapters(
-    novel_id: str, body: GenerateChapterBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: GenerateChapterBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    started = time.perf_counter()
-    batch_id = f"gen-{int(time.time())}-{novel_id[:8]}"
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    """入队后台批量生成章节；逻辑在 Celery worker 中执行。"""
+    n = require_novel_access(db, novel_id, user)
     if not n.framework_confirmed:
         raise HTTPException(400, "请先确认小说框架后再生成章节")
-    mem = latest_memory_json(db, novel_id)
-    llm = NovelLLMService()
-    created: list[str] = []
-    base_no = next_chapter_no_from_approved(db, novel_id)
-    if body.chapter_no is not None:
-        # 指定章：只生成这一章
-        if body.count != 1:
-            raise HTTPException(400, "指定 chapter_no 时 count 必须为 1")
-        base_no = int(body.chapter_no)
-    do_consistency_check = bool(body.auto_consistency_check)
+    if has_pending_chapter_generation_batch(db, novel_id):
+        raise HTTPException(
+            409,
+            "当前已有章节生成任务进行中，请在「生成日志」中查看进度后再试",
+        )
+    chapter_nos, requested_cap = _resolve_chapter_nos_for_generate(db, novel_id, body)
+    batch_id = f"gen-{int(time.time())}-{novel_id[:8]}"
+    
+    # 确定来源：如果 body 中有指定则用指定的，否则根据是否是单章生成来判断
+    source = body.source
+    if not source:
+        source = "manual" if body.chapter_no is not None else "batch_auto"
+
+    payload: dict[str, Any] = {
+        "title_hint": body.title_hint,
+        "chapter_nos": chapter_nos,
+        "requested_count": requested_cap,
+        "use_cold_recall": body.use_cold_recall,
+        "cold_recall_items": body.cold_recall_items,
+        "auto_consistency_check": body.auto_consistency_check,
+        "source": source,
+    }
     logger.info(
-        "generate_chapters start | novel_id=%s title=%r count=%s base_no=%s cold_recall=%s cold_items=%s consistency_check=%s mem_chars=%s",
+        "generate_chapters enqueue | novel_id=%s count=%s chapter_nos=%s batch_id=%s",
         novel_id,
-        n.title,
-        body.count,
-        base_no,
-        body.use_cold_recall,
-        body.cold_recall_items,
-        do_consistency_check,
-        len(mem or ""),
+        len(chapter_nos),
+        chapter_nos,
+        batch_id,
     )
     _append_generation_log(
         db,
         novel_id=novel_id,
         batch_id=batch_id,
-        event="batch_start",
-        message=f"开始生成 {body.count} 章（从第 {base_no} 章起）",
+        event="chapter_generation_queued",
+        message=f"已入队后台串行生成 {len(chapter_nos)} 章（章号：{', '.join(str(x) for x in chapter_nos)}）",
         meta={
-            "count": body.count,
-            "base_no": base_no,
-            "use_cold_recall": body.use_cold_recall,
-            "cold_recall_items": body.cold_recall_items,
-            "consistency_check": do_consistency_check,
+            "requested_count": requested_cap,
+            "actual_count": len(chapter_nos),
+            "chapter_nos": chapter_nos,
+            **payload,
         },
     )
+    db.commit()
     try:
-        for idx in range(body.count):
-            step_start = time.perf_counter()
-            continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
-            full_context = format_recent_approved_fulltext_context(
-                db,
-                novel_id,
-                max_chapters=max(1, settings.novel_recent_full_context_chapters),
-            )
-            no = base_no + idx
-            # 若存在章计划，注入本章计划作为强约束（按卷驱动）
-            chapter_plan_hint = ""
-            plan = (
-                db.query(NovelChapterPlan)
-                .filter(NovelChapterPlan.novel_id == novel_id, NovelChapterPlan.chapter_no == no)
-                .order_by(NovelChapterPlan.updated_at.desc())
-                .first()
-            )
-            if plan:
-                try:
-                    beats = json.loads(plan.beats_json or "{}")
-                except Exception:
-                    beats = {}
-                try:
-                    added = json.loads(plan.open_plots_intent_added_json or "[]")
-                except Exception:
-                    added = []
-                try:
-                    resolved = json.loads(plan.open_plots_intent_resolved_json or "[]")
-                except Exception:
-                    resolved = []
-                chapter_plan_hint = _build_chapter_plan_hint(
-                    no, plan.chapter_title, beats, added, resolved
-                )
-            logger.info(
-                "generate_chapters step start | novel_id=%s chapter_no=%s idx=%s/%s continuity_chars=%s",
-                novel_id,
-                no,
-                idx + 1,
-                body.count,
-                len(continuity or ""),
-            )
-            _append_generation_log(
-                db,
-                novel_id=novel_id,
-                batch_id=batch_id,
-                event="chapter_start",
-                chapter_no=no,
-                message=f"第 {no} 章开始生成（{idx + 1}/{body.count}）",
-                meta={"continuity_chars": len(continuity or "")},
-            )
-            raw_content = await llm.generate_chapter(
-                n,
-                no,
-                (plan.chapter_title if plan and plan.chapter_title else body.title_hint),
-                mem,
-                continuity,
-                full_context,
-                chapter_plan_hint=chapter_plan_hint,
-                db=db,
-                use_cold_recall=body.use_cold_recall,
-                cold_recall_items=body.cold_recall_items,
-            )
-            content = raw_content
-            draft_metrics = chapter_content_metrics(raw_content)
-            logger.info(
-                "generate_chapters step draft done | novel_id=%s chapter_no=%s raw_chars=%s body_chars=%s paragraphs=%s",
-                novel_id,
-                no,
-                len(raw_content or ""),
-                draft_metrics["body_chars"],
-                draft_metrics["paragraph_count"],
-            )
-            _append_generation_log(
-                db,
-                novel_id=novel_id,
-                batch_id=batch_id,
-                event="chapter_draft_done",
-                chapter_no=no,
-                message=f"第 {no} 章初稿生成完成（正文约 {draft_metrics['body_chars']} 字）",
-                meta={
-                    "raw_chars": len(raw_content or ""),
-                    **draft_metrics,
-                },
-            )
-            if do_consistency_check:
-                try:
-                    content = await llm.check_and_fix_chapter(
-                        n, no, body.title_hint, mem, continuity, raw_content, db=db
-                    )
-                    fixed_metrics = chapter_content_metrics(content)
-                    logger.info(
-                        "generate_chapters step consistency done | novel_id=%s chapter_no=%s fixed_chars=%s body_chars=%s paragraphs=%s",
-                        novel_id,
-                        no,
-                        len(content or ""),
-                        fixed_metrics["body_chars"],
-                        fixed_metrics["paragraph_count"],
-                    )
-                    _append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_consistency_done",
-                        chapter_no=no,
-                        message=f"第 {no} 章一致性修订完成（正文约 {fixed_metrics['body_chars']} 字）",
-                        meta={
-                            "fixed_chars": len(content or ""),
-                            **fixed_metrics,
-                        },
-                    )
-                except Exception:
-                    logger.exception(
-                        "generate_chapters step consistency failed, fallback raw | novel_id=%s chapter_no=%s",
-                        novel_id,
-                        no,
-                    )
-                    _append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_consistency_failed",
-                        chapter_no=no,
-                        level="error",
-                        message=f"第 {no} 章一致性修订失败，已回退初稿",
-                    )
-                    content = raw_content
-            normalized_title, normalized_content = _ensure_chapter_heading(
-                no, content, title_hint=body.title_hint
-            )
-            content = normalized_content
-            try:
-                memory_delta_result = await llm.propose_memory_update_from_chapter(
-                    n,
-                    chapter_no=no,
-                    chapter_title=normalized_title,
-                    chapter_text=content,
-                    prev_memory=mem,
-                    db=db,
-                )
-                if memory_delta_result.get("ok"):
-                    mem = str(memory_delta_result.get("payload_json") or mem)
-                    _append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_memory_delta_applied",
-                        chapter_no=no,
-                        message=f"第 {no} 章工作记忆已更新",
-                        meta=memory_delta_result.get("stats") or {},
-                    )
-                else:
-                    _append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_memory_delta_failed",
-                        chapter_no=no,
-                        level="error",
-                        message=f"第 {no} 章工作记忆更新失败，已保留旧记忆",
-                        meta={"errors": memory_delta_result.get("errors") or []},
-                    )
-            except Exception:
-                logger.exception(
-                    "generate_chapters memory delta failed | novel_id=%s chapter_no=%s",
-                    novel_id,
-                    no,
-                )
-                _append_generation_log(
-                    db,
-                    novel_id=novel_id,
-                    batch_id=batch_id,
-                    event="chapter_memory_delta_failed",
-                    chapter_no=no,
-                    level="error",
-                    message=f"第 {no} 章工作记忆更新异常，已保留旧记忆",
-                )
-            saved_metrics = chapter_content_metrics(content)
-            ch = (
-                db.query(Chapter)
-                .filter(Chapter.novel_id == novel_id, Chapter.chapter_no == no)
-                .order_by(Chapter.updated_at.desc())
-                .first()
-            )
-            if ch and ch.status != "approved":
-                ch.title = normalized_title
-                ch.content = content
-                ch.pending_content = ""
-                ch.pending_revision_prompt = ""
-                ch.status = "pending_review"
-                ch.source = "manual"
-            else:
-                ch = Chapter(
-                    novel_id=novel_id,
-                    chapter_no=no,
-                    title=normalized_title,
-                    content=content,
-                    status="pending_review",
-                    source="manual",
-                )
-                db.add(ch)
-                db.flush()
-            created.append(ch.id)
-            logger.info(
-                "generate_chapters step saved | novel_id=%s chapter_no=%s chapter_id=%s body_chars=%s paragraphs=%s elapsed=%.2fs",
-                novel_id,
-                no,
-                ch.id,
-                saved_metrics["body_chars"],
-                saved_metrics["paragraph_count"],
-                time.perf_counter() - step_start,
-            )
-            _append_generation_log(
-                db,
-                novel_id=novel_id,
-                batch_id=batch_id,
-                event="chapter_saved",
-                chapter_no=no,
-                message=f"第 {no} 章已保存（待审，正文约 {saved_metrics['body_chars']} 字）",
-                meta={
-                    "chapter_id": ch.id,
-                    **saved_metrics,
-                    "elapsed_seconds": round(time.perf_counter() - step_start, 2),
-                },
-            )
-        db.commit()
-    except Exception:
-        db.rollback()
-        logger.exception(
-            "generate_chapters failed | novel_id=%s count=%s elapsed=%.2fs",
-            novel_id,
-            body.count,
-            time.perf_counter() - started,
+        task = novel_generate_chapters_for_novel.delay(
+            novel_id, str(user.id), batch_id, payload
         )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("generate_chapters enqueue failed | novel_id=%s", novel_id)
         try:
             _append_generation_log(
                 db,
                 novel_id=novel_id,
                 batch_id=batch_id,
-                event="batch_failed",
+                event="chapter_generation_enqueue_failed",
                 level="error",
-                message="批量生成失败，请查看服务日志堆栈",
-                meta={"elapsed_seconds": round(time.perf_counter() - started, 2)},
+                message=f"后台任务入队失败：{e}",
+                meta={"error": str(e)},
             )
             db.commit()
         except Exception:
             db.rollback()
-        raise
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
     _append_generation_log(
         db,
         novel_id=novel_id,
         batch_id=batch_id,
-        event="batch_done",
-        message=f"批量生成完成，共 {len(created)} 章",
-        meta={"elapsed_seconds": round(time.perf_counter() - started, 2)},
+        event="chapter_generation_task_accepted",
+        message="后台任务已接收",
+        meta={"task_id": task_id},
     )
     db.commit()
-    logger.info(
-        "generate_chapters done | novel_id=%s count=%s created=%s elapsed=%.2fs",
-        novel_id,
-        body.count,
-        len(created),
-        time.perf_counter() - started,
-    )
-    return {"chapter_ids": created, "batch_id": batch_id}
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "chapter_nos": chapter_nos,
+        "requested_count": requested_cap,
+        "actual_count": len(chapter_nos),
+        "message": "章节将按章计划在后台串行生成，可在生成日志中查看进度",
+    }
 
 
 @router.post("/chapters/{chapter_id}/consistency-fix")
-async def consistency_fix_chapter(
-    chapter_id: str, db: Session = Depends(get_db)
-) -> dict[str, str]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
-    n = db.get(Novel, c.novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+def consistency_fix_chapter(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    c = require_chapter_access(db, chapter_id, user)
+    n = require_novel_access(db, c.novel_id, user)
     if not n.framework_confirmed:
         raise HTTPException(400, "请先确认小说框架")
     if not (c.content or "").strip():
         raise HTTPException(400, "当前无正式正文，无法一致性修订")
-
-    llm = NovelLLMService()
-    mem = latest_memory_json(db, c.novel_id)
-    continuity = format_continuity_excerpts(db, c.novel_id, approved_only=True)
-    try:
-        fixed_text = await llm.check_and_fix_chapter(
-            n, c.chapter_no, c.title or "", mem, continuity, c.content, db=db
+    if has_pending_chapter_consistency_batch(db, c.novel_id, chapter_id):
+        raise HTTPException(
+            409,
+            "当前章节一致性修订任务进行中，请在「生成日志」中查看进度后再试",
         )
-    except RuntimeError as e:
-        raise HTTPException(503, str(e)) from e
-
-    c.pending_content = fixed_text
-    c.pending_revision_prompt = "一致性修订（手动触发）"
-    c.status = "pending_review"
+    batch_id = f"consist-{chapter_id}-{int(time.time())}"
+    try:
+        task = novel_chapter_consistency_fix.delay(
+            chapter_id, str(user.id), batch_id
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("consistency_fix enqueue failed | chapter_id=%s", chapter_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    _append_generation_log(
+        db,
+        novel_id=c.novel_id,
+        batch_id=batch_id,
+        event="chapter_consistency_queued",
+        message="已入队后台一致性修订",
+        chapter_no=c.chapter_no,
+        meta={"chapter_id": chapter_id, "task_id": task_id},
+    )
     db.commit()
-    return {"status": "ok"}
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "一致性修订已在后台执行，可在生成日志中查看进度",
+    }
 
 
 @router.get("/{novel_id}/generation-logs")
 def list_generation_logs(
     novel_id: str,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
     batch_id: str | None = None,
     level: str | None = None,
     limit: int = 200,
 ) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
     lim = max(1, min(limit, 500))
     q = db.query(NovelGenerationLog).filter(NovelGenerationLog.novel_id == novel_id)
     if batch_id:
@@ -1316,6 +1011,9 @@ def list_generation_logs(
         if "memory_refresh_failed" in events or "memory_refresh_validation_failed" in events:
             refresh_status = "failed"
             refresh_progress = 100
+        elif "memory_refresh_warning" in events:
+            refresh_status = "done"
+            refresh_progress = 100
         elif "memory_refresh_done" in events:
             refresh_status = "done"
             refresh_progress = 100
@@ -1329,6 +1027,115 @@ def list_generation_logs(
             refresh_status = "idle"
             refresh_progress = 0
 
+    latest_chapter_gen_batch_id: str | None = None
+    chapter_generation_status = "idle"
+    for r in all_rows:
+        bid = r.batch_id or ""
+        if bid.startswith("gen-"):
+            latest_chapter_gen_batch_id = bid
+            break
+    if latest_chapter_gen_batch_id:
+        cg = (
+            db.query(NovelGenerationLog)
+            .filter(
+                NovelGenerationLog.novel_id == novel_id,
+                NovelGenerationLog.batch_id == latest_chapter_gen_batch_id,
+            )
+            .order_by(NovelGenerationLog.created_at.asc())
+            .all()
+        )
+        ev_cg = {x.event for x in cg}
+        if "batch_failed" in ev_cg:
+            chapter_generation_status = "failed"
+        elif "batch_done" in ev_cg:
+            chapter_generation_status = "done"
+        elif "batch_start" in ev_cg:
+            chapter_generation_status = "started"
+        elif "chapter_generation_queued" in ev_cg:
+            chapter_generation_status = "queued"
+
+    refresh_outcome: str = "idle"
+    memory_refresh_preview: dict[str, Any] | None = None
+    if latest_refresh_batch_id:
+        rb2 = (
+            db.query(NovelGenerationLog)
+            .filter(
+                NovelGenerationLog.novel_id == novel_id,
+                NovelGenerationLog.batch_id == latest_refresh_batch_id,
+            )
+            .order_by(NovelGenerationLog.created_at.asc())
+            .all()
+        )
+        ev_rb = {x.event for x in rb2}
+        if "memory_refresh_failed" in ev_rb:
+            refresh_outcome = "failed"
+        elif "memory_refresh_validation_failed" in ev_rb:
+            refresh_outcome = "blocked"
+        elif "memory_refresh_warning" in ev_rb:
+            refresh_outcome = "warning"
+            for x in reversed(rb2):
+                if x.event == "memory_refresh_warning":
+                    try:
+                        wm = json.loads(x.meta_json or "{}")
+                    except json.JSONDecodeError:
+                        wm = {}
+                    memory_refresh_preview = {
+                        "tier": "warning",
+                        "current_version": wm.get("current_version"),
+                        "candidate_json": wm.get("candidate_json"),
+                        "candidate_readable_zh": wm.get("candidate_readable_zh"),
+                        "warnings": wm.get("warnings") or [],
+                        "auto_pass_notes": wm.get("auto_pass_notes") or [],
+                        "confirmation_token": wm.get("confirmation_token"),
+                    }
+                    break
+        elif "memory_refresh_done" in ev_rb:
+            refresh_outcome = "ok"
+        if refresh_outcome == "blocked":
+            for x in reversed(rb2):
+                if x.event == "memory_refresh_validation_failed":
+                    try:
+                        bm = json.loads(x.meta_json or "{}")
+                    except json.JSONDecodeError:
+                        bm = {}
+                    memory_refresh_preview = {
+                        "tier": "blocked",
+                        "current_version": bm.get("current_version"),
+                        "candidate_json": bm.get("candidate_json"),
+                        "candidate_readable_zh": bm.get("candidate_readable_zh"),
+                        "errors": bm.get("errors") or [],
+                        "warnings": bm.get("warnings") or [],
+                        "auto_pass_notes": bm.get("auto_pass_notes") or [],
+                    }
+                    break
+
+    latest_volume_plan_batch_id: str | None = None
+    volume_plan_status = "idle"
+    for r in all_rows:
+        bid = r.batch_id or ""
+        if bid.startswith("vol-plan-"):
+            latest_volume_plan_batch_id = bid
+            break
+    if latest_volume_plan_batch_id:
+        vp = (
+            db.query(NovelGenerationLog)
+            .filter(
+                NovelGenerationLog.novel_id == novel_id,
+                NovelGenerationLog.batch_id == latest_volume_plan_batch_id,
+            )
+            .order_by(NovelGenerationLog.created_at.asc())
+            .all()
+        )
+        ev_vp = {x.event for x in vp}
+        if "volume_plan_failed" in ev_vp or "volume_plan_enqueue_failed" in ev_vp:
+            volume_plan_status = "failed"
+        elif "volume_plan_done" in ev_vp:
+            volume_plan_status = "done"
+        elif "volume_plan_started" in ev_vp:
+            volume_plan_status = "started"
+        elif "volume_plan_queued" in ev_vp:
+            volume_plan_status = "queued"
+
     return {
         "items": out,
         "latest_batch_id": latest_batch_id,
@@ -1340,52 +1147,81 @@ def list_generation_logs(
         "refresh_started_at": refresh_started_at,
         "refresh_elapsed_seconds": refresh_elapsed_seconds,
         "latest_refresh_success_version": latest_refresh_success_version,
+        "latest_chapter_gen_batch_id": latest_chapter_gen_batch_id,
+        "chapter_generation_status": chapter_generation_status,
+        "refresh_outcome": refresh_outcome,
+        "memory_refresh_preview": memory_refresh_preview,
+        "latest_volume_plan_batch_id": latest_volume_plan_batch_id,
+        "volume_plan_status": volume_plan_status,
     }
 
 
+@router.post("/{novel_id}/logs/clear")
+def clear_generation_logs(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    db.query(NovelGenerationLog).filter(NovelGenerationLog.novel_id == novel_id).delete(
+        synchronize_session=False
+    )
+    db.commit()
+    return {"status": "ok", "message": "生成日志已清空"}
+
+
 @router.post("/chapters/{chapter_id}/revise")
-async def revise_chapter(
-    chapter_id: str, body: ChapterReviseBody, db: Session = Depends(get_db)
-) -> dict[str, str]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
-    n = db.get(Novel, c.novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+def revise_chapter(
+    chapter_id: str,
+    body: ChapterReviseBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    c = require_chapter_access(db, chapter_id, user)
+    n = require_novel_access(db, c.novel_id, user)
     if not n.framework_confirmed:
         raise HTTPException(400, "请先确认小说框架")
     if not (c.content or "").strip():
         raise HTTPException(400, "当前无正式正文，无法按意见改稿")
-    mem = latest_memory_json(db, c.novel_id)
-    fbs = (
-        db.query(ChapterFeedback)
-        .filter(ChapterFeedback.chapter_id == chapter_id)
-        .order_by(ChapterFeedback.created_at.asc())
-        .all()
-    )
-    bodies = [x.body for x in fbs]
-    llm = NovelLLMService()
-    try:
-        new_text = await llm.revise_chapter(
-            n, c, mem, bodies, body.user_prompt.strip(), db=db
+    if has_pending_chapter_revise_batch(db, c.novel_id, chapter_id):
+        raise HTTPException(
+            409,
+            "当前章节改稿任务进行中，请在「生成日志」中查看进度后再试",
         )
-    except RuntimeError as e:
-        raise HTTPException(503, str(e)) from e
-    c.pending_content = new_text
-    c.pending_revision_prompt = body.user_prompt.strip()
-    c.status = "pending_review"
+    batch_id = f"revise-{chapter_id}-{int(time.time())}"
+    try:
+        task = novel_chapter_revise.delay(
+            chapter_id, str(user.id), batch_id, body.user_prompt.strip()
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("revise_chapter enqueue failed | chapter_id=%s", chapter_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    _append_generation_log(
+        db,
+        novel_id=c.novel_id,
+        batch_id=batch_id,
+        event="chapter_revise_queued",
+        message="已入队后台按意见改稿",
+        chapter_no=c.chapter_no,
+        meta={"chapter_id": chapter_id, "task_id": task_id},
+    )
     db.commit()
-    return {"status": "ok"}
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "改稿已在后台执行，可在生成日志中查看进度",
+    }
 
 
 @router.post("/chapters/{chapter_id}/apply-revision")
 async def apply_chapter_revision(
-    chapter_id: str, db: Session = Depends(get_db)
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
+    c = require_chapter_access(db, chapter_id, user)
     if not (c.pending_content or "").strip():
         raise HTTPException(400, "暂无待确认的修订稿")
     c.content = c.pending_content
@@ -1408,10 +1244,12 @@ async def apply_chapter_revision(
 
 
 @router.post("/chapters/{chapter_id}/discard-revision")
-def discard_chapter_revision(chapter_id: str, db: Session = Depends(get_db)) -> dict[str, str]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
+def discard_chapter_revision(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    c = require_chapter_access(db, chapter_id, user)
     c.pending_content = ""
     c.pending_revision_prompt = ""
     db.commit()
@@ -1420,11 +1258,12 @@ def discard_chapter_revision(chapter_id: str, db: Session = Depends(get_db)) -> 
 
 @router.post("/chapters/{chapter_id}/feedback")
 def add_feedback(
-    chapter_id: str, body: ChapterFeedbackBody, db: Session = Depends(get_db)
+    chapter_id: str,
+    body: ChapterFeedbackBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
+    c = require_chapter_access(db, chapter_id, user)
     fb = ChapterFeedback(chapter_id=chapter_id, body=body.body)
     db.add(fb)
     c.status = "pending_review"
@@ -1433,15 +1272,28 @@ def add_feedback(
 
 
 @router.post("/chapters/{chapter_id}/approve")
-async def approve_chapter(chapter_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
-    n = db.get(Novel, c.novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+async def approve_chapter(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    c = require_chapter_access(db, chapter_id, user)
+    n = require_novel_access(db, c.novel_id, user)
+    if c.status == "approved":
+        return {
+            "status": "ok",
+            "already_approved": True,
+            "incremental_memory_status": "none",
+            "incremental_memory_version": None,
+            "incremental_memory_batch_id": None,
+            "incremental_memory_task_id": None,
+            "memory_refresh_status": "none",
+            "memory_refresh_task_id": None,
+            "memory_refresh_batch_id": None,
+            "consolidate_memory_task_id": None,
+        }
     if settings.novel_setting_audit_on_approve:
-        llm_audit = NovelLLMService()
+        llm_audit = _novel_llm(user)
         audit = llm_audit.audit_chapter_against_constraints_sync(
             n, c.content or "", db
         )
@@ -1466,109 +1318,82 @@ async def approve_chapter(chapter_id: str, db: Session = Depends(get_db)) -> dic
     )
     for d in dups:
         db.delete(d)
-    incremental_memory_status = "none"
-    incremental_memory_version: int | None = None
     approve_batch_id = f"chapter-approve-{int(time.time())}-{c.novel_id[:8]}"
+    # 先提交审定状态，再由 Celery 后台执行单章增量记忆，避免阻塞 HTTP。
+    db.commit()
+    incremental_memory_task_id: str | None = None
+    incremental_memory_status: Literal["queued", "enqueue_failed"] = "enqueue_failed"
     try:
-        prev_memory = latest_memory_json(db, c.novel_id)
-        llm = NovelLLMService()
-        delta_result = await llm.propose_memory_update_from_chapter(
-            n,
-            chapter_no=c.chapter_no,
-            chapter_title=c.title or "",
-            chapter_text=c.content or "",
-            prev_memory=prev_memory,
-            db=db,
+        t = novel_chapter_approve_memory_delta.delay(
+            c.novel_id,
+            chapter_id,
+            approve_batch_id,
+            int(c.chapter_no) if c.chapter_no is not None else 0,
         )
-        if delta_result.get("ok"):
-            incremental_memory_status = "applied"
-            incremental_memory_version = delta_result.get("version") # NovelLLMService should return this if possible
-            # 如果 result 没返回 version，我们自己查一下最新的
-            if not incremental_memory_version:
-                incremental_memory_version = db.query(func.max(NovelMemory.version)).filter(
-                    NovelMemory.novel_id == c.novel_id
-                ).scalar()
-
+        incremental_memory_task_id = getattr(t, "id", None)
+        incremental_memory_status = "queued"
+    except Exception:
+        logger.exception(
+            "enqueue novel.chapter_approve_memory_delta failed | novel_id=%s chapter_id=%s",
+            c.novel_id,
+            chapter_id,
+        )
+    # commit 后仍使用同一 session 写入入队日志
+    try:
+        if incremental_memory_status == "queued":
             _append_generation_log(
                 db,
                 novel_id=c.novel_id,
                 batch_id=approve_batch_id,
-                event="chapter_memory_delta_applied",
+                event="chapter_memory_delta_queued",
                 chapter_no=c.chapter_no,
-                message=f"第 {c.chapter_no} 章审定后已增量写入规范化存储 v{incremental_memory_version}",
+                message="审定已通过：单章增量记忆已入队后台执行",
                 meta={
-                    **(delta_result.get("stats") or {}),
-                    "memory_version": incremental_memory_version,
                     "source": "approve_chapter",
+                    "task_id": incremental_memory_task_id,
                 },
             )
         else:
-            incremental_memory_status = "failed"
             _append_generation_log(
                 db,
                 novel_id=c.novel_id,
                 batch_id=approve_batch_id,
-                event="chapter_memory_delta_failed",
+                event="chapter_memory_delta_enqueue_failed",
                 chapter_no=c.chapter_no,
                 level="error",
-                message=f"第 {c.chapter_no} 章审定后增量写入记忆失败，已保留旧记忆",
-                meta={
-                    "errors": delta_result.get("errors") or [],
-                    "source": "approve_chapter",
-                },
+                message="审定已通过：单章增量记忆入队失败，请稍后重试或在记忆页手动刷新",
+                meta={"source": "approve_chapter"},
             )
+        db.commit()
     except Exception:
-        incremental_memory_status = "failed"
         logger.exception(
-            "approve_chapter memory delta failed | chapter_id=%s novel_id=%s chapter_no=%s",
-            chapter_id,
+            "approve_chapter post-commit log failed | novel_id=%s chapter_id=%s",
             c.novel_id,
-            c.chapter_no,
+            chapter_id,
         )
-        _append_generation_log(
-            db,
-            novel_id=c.novel_id,
-            batch_id=approve_batch_id,
-            event="chapter_memory_delta_failed",
-            chapter_no=c.chapter_no,
-            level="error",
-            message=f"第 {c.chapter_no} 章审定后增量写入记忆异常，已保留旧记忆",
-            meta={"source": "approve_chapter"},
-        )
-    # 审定已通过单章增量写入正式记忆；不再自动排队「最近 N 章」批量刷新，避免重复调用。
-    # 需要跨章对齐或补漏时在记忆页手动刷新（或编辑/删除已审定章仍会触发后台刷新）。
-    db.commit()
-    consolidate_memory_task_id: str | None = None
-    n_every = max(0, int(settings.novel_memory_consolidate_every_n_chapters or 0))
-    if n_every > 0 and c.chapter_no > 0 and c.chapter_no % n_every == 0:
-        try:
-            t = novel_consolidate_memory.delay(c.novel_id)
-            consolidate_memory_task_id = getattr(t, "id", None)
-        except Exception:
-            logger.exception(
-                "enqueue novel.consolidate_memory failed | novel_id=%s chapter_no=%s",
-                c.novel_id,
-                c.chapter_no,
-            )
+        db.rollback()
+    # 审定后增量记忆在后台完成；周期性归档合并由后台任务在成功写入后触发。
     return {
         "status": "ok",
         "incremental_memory_status": incremental_memory_status,
-        "incremental_memory_version": incremental_memory_version,
+        "incremental_memory_version": None,
         "incremental_memory_batch_id": approve_batch_id,
+        "incremental_memory_task_id": incremental_memory_task_id,
         "memory_refresh_status": "none",
         "memory_refresh_task_id": None,
         "memory_refresh_batch_id": None,
-        "consolidate_memory_task_id": consolidate_memory_task_id,
+        "consolidate_memory_task_id": None,
     }
 
 
 @router.patch("/chapters/{chapter_id}")
 async def patch_chapter(
-    chapter_id: str, body: ChapterUpdateBody, db: Session = Depends(get_db)
+    chapter_id: str,
+    body: ChapterUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
+    c = require_chapter_access(db, chapter_id, user)
     if body.title is not None:
         c.title = body.title.strip() or c.title
     c.content = body.content
@@ -1590,11 +1415,55 @@ async def patch_chapter(
     }
 
 
+@router.post("/chapters/{chapter_id}/memory-retry")
+def retry_chapter_memory(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """手动重试单章增量记忆写入：即使章节已审定，也重新入队执行记忆抽取。"""
+    c = require_chapter_access(db, chapter_id, user)
+    
+    # 产生一个新的 batch_id 用于日志
+    retry_batch_id = f"retry_mem_{int(time.time())}"
+    
+    try:
+        t = novel_chapter_approve_memory_delta.delay(
+            c.novel_id,
+            chapter_id,
+            retry_batch_id,
+            int(c.chapter_no) if c.chapter_no is not None else 0,
+        )
+        task_id = getattr(t, "id", None)
+        
+        _append_generation_log(
+            db,
+            novel_id=c.novel_id,
+            batch_id=retry_batch_id,
+            event="chapter_memory_retry_queued",
+            chapter_no=c.chapter_no,
+            message="手动触发：章节增量记忆写入已入队后台执行",
+            meta={"task_id": task_id},
+        )
+        db.commit()
+        
+        return {
+            "status": "queued",
+            "batch_id": retry_batch_id,
+            "task_id": task_id,
+        }
+    except Exception as e:
+        logger.exception("retry_chapter_memory failed | chapter_id=%s", chapter_id)
+        raise HTTPException(500, f"入队失败：{e}")
+
+
 @router.delete("/chapters/{chapter_id}")
-async def delete_chapter(chapter_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    c = db.get(Chapter, chapter_id)
-    if not c:
-        raise HTTPException(404, "章节不存在")
+async def delete_chapter(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    c = require_chapter_access(db, chapter_id, user)
 
     is_approved = c.status == "approved"
     novel_id = c.novel_id
@@ -1621,7 +1490,12 @@ async def delete_chapter(chapter_id: str, db: Session = Depends(get_db)) -> dict
 
 
 @router.get("/{novel_id}/memory")
-def get_memory(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_memory(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
     row = (
         db.query(NovelMemory)
         .filter(NovelMemory.novel_id == novel_id)
@@ -1637,6 +1511,8 @@ def get_memory(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
             "readable_zh_auto": memory_payload_readable_zh_auto(empty),
             "has_readable_override": False,
             "summary": "",
+            "schema_guide": build_memory_schema_guide(),
+            "health": build_memory_health_summary(db, novel_id),
         }
     pj = row.payload_json
     try:
@@ -1668,15 +1544,19 @@ def get_memory(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
         "summary": row.summary,
         "created_at": row.created_at.isoformat() if row.created_at else None,
         "normalized": normalized,
+        "schema_guide": build_memory_schema_guide(),
+        "health": build_memory_health_summary(db, novel_id),
     }
 
 
 @router.get("/{novel_id}/memory/normalized")
-def get_memory_normalized(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_memory_normalized(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     """规范化落表后的记忆分块（真源）；表空时从最新快照补建一次（迁移/兼容）。"""
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    require_novel_access(db, novel_id, user)
     data = normalized_memory_to_dict(db, novel_id)
     if data is None:
         mem_row = (
@@ -1692,18 +1572,25 @@ def get_memory_normalized(novel_id: str, db: Session = Depends(get_db)) -> dict[
         )
         db.commit()
         data = normalized_memory_to_dict(db, novel_id)
-    return {"status": "ok", "data": data}
+    return {
+        "status": "ok",
+        "data": data,
+        "schema_guide": build_memory_schema_guide(),
+        "health": build_memory_health_summary(db, novel_id),
+    }
 
 
 @router.post("/{novel_id}/memory/rebuild-normalized")
-def rebuild_memory_normalized(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def rebuild_memory_normalized(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     """
     灾难恢复/导入：用当前最新快照 JSON 覆盖并重写规范化表，再派生新快照与分表对齐。
     日常请以结构化数据为准；勿与「仅改快照」混用。
     """
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    require_novel_access(db, novel_id, user)
     mem_row = (
         db.query(NovelMemory)
         .filter(NovelMemory.novel_id == novel_id)
@@ -1721,21 +1608,27 @@ def rebuild_memory_normalized(novel_id: str, db: Session = Depends(get_db)) -> d
     )
     db.commit()
     data = normalized_memory_to_dict(db, novel_id)
-    return {"status": "ok", "data": data}
+    return {
+        "status": "ok",
+        "data": data,
+        "schema_guide": build_memory_schema_guide(),
+        "health": build_memory_health_summary(db, novel_id),
+    }
 
 
 @router.post("/{novel_id}/memory/save")
 def save_memory_payload(
-    novel_id: str, body: MemorySaveBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: MemorySaveBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     人工保存记忆（API）：先写入规范化表，再由分表派生 NovelMemory 快照。
     - payload_json：整包导入为真源并重建分表
     - readable_zh_override：合并进待生成快照（经 sync 保留）
     """
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    require_novel_access(db, novel_id, user)
 
     patch = body.model_dump(exclude_unset=True)
     if not patch:
@@ -1818,39 +1711,138 @@ def save_memory_payload(
 
 @router.post("/{novel_id}/memory/sync-json")
 def trigger_sync_json_snapshot(
-    novel_id: str, db: Session = Depends(get_db)
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     手动触发：将规范化存储中的数据反向同步到 NovelMemory (JSON 快照) 中。
     """
+    require_novel_access(db, novel_id, user)
     task = novel_sync_json_snapshot.delay(novel_id)
     return {"status": "queued", "task_id": getattr(task, "id", None)}
 
 
 @router.post("/{novel_id}/memory/consolidate")
 def trigger_memory_consolidate(
-    novel_id: str, db: Session = Depends(get_db)
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     手动触发：后台记忆压缩（早期章节 key_facts → timeline_archive，并裁剪过久条目）。
     """
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    require_novel_access(db, novel_id, user)
     task = novel_consolidate_memory.delay(novel_id)
     return {"status": "queued", "task_id": getattr(task, "id", None)}
 
 
+@router.get("/{novel_id}/memory/history")
+def get_memory_history(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> list[dict[str, Any]]:
+    """获取记忆版本历史列表。"""
+    require_novel_access(db, novel_id, user)
+    rows = (
+        db.query(NovelMemory)
+        .filter(NovelMemory.novel_id == novel_id)
+        .order_by(NovelMemory.version.desc())
+        .all()
+    )
+    return [
+        {
+            "version": r.version,
+            "summary": r.summary,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
+
+
+@router.post("/{novel_id}/memory/clear")
+def clear_memory(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """一键清空记忆：清空规范化表并产生一个空快照，同时将所有章节状态重置为待审。"""
+    require_novel_access(db, novel_id, user)
+    
+    # 1. 产生新版本号
+    ver = (
+        db.query(func.max(NovelMemory.version))
+        .filter(NovelMemory.novel_id == novel_id)
+        .scalar()
+        or 0
+    )
+    new_ver = ver + 1
+    
+    # 2. 用空 JSON 覆盖记忆
+    empty_payload = "{}"
+    replace_normalized_from_payload(db, novel_id, new_ver, empty_payload)
+    
+    # 强制 flush 以确保 normalized_memory_to_dict 能读到新 outline
+    db.flush()
+    
+    sync_json_snapshot_from_normalized(db, novel_id, summary="管理员一键清空记忆")
+    
+    # 3. 重置所有章节状态为 pending_review
+    db.query(Chapter).filter(Chapter.novel_id == novel_id).update(
+        {"status": "pending_review"}, synchronize_session=False
+    )
+    
+    db.commit()
+    
+    return {"status": "ok", "version": new_ver}
+
+
+@router.post("/{novel_id}/memory/rollback/{version}")
+def rollback_memory_version(
+    novel_id: str,
+    version: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """回退到指定的记忆版本：将该版本的快照应用到规范化表，并派生新快照。"""
+    require_novel_access(db, novel_id, user)
+    
+    target_row = (
+        db.query(NovelMemory)
+        .filter(NovelMemory.novel_id == novel_id, NovelMemory.version == version)
+        .first()
+    )
+    if not target_row:
+        raise HTTPException(404, f"未找到版本号为 {version} 的记忆快照")
+        
+    ver = (
+        db.query(func.max(NovelMemory.version))
+        .filter(NovelMemory.novel_id == novel_id)
+        .scalar()
+        or 0
+    )
+    new_ver = ver + 1
+    
+    replace_normalized_from_payload(db, novel_id, new_ver, target_row.payload_json or "{}")
+    sync_json_snapshot_from_normalized(db, novel_id, summary=f"回退到版本 v{version}")
+    db.commit()
+    
+    return {"status": "ok", "new_version": new_ver}
+
+
 @router.get("/{novel_id}/metrics")
-def get_novel_metrics(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
+def get_novel_metrics(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     """
     观察指标仪表盘数据：
     - 指标：open_plots / canonical_timeline 覆盖、章节状态分布、连续性简评
     - 当前设定：连贯性策略与一致性核对开关/温度（只返回非敏感配置）
     """
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    n = require_novel_access(db, novel_id, user)
 
     chapters: list[Chapter] = (
         db.query(Chapter)
@@ -2095,15 +2087,19 @@ def get_novel_metrics(novel_id: str, db: Session = Depends(get_db)) -> dict[str,
             "volumes_count": int(volumes_count),
             "planned_chapters_count": int(planned_chapters_count),
             "has_next_chapter_plan": bool(has_next_plan),
+            "memory_health": build_memory_health_summary(db, novel_id),
         },
+        "schema_guide": build_memory_schema_guide(),
     }
 
 
 @router.post("/{novel_id}/memory/refresh")
-async def refresh_memory(novel_id: str, db: Session = Depends(get_db)) -> dict[str, Any]:
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+def refresh_memory(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
     chapters = (
         db.query(Chapter)
         .filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
@@ -2112,43 +2108,92 @@ async def refresh_memory(novel_id: str, db: Session = Depends(get_db)) -> dict[s
     )
     if not chapters:
         raise HTTPException(400, "暂无已审定章节可用于汇总记忆")
-    summary = format_approved_chapters_summary(
-        chapters,
-        settings.novel_chapter_summary_tail_chars,
-        head_chars=settings.novel_chapter_summary_head_chars,
-        mode=settings.novel_chapter_summary_mode,
-        max_chapters=settings.novel_memory_refresh_chapters,
-    )
-    prev = latest_memory_json(db, novel_id)
-    llm = NovelLLMService()
-    result = await llm.refresh_memory_from_chapters(n, summary, prev, db=db)
-    if not result.get("ok"):
-        ver = (
-            db.query(func.max(NovelMemory.version)).filter(NovelMemory.novel_id == novel_id).scalar()
-            or 0
+    if has_pending_memory_refresh_batch(db, novel_id):
+        raise HTTPException(
+            409,
+            "当前已有记忆刷新任务进行中，请在「生成日志」中查看进度后再试",
         )
-        candidate_json = str(result.get("candidate_json") or "{}")
-        return {
-            "status": "validation_failed",
-            "version": ver,
-            "payload_json": prev,
-            "readable_zh": memory_payload_to_readable_zh(prev),
-            "candidate_json": candidate_json,
-            "candidate_readable_zh": memory_payload_to_readable_zh(candidate_json),
-            "errors": result.get("errors") or [],
-        }
-    new_json = result.get("payload_json") or prev
+    batch_id = f"mem-refresh-{int(time.time())}-{novel_id[:8]}"
+    try:
+        task = novel_refresh_memory_for_novel.delay(
+            novel_id, "手动：记忆页刷新", batch_id
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("refresh_memory enqueue failed | novel_id=%s", novel_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="memory_refresh_queued",
+        message="已入队手动记忆刷新",
+        meta={"reason": "手动：记忆页刷新", "task_id": task_id},
+    )
+    db.commit()
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "记忆刷新已在后台执行，可在生成日志中查看进度",
+    }
+
+
+@router.post("/{novel_id}/memory/refresh/apply")
+async def apply_refresh_memory_candidate(
+    novel_id: str,
+    body: ApplyMemoryRefreshCandidateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    current_version = (
+        db.query(func.max(NovelMemory.version)).filter(NovelMemory.novel_id == novel_id).scalar()
+        or 0
+    )
+    if current_version != body.current_version:
+        raise HTTPException(409, "当前记忆版本已变化，请重新刷新候选记忆")
+    expected = memory_refresh_confirmation_token(
+        novel_id, body.current_version, body.candidate_json
+    )
+    if not hmac.compare_digest(expected, body.confirmation_token):
+        raise HTTPException(400, "候选记忆确认令牌无效，请重新刷新记忆")
+    try:
+        parsed = json.loads(body.candidate_json or "{}")
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "候选记忆不是合法 JSON 对象") from exc
+    if not isinstance(parsed, dict):
+        raise HTTPException(400, "候选记忆不是合法 JSON 对象")
+
+    next_ver = current_version + 1
+    replace_normalized_from_payload(db, novel_id, next_ver, body.candidate_json)
+    sync_json_snapshot_from_normalized(
+        db,
+        novel_id,
+        summary="人工确认应用 warning 候选记忆",
+    )
+    db.commit()
+    latest_row = (
+        db.query(NovelMemory)
+        .filter(NovelMemory.novel_id == novel_id)
+        .order_by(NovelMemory.version.desc())
+        .first()
+    )
+    payload_json = latest_row.payload_json if latest_row else body.candidate_json
     return {
         "status": "ok",
-        "version": result.get("version"),
-        "payload_json": new_json,
-        "readable_zh": memory_payload_to_readable_zh(new_json),
+        "version": latest_row.version if latest_row else next_ver,
+        "payload_json": payload_json,
+        "readable_zh": memory_payload_to_readable_zh(payload_json),
     }
 
 
 @router.post("/{novel_id}/memory/manual-fix")
 async def manual_fix_memory(
-    novel_id: str, body: ManualFixMemoryBody, db: Session = Depends(get_db)
+    novel_id: str,
+    body: ManualFixMemoryBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     """
     手动纠偏（低风险）：只覆盖
@@ -2156,9 +2201,7 @@ async def manual_fix_memory(
     - canonical_timeline 最后一条的 key_facts/causal_results/open_plots_added/open_plots_resolved
     并写入新版本的 NovelMemory。
     """
-    n = db.get(Novel, novel_id)
-    if not n:
-        raise HTTPException(404, "小说不存在")
+    require_novel_access(db, novel_id, user)
 
     mem_row = (
         db.query(NovelMemory)
@@ -2177,7 +2220,18 @@ async def manual_fix_memory(
 
     # 1) open_plots 替换
     open_plots_clean = [x.strip() for x in (body.open_plots or []) if x and x.strip()]
-    payload["open_plots"] = open_plots_clean
+    prev_open_plot_map: dict[str, dict[str, Any]] = {}
+    prev_open_plots = payload.get("open_plots")
+    if isinstance(prev_open_plots, list):
+        for item in prev_open_plots:
+            if not isinstance(item, dict):
+                continue
+            body_text = str(item.get("body") or item.get("text") or "").strip()
+            if body_text:
+                prev_open_plot_map[body_text] = dict(item)
+    payload["open_plots"] = [
+        prev_open_plot_map.get(text, {"body": text}) for text in open_plots_clean
+    ]
 
     # 2) canonical_timeline_hot 最后一条替换（尽量保留其它字段）
     ct = payload.get("canonical_timeline_hot")
@@ -2230,20 +2284,32 @@ async def manual_fix_memory(
     # open_plots 活跃线自动维护：移除 resolved，补入 added
     resolved_set = {x.strip() for x in canonical_last_clean["open_plots_resolved"] if x.strip()}
     added_set = [x.strip() for x in canonical_last_clean["open_plots_added"] if x.strip()]
-    active = [x for x in payload.get("open_plots", []) if isinstance(x, str)]
-    active = [x for x in active if x.strip() and x.strip() not in resolved_set]
+    active_rows: list[dict[str, Any]] = []
+    for item in payload.get("open_plots", []) if isinstance(payload.get("open_plots"), list) else []:
+        if isinstance(item, dict):
+            body_text = str(item.get("body") or item.get("text") or "").strip()
+            if body_text and body_text not in resolved_set:
+                active_rows.append(item)
+        elif isinstance(item, str) and item.strip() and item.strip() not in resolved_set:
+            active_rows.append({"body": item.strip()})
+    active_bodies = {
+        str((item.get("body") if isinstance(item, dict) else item) or "").strip()
+        for item in active_rows
+    }
     for x in added_set:
-        if x not in active:
-            active.append(x)
-    payload["open_plots"] = active
+        if x not in active_bodies:
+            active_rows.append(prev_open_plot_map.get(x, {"body": x}))
+    payload["open_plots"] = active_rows
 
     if body.notes_hint and body.notes_hint.strip():
         hint = f"人工纠偏：{body.notes_hint.strip()}"
         old_notes = payload.get("notes")
-        if isinstance(old_notes, str) and old_notes.strip():
-            payload["notes"] = f"{old_notes.strip()}\\n{hint}"
+        if isinstance(old_notes, list):
+            payload["notes"] = [*old_notes, hint]
+        elif isinstance(old_notes, str) and old_notes.strip():
+            payload["notes"] = [old_notes.strip(), hint]
         else:
-            payload["notes"] = hint
+            payload["notes"] = [hint]
 
     new_json = json.dumps(payload, ensure_ascii=False)
     ver = (

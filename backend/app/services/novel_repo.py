@@ -7,8 +7,9 @@ from typing import Any
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.novel import Chapter, NovelMemory
-from app.models.volume import NovelVolume
+from app.models.volume import NovelChapterPlan, NovelVolume
 from app.models.novel_memory_norm import (
     NovelMemoryNormChapter,
     NovelMemoryNormCharacter,
@@ -19,6 +20,7 @@ from app.models.novel_memory_norm import (
     NovelMemoryNormRelation,
     NovelMemoryNormSkill,
 )
+from app.services.memory_schema import extract_aliases, memory_schema_guide
 
 
 def chapter_content_metrics(content: str) -> dict[str, int]:
@@ -121,6 +123,73 @@ def next_chapter_no_from_approved(db: Session, novel_id: str) -> int:
     return (m or 0) + 1
 
 
+def has_any_chapter_plan(db: Session, novel_id: str) -> bool:
+    """是否存在任意章计划条目。"""
+    return (
+        db.query(NovelChapterPlan.id)
+        .filter(NovelChapterPlan.novel_id == novel_id)
+        .limit(1)
+        .first()
+    ) is not None
+
+
+def chapter_plan_exists(db: Session, novel_id: str, chapter_no: int) -> bool:
+    return (
+        db.query(NovelChapterPlan.id)
+        .filter(
+            NovelChapterPlan.novel_id == novel_id,
+            NovelChapterPlan.chapter_no == chapter_no,
+        )
+        .first()
+    ) is not None
+
+
+def chapter_needs_body_per_plan(db: Session, novel_id: str, chapter_no: int) -> bool:
+    """
+    该章在章计划中存在，且当前尚未形成「可视为已写完」的正文。
+    已审定、或已有非空待审正文，视为不需要再自动生成。
+    """
+    if not chapter_plan_exists(db, novel_id, chapter_no):
+        return False
+    ch = (
+        db.query(Chapter)
+        .filter(Chapter.novel_id == novel_id, Chapter.chapter_no == chapter_no)
+        .order_by(Chapter.updated_at.desc())
+        .first()
+    )
+    if not ch:
+        return True
+    if ch.status == "approved":
+        return False
+    if (ch.content or "").strip():
+        return False
+    return True
+
+
+def planned_chapter_numbers_needing_body(
+    db: Session, novel_id: str, limit: int
+) -> list[int]:
+    """
+    按全局章号升序，取前 limit 个「有计划且尚缺正文」的章号（用于批量续写，串行生成以保持连贯）。
+    """
+    if limit <= 0:
+        return []
+    rows = (
+        db.query(NovelChapterPlan.chapter_no)
+        .filter(NovelChapterPlan.novel_id == novel_id)
+        .distinct()
+        .all()
+    )
+    nos = sorted({int(r[0]) for r in rows})
+    out: list[int] = []
+    for no in nos:
+        if len(out) >= limit:
+            break
+        if chapter_needs_body_per_plan(db, novel_id, no):
+            out.append(no)
+    return out
+
+
 def truncate_framework_json(framework_json: str, max_len: int = 8000) -> str:
     raw = (framework_json or "").strip()
     if not raw:
@@ -146,7 +215,27 @@ def format_open_plots_block(memory_json: str) -> str:
             if isinstance(x, str):
                 lines.append(f"  {i}. {x}")
             else:
-                lines.append(f"  {i}. {json.dumps(x, ensure_ascii=False)}")
+                body = str(x.get("body") or x.get("text") or "").strip()
+                iid = x.get("id")
+                meta: list[str] = []
+                ptype = str(x.get("plot_type") or "").strip()
+                if ptype and ptype != "Transient":
+                    meta.append(ptype)
+                pr = x.get("priority")
+                if isinstance(pr, int) and pr > 0:
+                    meta.append(f"prio={pr}")
+                est = x.get("estimated_duration")
+                if isinstance(est, int) and est > 0:
+                    meta.append(f"约{est}章")
+                current_stage = str(x.get("current_stage") or "").strip()
+                resolve_when = str(x.get("resolve_when") or "").strip()
+                id_tag = f"[{iid}] " if iid else ""
+                line = id_tag + (f"[{' / '.join(meta)}] " if meta else "") + (body or json.dumps(x, ensure_ascii=False))
+                if current_stage:
+                    line += f"｜当前阶段：{current_stage[:120]}"
+                if resolve_when:
+                    line += f"｜收束条件：{resolve_when[:120]}"
+                lines.append(f"  {i}. {line}")
     else:
         lines.append(f"  {op}")
     return "\n".join(lines)
@@ -164,6 +253,7 @@ def _compact_characters_for_hot(chars: Any, max_items: int) -> list[dict[str, st
         role = x.get("role")
         traits = x.get("traits")
         state = x.get("state") or x.get("status")
+        iid = x.get("id")
         if isinstance(name, str) and name.strip():
             item["name"] = name.strip()
         if isinstance(role, str) and role.strip():
@@ -172,6 +262,8 @@ def _compact_characters_for_hot(chars: Any, max_items: int) -> list[dict[str, st
             item["traits"] = traits.strip()[:120]
         if isinstance(state, str) and state.strip():
             item["state"] = state.strip()[:120]
+        if iid:
+            item["id"] = str(iid)
         if item:
             out.append(item)
     return out
@@ -201,21 +293,40 @@ def _compact_relations_for_hot(relations: Any, max_items: int = 10) -> list[dict
         src = str(rel.get("from") or "").strip()
         dst = str(rel.get("to") or "").strip()
         relation = str(rel.get("relation") or "").strip()
+        iid = rel.get("id")
         if not (src and dst and relation):
             continue
-        out.append({"from": src, "to": dst, "relation": relation[:140]})
+        item = {"from": src, "to": dst, "relation": relation[:140]}
+        if iid:
+            item["id"] = str(iid)
+        out.append(item)
         if len(out) >= max_items:
             break
     return out
 
 
-def _compact_inventory_for_hot(inventory: Any, max_items: int = 12) -> list[str]:
+def _compact_inventory_for_hot(inventory: Any, max_items: int = 12) -> list[dict[str, Any]]:
     if not isinstance(inventory, list):
         return []
-    return _dedupe_preserve_order(
-        [str(item).strip()[:120] for item in inventory if str(item).strip()],
-        max_items=max_items,
-    )
+    out: list[dict[str, Any]] = []
+    seen = set()
+    for item in inventory:
+        if isinstance(item, dict):
+            label = str(
+                item.get("name") or item.get("item") or item.get("label") or ""
+            ).strip()
+            iid = item.get("id")
+            if label and label not in seen:
+                out.append({"name": label[:120], "id": str(iid) if iid else None})
+                seen.add(label)
+        else:
+            text = str(item).strip()
+            if text and text not in seen:
+                out.append({"name": text[:120]})
+                seen.add(text)
+        if len(out) >= max_items:
+            break
+    return out
 
 
 def _compact_named_state_for_hot(items: Any, max_items: int = 8) -> list[dict[str, str]]:
@@ -231,10 +342,13 @@ def _compact_named_state_for_hot(items: Any, max_items: int = 8) -> list[dict[st
         compact: dict[str, str] = {"name": name}
         description = str(item.get("description") or item.get("role") or "").strip()
         cost = str(item.get("cost") or item.get("status") or "").strip()
+        iid = item.get("id")
         if description:
             compact["description"] = description[:140]
         if cost:
             compact["status"] = cost[:120]
+        if iid:
+            compact["id"] = str(iid)
         out.append(compact)
         if len(out) >= max_items:
             break
@@ -278,10 +392,10 @@ def build_hot_memory_for_prompt(
         open_plots_hot = []
 
     hot_payload = {
-        "world_rules_hot": _dedupe_preserve_order(
-            [str(x).strip() for x in data.get("world_rules", []) if str(x).strip()],
-            max_items=8,
-        ),
+        "forbidden_constraints_hot": [
+            x if isinstance(x, dict) else {"body": str(x).strip()}
+            for x in data.get("forbidden_constraints", [])
+        ][:12],
         "main_plot_hot": str(data.get("main_plot") or "").strip()[:240],
         "open_plots_hot": open_plots_hot,
         "canonical_timeline_hot": timeline_hot,
@@ -319,15 +433,29 @@ def _extract_recall_terms(memory_json: str, query_text: str) -> list[str]:
                 name = str(item.get("name") or "").strip()
                 if name and name in query:
                     candidates.append(name)
+                for alias in extract_aliases(item):
+                    if alias and alias in query:
+                        candidates.append(alias)
     for raw in data.get("inventory", []) if isinstance(data.get("inventory"), list) else []:
-        item = str(raw or "").strip()
+        if isinstance(raw, dict):
+            item = str(raw.get("name") or raw.get("item") or raw.get("label") or "").strip()
+            aliases = extract_aliases(raw)
+        else:
+            item = str(raw or "").strip()
+            aliases = []
         if not item:
             continue
         short = re.split(r"[（(，,:：]", item)[0].strip()
         if short and short in query:
             candidates.append(short)
+        for alias in aliases:
+            if alias in query:
+                candidates.append(alias)
     for raw in data.get("open_plots", []) if isinstance(data.get("open_plots"), list) else []:
-        plot = str(raw or "").strip()
+        if isinstance(raw, dict):
+            plot = str(raw.get("body") or raw.get("text") or "").strip()
+        else:
+            plot = str(raw or "").strip()
         if not plot:
             continue
         for token in re.split(r"[，、：:；。,.\\s]", plot):
@@ -366,7 +494,8 @@ def format_entity_recall_block(
             if not isinstance(item, dict):
                 continue
             name = str(item.get("name") or "").strip()
-            if not name or name not in terms:
+            aliases = extract_aliases(item)
+            if not name or not (name in terms or any(alias in terms for alias in aliases)):
                 continue
             role = str(item.get("role") or "").strip()
             state = str(item.get("status") or item.get("state") or "").strip()
@@ -374,6 +503,7 @@ def format_entity_recall_block(
                 f"- {name}"
                 + (f"｜身份：{role[:80]}" if role else "")
                 + (f"｜当前状态：{state[:140]}" if state else "")
+                + (f"｜别名：{'、'.join(aliases[:4])}" if aliases else "")
             )
             if len(matched_chars) >= max_items:
                 break
@@ -402,11 +532,30 @@ def format_entity_recall_block(
 
     inventory = data.get("inventory")
     if isinstance(inventory, list):
-        matched_items = [
-            f"- {str(item).strip()[:160]}"
-            for item in inventory
-            if str(item).strip() and any(term in str(item) for term in terms)
-        ][:max_items]
+        matched_items: list[str] = []
+        for item in inventory:
+            if isinstance(item, dict):
+                blob = json.dumps(item, ensure_ascii=False)
+                aliases = extract_aliases(item)
+                if not (
+                    any(term in blob for term in terms)
+                    or any(alias in terms for alias in aliases)
+                ):
+                    continue
+                label = str(
+                    item.get("name") or item.get("item") or item.get("label") or ""
+                ).strip()
+                if not label:
+                    continue
+                matched_items.append(
+                    f"- {label[:160]}" + (f"｜别名：{'、'.join(aliases[:4])}" if aliases else "")
+                )
+            else:
+                text = str(item).strip()
+                if text and any(term in text for term in terms):
+                    matched_items.append(f"- {text[:160]}")
+            if len(matched_items) >= max_items:
+                break
         if matched_items:
             lines.append("相关物品：")
             lines.extend(matched_items)
@@ -1000,13 +1149,22 @@ def format_recent_approved_fulltext_context(
     if not rows:
         return ""
     chunks: list[str] = ["【最近已审定章节完整正文（增强衔接）】"]
+    total_chars = len(chunks[0])
     for ch in reversed(rows):
         content = (ch.content or "").strip()
         if not content:
             continue
         if len(content) > per_chapter_max_chars:
             content = content[-per_chapter_max_chars:]
-        chunks.append(f"第{ch.chapter_no}章《{ch.title}》\n{content}")
+        chunk = f"第{ch.chapter_no}章《{ch.title}》\n{content}"
+        total_chars += len(chunk)
+        if total_chars > settings.novel_recent_full_context_total_chars:
+            remaining = settings.novel_recent_full_context_total_chars - (total_chars - len(chunk))
+            if remaining <= 200:
+                continue
+            chunk = chunk[-remaining:]
+            total_chars = settings.novel_recent_full_context_total_chars
+        chunks.append(chunk)
     return "\n\n".join(chunks) if len(chunks) > 1 else ""
 
 
@@ -1292,9 +1450,16 @@ def format_constraints_block(db: Session, novel_id: str) -> str:
         return ""
     lines = ["【设定防火墙（正文禁止违反）】"]
     for i, x in enumerate(fc[:24], 1):
-        s = str(x).strip()
-        if s:
-            lines.append(f"  {i}. {s[:400]}")
+        if isinstance(x, dict):
+            body = str(x.get("body") or "").strip()
+            iid = x.get("id")
+            if body:
+                id_tag = f"[{iid}] " if iid else ""
+                lines.append(f"  {i}. {id_tag}{body[:400]}")
+        else:
+            s = str(x).strip()
+            if s:
+                lines.append(f"  {i}. {s[:400]}")
     return "\n".join(lines)
 
 
@@ -1372,6 +1537,82 @@ def _norm_influence(obj: Any) -> int:
         return 0
 
 
+def _detail_json(obj: Any) -> dict[str, Any]:
+    raw = getattr(obj, "detail_json", None) or "{}"
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        data = {}
+    return data if isinstance(data, dict) else {}
+
+
+def _entity_aliases(obj: Any) -> list[str]:
+    return extract_aliases(_detail_json(obj))
+
+
+def _plot_is_stale(plot: Any, latest_chapter_no: int) -> bool:
+    est = max(0, int(getattr(plot, "estimated_duration", 0) or 0))
+    if est <= 0 or latest_chapter_no <= 0:
+        return False
+    touched = max(
+        int(getattr(plot, "last_touched_chapter", 0) or 0),
+        int(getattr(plot, "introduced_chapter", 0) or 0),
+    )
+    if touched <= 0:
+        return False
+    return (latest_chapter_no - touched) > (est + settings.novel_open_plot_stale_grace_chapters)
+
+
+def build_memory_schema_guide() -> dict[str, Any]:
+    return memory_schema_guide()
+
+
+def build_memory_health_summary(db: Session, novel_id: str) -> dict[str, Any]:
+    latest_chapter_no = (
+        db.query(func.max(NovelMemoryNormChapter.chapter_no))
+        .filter(NovelMemoryNormChapter.novel_id == novel_id)
+        .scalar()
+        or 0
+    )
+    plots = (
+        db.query(NovelMemoryNormPlot)
+        .filter(NovelMemoryNormPlot.novel_id == novel_id)
+        .order_by(NovelMemoryNormPlot.priority.desc(), NovelMemoryNormPlot.sort_order.asc())
+        .all()
+    )
+    stale: list[dict[str, Any]] = []
+    overdue: list[dict[str, Any]] = []
+    for p in plots:
+        est = int(getattr(p, "estimated_duration", 0) or 0)
+        touched = max(
+            int(getattr(p, "last_touched_chapter", 0) or 0),
+            int(getattr(p, "introduced_chapter", 0) or 0),
+        )
+        if est <= 0 or touched <= 0 or latest_chapter_no <= 0:
+            continue
+        exceeded = latest_chapter_no - touched - est
+        row = {
+            "body": p.body,
+            "plot_type": getattr(p, "plot_type", "Transient") or "Transient",
+            "priority": getattr(p, "priority", 0) or 0,
+            "estimated_duration": est,
+            "introduced_chapter": getattr(p, "introduced_chapter", 0) or 0,
+            "last_touched_chapter": getattr(p, "last_touched_chapter", 0) or 0,
+            "current_stage": getattr(p, "current_stage", "") or "",
+            "resolve_when": getattr(p, "resolve_when", "") or "",
+            "overdue_chapters": max(0, exceeded),
+        }
+        if exceeded > 0:
+            overdue.append(row)
+        if _plot_is_stale(p, latest_chapter_no):
+            stale.append(row)
+    return {
+        "latest_chapter_no": latest_chapter_no,
+        "stale_plots": stale[:12],
+        "overdue_plots": overdue[:12],
+    }
+
+
 def build_hot_memory_from_db(
     db: Session,
     novel_id: str,
@@ -1387,6 +1628,12 @@ def build_hot_memory_from_db(
     outline = db.get(NovelMemoryNormOutline, novel_id)
     if not outline:
         return "{}"
+    latest_chapter_no = (
+        db.query(func.max(NovelMemoryNormChapter.chapter_no))
+        .filter(NovelMemoryNormChapter.novel_id == novel_id)
+        .scalar()
+        or 0
+    )
 
     # 1. 最近时间线
     timeline_entries = (
@@ -1424,11 +1671,27 @@ def build_hot_memory_from_db(
     )
     open_plots_hot = []
     for p in plots:
-        line = p.body
-        ptype = getattr(p, "plot_type", None) or "Transient"
-        if ptype and str(ptype).strip() and str(ptype) != "Transient":
-            line = f"[{ptype}] {line}"
-        open_plots_hot.append(line)
+        item: dict[str, Any] = {
+            "body": p.body,
+            "plot_type": getattr(p, "plot_type", None) or "Transient",
+            "priority": getattr(p, "priority", 0) or 0,
+            "estimated_duration": getattr(p, "estimated_duration", 0) or 0,
+        }
+        current_stage = str(getattr(p, "current_stage", "") or "").strip()
+        resolve_when = str(getattr(p, "resolve_when", "") or "").strip()
+        if current_stage:
+            item["current_stage"] = current_stage[:240]
+        if resolve_when:
+            item["resolve_when"] = resolve_when[:240]
+        introduced_chapter = getattr(p, "introduced_chapter", 0) or 0
+        last_touched = getattr(p, "last_touched_chapter", 0) or 0
+        if introduced_chapter:
+            item["introduced_chapter"] = introduced_chapter
+        if last_touched:
+            item["last_touched_chapter"] = last_touched
+        if _plot_is_stale(p, latest_chapter_no):
+            item["is_stale"] = True
+        open_plots_hot.append(item)
 
     # 3. 角色状态（影响力优先 + 仅活跃）
     chars = (
@@ -1451,6 +1714,8 @@ def build_hot_memory_from_db(
             "role": c.role,
             "traits": json.loads(c.traits_json or "[]"),
             "state": c.status,
+            "aliases": _entity_aliases(c),
+            "influence_score": _norm_influence(c),
         })
 
     # 4. 关系
@@ -1477,7 +1742,13 @@ def build_hot_memory_from_db(
         .limit(12)
         .all()
     )
-    inventory_hot = [item.label for item in inventory_items]
+    inventory_hot = []
+    for item in inventory_items:
+        inv = {"label": item.label, "influence_score": _norm_influence(item)}
+        aliases = _entity_aliases(item)
+        if aliases:
+            inv["aliases"] = aliases
+        inventory_hot.append(inv)
 
     skills_objs = (
         db.query(NovelMemoryNormSkill)
@@ -1495,11 +1766,15 @@ def build_hot_memory_from_db(
     skills_hot = []
     for s in skills_objs:
         item = {"name": s.name}
-        detail = json.loads(s.detail_json or "{}")
+        detail = _detail_json(s)
         if detail.get("description"):
             item["description"] = detail["description"]
         if detail.get("status") or detail.get("cost"):
             item["status"] = detail.get("status") or detail.get("cost")
+        aliases = _entity_aliases(s)
+        if aliases:
+            item["aliases"] = aliases
+        item["influence_score"] = _norm_influence(s)
         skills_hot.append(item)
 
     pets_objs = (
@@ -1515,10 +1790,18 @@ def build_hot_memory_from_db(
         .limit(6)
         .all()
     )
-    pets_hot = [{"name": p.name, **json.loads(p.detail_json or "{}")} for p in pets_objs]
+    pets_hot = []
+    for p in pets_objs:
+        item = {"name": p.name, **_detail_json(p), "influence_score": _norm_influence(p)}
+        aliases = _entity_aliases(p)
+        if aliases:
+            item["aliases"] = aliases
+        pets_hot.append(item)
 
     hot_payload: dict[str, Any] = {
-        "world_rules_hot": json.loads(outline.world_rules_json or "[]")[:8],
+        "forbidden_constraints_hot": json.loads(
+            getattr(outline, "forbidden_constraints_json", None) or "[]"
+        )[:12],
         "main_plot_hot": (outline.main_plot or "")[:240],
         "open_plots_hot": open_plots_hot,
         "canonical_timeline_hot": timeline_hot,
@@ -1537,6 +1820,12 @@ def build_hot_memory_from_db(
 
 
 def format_open_plots_from_db(db: Session, novel_id: str) -> str:
+    latest_chapter_no = (
+        db.query(func.max(NovelMemoryNormChapter.chapter_no))
+        .filter(NovelMemoryNormChapter.novel_id == novel_id)
+        .scalar()
+        or 0
+    )
     plots = (
         db.query(NovelMemoryNormPlot)
         .filter(NovelMemoryNormPlot.novel_id == novel_id)
@@ -1561,7 +1850,16 @@ def format_open_plots_from_db(db: Session, novel_id: str) -> str:
         est = getattr(p, "estimated_duration", 0) or 0
         if est:
             meta += f"[约{est}章]"
-        lines.append(f"  {i}. {meta}{p.body}" if meta else f"  {i}. {p.body}")
+        if _plot_is_stale(p, latest_chapter_no):
+            meta += "[stale]"
+        body = p.body
+        current_stage = str(getattr(p, "current_stage", "") or "").strip()
+        resolve_when = str(getattr(p, "resolve_when", "") or "").strip()
+        if current_stage:
+            body += f"｜当前阶段：{current_stage[:120]}"
+        if resolve_when:
+            body += f"｜收束条件：{resolve_when[:120]}"
+        lines.append(f"  {i}. {meta}{body}" if meta else f"  {i}. {body}")
     return "\n".join(lines)
 
 
@@ -1628,10 +1926,17 @@ def format_entity_recall_from_db(
         )
         .all()
     )
-    relevant_chars = [c for c in chars if c.name in query]
+    relevant_chars = [
+        c
+        for c in chars
+        if c.name in query or any(alias in query for alias in _entity_aliases(c))
+    ]
     for c in relevant_chars:
         if c.name not in matched_terms:
             matched_terms.append(c.name)
+        for alias in _entity_aliases(c):
+            if alias in query and alias not in matched_terms:
+                matched_terms.append(alias)
     relevant_chars.sort(key=lambda x: (-_norm_influence(x), x.name))
 
     if relevant_chars:
@@ -1643,6 +1948,11 @@ def format_entity_recall_from_db(
                 f"- {c.name}{tag}"
                 + (f"｜身份：{c.role[:80]}" if c.role else "")
                 + (f"｜当前状态：{c.status[:140]}" if c.status else "")
+                + (
+                    f"｜别名：{'、'.join(_entity_aliases(c)[:4])}"
+                    if _entity_aliases(c)
+                    else ""
+                )
             )
 
     # 2. 检索关系 (基于匹配的角色)
@@ -1676,13 +1986,18 @@ def format_entity_recall_from_db(
     relevant_items = [
         it
         for it in items
-        if it.label in query or any(t in it.label for t in matched_terms)
+        if it.label in query
+        or any(t in it.label for t in matched_terms)
+        or any(alias in query for alias in _entity_aliases(it))
     ]
     relevant_items.sort(key=lambda x: (-_norm_influence(x), x.label))
     if relevant_items:
         lines.append("相关物品：")
         for it in relevant_items[:max_items]:
-            lines.append(f"- {it.label[:160]}")
+            alias_text = "、".join(_entity_aliases(it)[:4])
+            lines.append(
+                f"- {it.label[:160]}" + (f"｜别名：{alias_text}" if alias_text else "")
+            )
 
     # 4. 检索技能与宠物
     skills = (
@@ -1696,13 +2011,16 @@ def format_entity_recall_from_db(
     relevant_skills = [
         s
         for s in skills
-        if s.name in query or any(t in s.name for t in matched_terms)
+        if s.name in query
+        or any(t in s.name for t in matched_terms)
+        or any(alias in query for alias in _entity_aliases(s))
     ]
     relevant_skills.sort(key=lambda x: (-_norm_influence(x), x.name))
     if relevant_skills:
         lines.append("相关技能：")
         for s in relevant_skills[:max_items]:
-            lines.append(f"- {s.name}")
+            alias_text = "、".join(_entity_aliases(s)[:4])
+            lines.append(f"- {s.name}" + (f"｜别名：{alias_text}" if alias_text else ""))
 
     pets = (
         db.query(NovelMemoryNormPet)
@@ -1715,13 +2033,16 @@ def format_entity_recall_from_db(
     relevant_pets = [
         p
         for p in pets
-        if p.name in query or any(t in p.name for t in matched_terms)
+        if p.name in query
+        or any(t in p.name for t in matched_terms)
+        or any(alias in query for alias in _entity_aliases(p))
     ]
     relevant_pets.sort(key=lambda x: (-_norm_influence(x), x.name))
     if relevant_pets:
         lines.append("相关同伴/宠物：")
         for p in relevant_pets[:max_items]:
-            lines.append(f"- {p.name}")
+            alias_text = "、".join(_entity_aliases(p)[:4])
+            lines.append(f"- {p.name}" + (f"｜别名：{alias_text}" if alias_text else ""))
 
     # 5. 检索历史事实 (关键词匹配)
     chapters = (

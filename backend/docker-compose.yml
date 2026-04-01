@@ -1,4 +1,4 @@
-# 可选：项目根 .env 中 DOCKER_HUB_PREFIX=docker.io/library 使用官方源
+# 默认 DaoCloud Hub 镜像；海外时在项目根 .env 设 DOCKER_HUB_PREFIX=docker.io/library
 
 services:
   postgres:

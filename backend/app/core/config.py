@@ -4,7 +4,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
-    app_name: str = "VocalFlow Studio API"
+    app_name: str = "StoryForge API"
     database_url: str = "sqlite:///./vocalflow.db"
     redis_url: str = "redis://localhost:6379/0"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
@@ -52,8 +52,14 @@ class Settings(BaseSettings):
     oss_public_base_url: str = ""
 
     jwt_secret_key: str = "change-me-in-production"
+    jwt_algorithm: str = "HS256"
+    jwt_expire_minutes: int = 60 * 24 * 7
+    # 1 元人民币 = 多少积分（扣费换算）
+    points_per_cny: int = 10
+    # 新注册用户赠送积分（生产可改为 0，由充值获得）
+    register_initial_points: int = 100
 
-    # 小说模块（单用户，无登录）
+    # 小说模块
     reference_txt_max_bytes: int = 15 * 1024 * 1024  # 15MB
     novel_local_upload_dir: str = "./uploads/novels"
     # 每日定时任务默认生成章节数（每本书可单独覆盖）
@@ -98,6 +104,10 @@ class Settings(BaseSettings):
     novel_memory_delta_max_tokens: int = 4096
     # 写章时默认携带最近完整正文的章节数
     novel_recent_full_context_chapters: int = 2
+    # 写章 prompt 的软预算（按字符近似）；超出后会优先裁剪最近正文与低优先级记忆块
+    novel_prompt_char_budget: int = 42_000
+    # 最近完整正文的总字符软上限（各章拼接后再二次裁剪）
+    novel_recent_full_context_total_chars: int = 16_000
     # 写章时按实体召回的历史条目数上限
     novel_memory_entity_recall_max_items: int = 6
     # 审定前：用 LLM 审计正文是否违反 forbidden_constraints（关闭则不调用）
@@ -106,6 +116,10 @@ class Settings(BaseSettings):
     novel_setting_audit_block_on_violation: bool = False
     # 记忆压缩：每隔 N 章可将更早章节细节合并入 timeline_archive（0 表示仅手动触发）
     novel_memory_consolidate_every_n_chapters: int = 50
+    # 线索超过预计持续章节数后，再额外宽限多少章才标记为 stale
+    novel_open_plot_stale_grace_chapters: int = 3
+    # 已收束剧情线日志保留：超过「当前最新章号 − 收束章号」则丢弃，避免列表无限增长
+    novel_resolved_open_plots_log_retention_chapters: int = 20
 
 
 settings = Settings()

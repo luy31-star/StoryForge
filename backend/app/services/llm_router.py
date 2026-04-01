@@ -19,6 +19,34 @@ logger = logging.getLogger(__name__)
 LLMProvider = Literal["ai302", "custom"]
 
 
+def _apply_llm_billing(
+    billing_db: Session | None,
+    billing_user_id: str | None,
+    model: str,
+    response_json: dict[str, Any],
+) -> None:
+    if not billing_db or not billing_user_id:
+        return
+    from app.services.billing_service import (
+        consume_points_for_llm,
+        extract_usage_from_response,
+    )
+
+    usage = extract_usage_from_response(response_json)
+    if not usage:
+        return
+    try:
+        consume_points_for_llm(
+            billing_db,
+            user_id=billing_user_id,
+            model_id=model,
+            usage=usage,
+        )
+    except RuntimeError as e:
+        logger.warning("billing: %s", e)
+        raise
+
+
 def _join_url(base: str, path: str) -> str:
     b = (base or "").rstrip("/")
     p = (path or "").strip()
@@ -114,8 +142,15 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        billing_user_id: str | None = None,
+        billing_db: Session | None = None,
     ) -> str:
         start = time.perf_counter()
+
+        if billing_db and billing_user_id:
+            from app.services.billing_service import assert_sufficient_balance
+
+            assert_sufficient_balance(billing_db, billing_user_id, min_points=1)
 
         if self.provider == "custom":
             model = self._resolve_model(fallback=settings.custom_llm_model)
@@ -135,6 +170,7 @@ class LLMRouter:
             except Exception:
                 logger.exception("custom llm failed | url=%s model=%s", url, model)
                 raise
+            _apply_llm_billing(billing_db, billing_user_id, model, data)
             try:
                 return data["choices"][0]["message"]["content"]
             except Exception:
@@ -160,6 +196,7 @@ class LLMRouter:
             except Exception:
                 logger.exception("ai302 kimi failed | url=%s model=%s", url, model)
                 raise
+            _apply_llm_billing(billing_db, billing_user_id, model, data)
             # content: [{type:"text", text:"..."}]
             try:
                 content = data.get("content")
@@ -197,6 +234,7 @@ class LLMRouter:
         except Exception:
             logger.exception("ai302 chat failed | url=%s model=%s", url, model)
             raise
+        _apply_llm_billing(billing_db, billing_user_id, model, data2)
         try:
             return data2["choices"][0]["message"]["content"]
         except Exception:
@@ -291,8 +329,15 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        billing_user_id: str | None = None,
+        billing_db: Session | None = None,
     ) -> str:
         start = time.perf_counter()
+
+        if billing_db and billing_user_id:
+            from app.services.billing_service import assert_sufficient_balance
+
+            assert_sufficient_balance(billing_db, billing_user_id, min_points=1)
 
         if self.provider == "custom":
             model = self._resolve_model(fallback=settings.custom_llm_model)
@@ -312,6 +357,7 @@ class LLMRouter:
             except Exception:
                 logger.exception("custom llm(sync) failed | url=%s model=%s", url, model)
                 raise
+            _apply_llm_billing(billing_db, billing_user_id, model, data)
             try:
                 return data["choices"][0]["message"]["content"]
             except Exception:
@@ -334,6 +380,7 @@ class LLMRouter:
             except Exception:
                 logger.exception("ai302 kimi(sync) failed | url=%s model=%s", url, model)
                 raise
+            _apply_llm_billing(billing_db, billing_user_id, model, data)
             try:
                 content = data.get("content")
                 if isinstance(content, list):
@@ -368,6 +415,7 @@ class LLMRouter:
         except Exception:
             logger.exception("ai302 chat(sync) failed | url=%s model=%s", url, model)
             raise
+        _apply_llm_billing(billing_db, billing_user_id, model, data2)
         try:
             return data2["choices"][0]["message"]["content"]
         except Exception:

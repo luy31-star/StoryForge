@@ -6,6 +6,20 @@ const base =
 const apiTraceEnabled =
   import.meta.env.DEV || String(import.meta.env.VITE_API_TRACE || "") === "1";
 
+function authHeader(): Record<string, string> {
+  try {
+    const raw = localStorage.getItem("storyforge-auth");
+    if (!raw) return {};
+    const parsed = JSON.parse(raw) as {
+      state?: { token?: string | null };
+    };
+    const token = parsed?.state?.token;
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function apiFetch(
   path: string,
   init?: RequestInit
@@ -18,6 +32,7 @@ export async function apiFetch(
       ...init,
       headers: {
         "Content-Type": "application/json",
+        ...authHeader(),
         ...init?.headers,
       },
     });

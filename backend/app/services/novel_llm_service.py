@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
@@ -51,8 +52,20 @@ from app.services.novel_repo import (
 )
 from app.services.runtime_llm_config import get_runtime_web_search_config
 from app.services.novel_storage import load_reference_text_for_llm
+from app.services.memory_schema import (
+    clamp_int,
+    dedupe_clean_strs,
+    extract_aliases,
+    is_irreversible_fact,
+    normalize_plot_type,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _short_id(content: str) -> str:
+    """基于内容的确定性短 ID（4位），用于 LLM 引用条目。"""
+    return hashlib.md5(content.encode("utf-8")).hexdigest()[:4].upper()
 
 
 def _dedupe_str_list(items: list[Any], *, max_items: int | None = None) -> list[str]:
@@ -495,9 +508,16 @@ def _volume_plan_parse_llm_json_to_dict(raw: str) -> dict[str, Any]:
 class NovelLLMService:
     """小说相关 302 Chat；默认智谱 GLM-4.7，可按配置开启联网搜索。"""
 
-    def __init__(self) -> None:
+    def __init__(self, billing_user_id: str | None = None) -> None:
         # 与历史实现保持兼容：一致性修订/记忆刷新仍走 AI302Client（sync + async）
         self._client = AI302Client()
+        self._billing_user_id = billing_user_id
+
+    @staticmethod
+    def _bill_kw(db: Any, billing_user_id: str | None) -> dict[str, Any]:
+        if billing_user_id and db is not None:
+            return {"billing_user_id": billing_user_id, "billing_db": db}
+        return {}
 
     def _model(self) -> str:
         return settings.ai302_novel_model or settings.ai302_chat_model
@@ -557,6 +577,50 @@ class NovelLLMService:
     def _messages_chars(messages: list[dict[str, str]]) -> int:
         return sum(len(m.get("content", "")) for m in messages)
 
+    @staticmethod
+    def _trim_text_block(block: str, max_chars: int) -> str:
+        raw = str(block or "").strip()
+        if max_chars <= 0 or len(raw) <= max_chars:
+            return raw
+        half = max_chars // 2
+        if half < 80:
+            return raw[-max_chars:]
+        return raw[:half] + "\n…（中间已裁剪）…\n" + raw[-(max_chars - half - 14):]
+
+    @classmethod
+    def _budget_chapter_messages(
+        cls,
+        messages: list[dict[str, str]],
+    ) -> list[dict[str, str]]:
+        budget = max(12000, int(settings.novel_prompt_char_budget))
+        if cls._messages_chars(messages) <= budget:
+            return messages
+
+        trimmed = [dict(m) for m in messages]
+        if len(trimmed) < 2:
+            return trimmed
+        user_text = trimmed[1].get("content", "")
+        blocks = user_text.split("\n\n")
+        lowered = [
+            ("【最近已审定章节完整正文（增强衔接）】", 9000),
+            ("【前文衔接摘录", 3200),
+            ("【与本章最相关的记忆召回】", 2600),
+            ("【冷层历史召回（按需）】", 1800),
+            ("【过程章素材（用于降速但不拖沓）】", 1200),
+        ]
+        for marker, keep_chars in lowered:
+            if cls._messages_chars(trimmed) <= budget:
+                break
+            for idx, block in enumerate(blocks):
+                if block.startswith(marker):
+                    blocks[idx] = cls._trim_text_block(block, keep_chars)
+                    break
+            trimmed[1]["content"] = "\n\n".join(blocks)
+
+        if cls._messages_chars(trimmed) > budget:
+            trimmed[1]["content"] = cls._trim_text_block(trimmed[1]["content"], budget - len(trimmed[0].get("content", "")) - 200)
+        return trimmed
+
     async def inspiration_chat(self, messages: list[dict[str, str]], db: Any = None) -> str:
         """新建小说阶段：多轮对话 + 强制联网搜索，获取创作灵感。"""
         router = self._router(db=db)
@@ -576,6 +640,7 @@ class NovelLLMService:
             temperature=0.75,
             web_search=self._novel_web_search(db, flow="inspiration"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
 
     async def inspiration_chat_stream(
@@ -660,6 +725,7 @@ class NovelLLMService:
             temperature=0.45,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
 
     async def chapter_context_chat_stream(
@@ -756,6 +822,7 @@ class NovelLLMService:
             temperature=0.6,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
         json_part = "{}"
         m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
@@ -1120,7 +1187,142 @@ class NovelLLMService:
             web_search=self._novel_web_search(db, flow="volume_plan"),
             timeout=settings.novel_volume_plan_batch_timeout,
             max_tokens=8192,
+            **self._bill_kw(db, self._billing_user_id),
         )
+
+    def _generate_single_batch_plan_sync(
+        self,
+        novel: Novel,
+        *,
+        volume_no: int,
+        volume_title: str,
+        from_chapter: int,
+        to_chapter: int,
+        memory_json: str,
+        prev_batch_context: str = "",
+        db: Any = None,
+    ) -> str:
+        """生成单批次章计划（同步，供 Celery worker 使用）。"""
+        router = self._router(db=db)
+        batch_chapter_count = to_chapter - from_chapter + 1
+        sys = (
+            "你是网络小说总策划。请为指定章节区间生成「章计划」，用于后续逐章写作。"
+            "你必须严格输出一个 JSON 对象，不要输出任何解释性文字、不要 Markdown、不要代码块围栏。"
+            "输出必须以 { 开头，以 } 结尾；除 JSON 外不得包含任何字符。"
+            "【JSON 语法硬要求】所有字符串值内禁止直接换行；若需分段请使用 \\n 转义。"
+            "剧情文本中避免使用未转义的英文双引号；可用中文「」或单引号代替。"
+        )
+        continuity_hint = ""
+        if prev_batch_context:
+            continuity_hint = (
+                "\n\n【前批次剧情衔接（必须承接）】\n"
+                f"{prev_batch_context}\n"
+                "要求：本章计划必须自然承接前批次的剧情走向、人物状态和未完结线索；"
+                "open_plots_intent_added 若在前批次已出现，本章不得重复声明（除非是新的分支）。\n"
+            )
+        user = (
+            f"【小说标题】{novel.title}\n"
+            f"【卷信息】第{volume_no}卷《{volume_title}》，本批次章节范围：第{from_chapter}章-第{to_chapter}章\n\n"
+            f"【框架 Markdown（摘要）】\n{(novel.framework_markdown or novel.background or '')[:8000]}\n\n"
+            f"【框架 JSON】\n{novel.framework_json or '{}'}\n\n"
+            f"【结构化记忆（open_plots/canonical_timeline 等）】\n{memory_json}\n"
+            f"{continuity_hint}"
+            "【输出要求（严格 JSON）】\n"
+            "{\n"
+            '  \"volume_title\": string,\n'
+            '  \"volume_summary\": string,\n'
+            '  \"chapters\": [\n'
+            "    {\n"
+            '      \"chapter_no\": number,\n'
+            '      \"title\": string,\n'
+            '      \"beats\": {\n'
+            '        \"goal\": string,\n'
+            '        \"conflict\": string,\n'
+            '        \"turn\": string,\n'
+            '        \"hook\": string,\n'
+            '        \"plot_summary\": string,\n'
+            '        \"stage_position\": string,\n'
+            '        \"pacing_justification\": string,\n'
+            '        \"progress_allowed\": string 或 string[],\n'
+            '        \"must_not\": string[],\n'
+            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ]\n'
+            "      },\n"
+            '      \"open_plots_intent_added\": string[],\n'
+            '      \"open_plots_intent_resolved\": string[]\n'
+            "    }\n"
+            "  ]\n"
+            "}\n\n"
+            "volume_summary：用 200～500 字写清本卷在本作中的位置、本卷核心矛盾、阶段目标、与前后卷的衔接、读者在本卷应获得的情绪曲线；"
+            "避免空泛一句话，需分层（人物线/主线/副线/悬念）各至少一句。\n"
+            "beats 字段说明：plot_summary 为本章剧情梗概（约 5～12 句，须写清场景转换、关键行动、信息边界、章末停笔点）；"
+            "stage_position 用一两句说明本章在「当前大纲弧/本卷」中的位置（例如「第一弧约 15% 处、仅完成铺垫」）；"
+            "pacing_justification 用一两句说明本章为何**不会**提前触发后续弧或更大阶段的核心事件（避免与 must_not 矛盾）；"
+            "progress_allowed 写明本章允许推进的内容；must_not 列出本章绝对不得出现的情节、能力觉醒、设定点名、剧透；"
+            "reserved_for_later 列出须延后到指定章节号及之后才允许在正文成真或点名的条目（not_before_chapter 为全局章节号）。\n\n"
+            "【硬约束】\n"
+            f"1) chapters 数组必须恰好包含 {batch_chapter_count} 个对象（第 {from_chapter}～{to_chapter} 章，缺一不可、也不可合并）；"
+            f"chapter_no 从 {from_chapter} 起连续递增；输出前自检 JSON 中 chapters.length === {batch_chapter_count}；\n"
+            "2) 每章 beats 必须体现「只推进一个小节拍」（不要一章跨多个大事件）；\n"
+            "3) 每章 open_plots_intent_resolved 最多 1 条（可以为空），避免清坑过猛导致快进；\n"
+            "4) 若本批次非卷末，章末应自然过渡到下一章，但不得提前解决后续大事件；\n"
+            "5) 必须通读【框架 JSON】中的 arcs、人物、金手指/能力、主线节点；若大纲写明某能力/身份/真相「第 N 章」才觉醒或揭露，"
+            "则所有 chapter_no < N 的章，beats.must_not 必须包含对应的禁止描述（如不得觉醒、不得点名该能力真名、不得让配角知晓等），"
+            "且 plot_summary/turn/hook 不得写到该事件的结果；\n"
+            "6) 每章 plot_summary 仅允许写本章内发生的事，不得写到后续章的结局或后验信息；\n"
+            "7) 输出前自检：若某章 plot_summary、turn 或 hook 与该章 must_not、或 reserved_for_later 中 not_before_chapter 大于该章 chapter_no 的条目冲突，必须改写该章直至一致；\n"
+            "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致；\n"
+            "9) 每章必须填写 stage_position 与 pacing_justification，且与 plot_summary、must_not 一致；\n"
+            "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件。\n"
+        )
+        return router.chat_text_sync(
+            messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
+            temperature=0.55,
+            web_search=self._novel_web_search(db, flow="volume_plan"),
+            timeout=settings.novel_volume_plan_batch_timeout,
+            max_tokens=8192,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+
+    def generate_volume_chapter_plan_batch_json_sync(
+        self,
+        novel: Novel,
+        *,
+        volume_no: int,
+        volume_title: str,
+        from_chapter: int,
+        to_chapter: int,
+        memory_json: str,
+        prev_batch_context: str = "",
+        db: Any = None,
+    ) -> str:
+        """同步版：生成指定区间的一批章计划 JSON 字符串（供 Celery）。"""
+        batch_label = f"卷{volume_no} 批次 {from_chapter}-{to_chapter}"
+        batch_json_str = self._generate_single_batch_plan_sync(
+            novel=novel,
+            volume_no=volume_no,
+            volume_title=volume_title,
+            from_chapter=from_chapter,
+            to_chapter=to_chapter,
+            memory_json=memory_json,
+            prev_batch_context=prev_batch_context,
+            db=db,
+        )
+        batch_data = self._parse_volume_plan_llm_json(batch_json_str, batch_label=batch_label)
+        raw_chapters = batch_data.get("chapters", [])
+        if not isinstance(raw_chapters, list):
+            raw_chapters = []
+        chapters = self._normalize_volume_plan_batch_chapters(
+            raw_chapters,
+            batch_start=from_chapter,
+            batch_end=to_chapter,
+            batch_label=batch_label,
+        )
+        result = {
+            "volume_title": volume_title,
+            "volume_summary": f"第{volume_no}卷，批次第{from_chapter}-{to_chapter}章",
+            "chapters": chapters,
+        }
+        return json.dumps(result, ensure_ascii=False)
 
     async def regenerate_single_chapter_plan(
         self,
@@ -1187,6 +1389,7 @@ class NovelLLMService:
             temperature=0.6,
             timeout=120.0,
             max_tokens=3000,
+            **self._bill_kw(db, self._billing_user_id),
         )
         
         # 解析 JSON
@@ -1282,6 +1485,7 @@ class NovelLLMService:
             use_cold_recall=use_cold_recall,
             cold_recall_items=cold_recall_items,
         )
+        messages = self._budget_chapter_messages(messages)
         model = llm_model or settings.llm_model or settings.ai302_novel_model
         web_search = self._novel_web_search(db, flow="generate")
         timeout = 600.0
@@ -1305,6 +1509,7 @@ class NovelLLMService:
                 web_search=web_search,
                 timeout=timeout,
                 max_tokens=settings.novel_chapter_max_tokens,
+                **self._bill_kw(db, self._billing_user_id),
             )
             return out
         finally:
@@ -1324,6 +1529,7 @@ class NovelLLMService:
         memory_json: str,
         continuity_excerpt: str,
         recent_full_context: str = "",
+        chapter_plan_hint: str = "",
         db: Any = None,
         *,
         use_cold_recall: bool = False,
@@ -1337,10 +1543,12 @@ class NovelLLMService:
             memory_json,
             continuity_excerpt,
             recent_full_context,
+            chapter_plan_hint,
             db=db,
             use_cold_recall=use_cold_recall,
             cold_recall_items=cold_recall_items,
         )
+        messages = self._budget_chapter_messages(messages)
         model = router.model or settings.ai302_novel_model
         web_search = self._novel_web_search(db, flow="generate")
         timeout = 600.0
@@ -1362,6 +1570,7 @@ class NovelLLMService:
                 timeout=timeout,
                 web_search=web_search,
                 max_tokens=settings.novel_chapter_max_tokens,
+                **self._bill_kw(db, self._billing_user_id),
             )
         finally:
             elapsed = time.perf_counter() - start
@@ -1391,6 +1600,7 @@ class NovelLLMService:
             continuity_excerpt,
             chapter_text,
         )
+        messages = self._budget_chapter_messages(messages)
         start = time.perf_counter()
         logger.info(
             "check_and_fix_chapter start | novel_id=%s chapter_no=%s msg_chars=%s text_chars=%s",
@@ -1405,6 +1615,7 @@ class NovelLLMService:
                 temperature=settings.novel_consistency_check_temperature,
                 web_search=False,
                 timeout=600.0,
+                **self._bill_kw(db, self._billing_user_id),
             )
         finally:
             elapsed = time.perf_counter() - start
@@ -1427,17 +1638,20 @@ class NovelLLMService:
     ) -> str:
         router = self._router(db=db)
         return router.chat_text_sync(
-            messages=_check_and_fix_chapter_messages(
-                novel,
-                chapter_no,
-                chapter_title_hint,
-                memory_json,
-                continuity_excerpt,
-                chapter_text,
+            messages=self._budget_chapter_messages(
+                _check_and_fix_chapter_messages(
+                    novel,
+                    chapter_no,
+                    chapter_title_hint,
+                    memory_json,
+                    continuity_excerpt,
+                    chapter_text,
+                )
             ),
             temperature=settings.novel_consistency_check_temperature,
             web_search=False,
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
 
     def _parse_refresh_memory_response(self, raw: str) -> dict[str, Any]:
@@ -1474,34 +1688,121 @@ class NovelLLMService:
             "facts_added[], facts_updated[], open_plots_added[], open_plots_resolved[],"
             "canonical_entries[], characters_updated[], relations_changed[],"
             "inventory_changed{added[],removed[]}, skills_changed{added[],updated[]},"
-            "pets_changed{added[],updated[]}, notes_added[], conflicts_detected[],"
-            "forbidden_constraints_added[], entity_influence_updates[]。"
+            "pets_changed{added[],updated[]}, conflicts_detected[],"
+            "forbidden_constraints_added[], ids_to_remove[], entity_influence_updates[]。"
+            "ids_to_remove[]：非常重要！当你判断某条【待收束线】已收束、某条【硬约束】已失效、或某项技能/道具已遗失/毁坏时，"
+            "直接在 ids_to_remove 中填入该条目在下文提供的 4 位短 ID。不要通过文本匹配删除。"
             "canonical_entries 每项结构："
             "{chapter_no:number, chapter_title:string, key_facts:string[], causal_results:string[],"
-            " open_plots_added:(string|{body,plot_type,priority,estimated_duration})[],"
+            " open_plots_added:(string|{body,plot_type,priority,estimated_duration,current_stage,resolve_when})[],"
             " open_plots_resolved:string[],"
             " emotional_state:string, unresolved_hooks:string[]}。"
             "open_plots_added 可为字符串或对象：对象时 plot_type 取 Core|Arc|Transient，"
-            "priority 越大越重要，estimated_duration 为预计持续章节数（估算即可）。"
+            "priority 越大越重要，estimated_duration 为预计持续章节数（估算即可），"
+            "current_stage 为当前推进到哪一步，resolve_when 为真正收束所需条件。"
             "characters_updated / entity_influence_updates 可含 influence_score(0-100)、is_active。"
             "entity_influence_updates 每项：{entity_type, name, influence_score?, is_active?}，"
             "entity_type 为 character|skill|item|pet|plot 之一。"
-            "forbidden_constraints_added：新增全局禁止事项（硬设定防火墙），须谨慎。"
+            "forbidden_constraints_added：新增全局禁止事项（硬设定防火墙），须谨慎，只写正文绝不能违反的规则。"
+            "facts_added / facts_updated 不要再重复塞进 notes。"
             "严禁输出全量 world_rules/main_plot/arcs。"
+            "open_plots_resolved：每条字符串必须与下文【全书待收束线】或 canonical_entries 中已有 open_plots 的 body 文本完全一致（逐字一致）；"
+            "只允许填写真正影响剧情推进、人物关系、核心矛盾、卷目标或后续章节承接的关键收束线；"
+            "日常动作、一次性细节、气氛描写、小误会、无后续影响的临时事件，即使结束了也不要写入 open_plots_resolved。"
+            "推荐优先使用 ids_to_remove 进行删除。"
         )
         user = (
             f"【框架 JSON（硬约束）】\n{fj}\n\n"
-            f"【旧记忆热层快照】\n{compact_prev}\n\n"
+            f"【旧记忆热层快照（含 ID）】\n{compact_prev}\n\n"
             f"{prev_open_plots}\n\n"
             f"【新章节文本/摘要】\n{chapters_summary}\n\n"
             "任务：提取本批章节相对旧记忆的增量事实。"
-            "如果某条线索明确收束，写入 open_plots_resolved；"
-            "如果只是推进但未真正解决，不要写 resolved。"
+            "如果某条线索在本批明确收束，请将该线索的 ID 放入 ids_to_remove；"
+            "如果某条硬约束、技能或物品不再适用，也请放入 ids_to_remove。"
+            "如果只是推进但未真正解决，不要移除。"
+            "再次强调：只总结关键收束线，不要总结对主剧情没有实质影响的小收尾。"
         )
         return [
             {"role": "system", "content": sys},
             {"role": "user", "content": user},
         ]
+
+    @staticmethod
+    def _is_key_resolved_plot(plot: Any, *, current_chapter_no: int = 0) -> bool:
+        if plot is None:
+            return False
+        if isinstance(plot, dict):
+            plot_type = normalize_plot_type(plot.get("plot_type"))
+            priority = clamp_int(plot.get("priority"), minimum=0, maximum=100, default=0)
+            estimated_duration = clamp_int(
+                plot.get("estimated_duration"), minimum=0, maximum=999, default=0
+            )
+            introduced = clamp_int(
+                plot.get("introduced_chapter"), minimum=0, maximum=20000, default=0
+            )
+            touched = clamp_int(
+                plot.get("last_touched_chapter"), minimum=0, maximum=20000, default=0
+            )
+            current_stage = str(plot.get("current_stage") or "").strip()
+            resolve_when = str(plot.get("resolve_when") or "").strip()
+        else:
+            plot_type = normalize_plot_type(getattr(plot, "plot_type", "Transient"))
+            priority = clamp_int(
+                getattr(plot, "priority", 0), minimum=0, maximum=100, default=0
+            )
+            estimated_duration = clamp_int(
+                getattr(plot, "estimated_duration", 0),
+                minimum=0,
+                maximum=999,
+                default=0,
+            )
+            introduced = clamp_int(
+                getattr(plot, "introduced_chapter", 0),
+                minimum=0,
+                maximum=20000,
+                default=0,
+            )
+            touched = clamp_int(
+                getattr(plot, "last_touched_chapter", 0),
+                minimum=0,
+                maximum=20000,
+                default=0,
+            )
+            current_stage = str(getattr(plot, "current_stage", "") or "").strip()
+            resolve_when = str(getattr(plot, "resolve_when", "") or "").strip()
+        observed_end = max(current_chapter_no, touched, introduced)
+        chapter_span = max(0, observed_end - introduced)
+        return any(
+            (
+                plot_type in {"Core", "Arc"},
+                priority >= 20,
+                estimated_duration >= 4,
+                chapter_span >= 3,
+                bool(current_stage and resolve_when and plot_type != "Transient"),
+            )
+        )
+
+    @classmethod
+    def _filter_key_resolved_plot_bodies(
+        cls,
+        bodies: list[str],
+        *,
+        plot_lookup: dict[str, Any],
+        current_chapter_no: int = 0,
+    ) -> list[str]:
+        kept: list[str] = []
+        seen: set[str] = set()
+        for body in bodies:
+            normalized = str(body or "").strip()
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            plot = plot_lookup.get(normalized)
+            if plot is None or cls._is_key_resolved_plot(
+                plot, current_chapter_no=current_chapter_no
+            ):
+                kept.append(normalized)
+        return kept
 
     @staticmethod
     def _normalize_delta_entry(entry: Any) -> dict[str, Any] | None:
@@ -1523,9 +1824,13 @@ class NovelLLMService:
                         open_plots_added_norm.append(
                             {
                                 "body": body,
-                                "plot_type": str(x.get("plot_type") or "Transient").strip()[:32],
-                                "priority": int(x.get("priority") or 0),
-                                "estimated_duration": int(x.get("estimated_duration") or 0),
+                                "plot_type": normalize_plot_type(x.get("plot_type")),
+                                "priority": clamp_int(x.get("priority"), minimum=0, maximum=100, default=0),
+                                "estimated_duration": max(
+                                    0, clamp_int(x.get("estimated_duration"), minimum=0, maximum=999, default=0)
+                                ),
+                                "current_stage": str(x.get("current_stage") or "").strip()[:500],
+                                "resolve_when": str(x.get("resolve_when") or "").strip()[:500],
                             }
                         )
                 else:
@@ -1648,6 +1953,14 @@ class NovelLLMService:
             "open_plots_resolved": 0,
             "characters_updated": 0,
         }
+        latest_delta_chapter_no = 0
+        active_plot_lookup = {
+            str(row.body or "").strip(): row
+            for row in db.query(NovelMemoryNormPlot)
+            .filter(NovelMemoryNormPlot.novel_id == novel_id)
+            .all()
+            if str(row.body or "").strip()
+        }
 
         # 1. 更新时间线 canonical_entries
         incoming_entries = delta.get("canonical_entries")
@@ -1658,6 +1971,7 @@ class NovelLLMService:
                 chapter_no = item.get("chapter_no")
                 if not isinstance(chapter_no, int):
                     continue
+                latest_delta_chapter_no = max(latest_delta_chapter_no, chapter_no)
                 
                 # 查找是否存在该章节
                 entry = db.query(NovelMemoryNormChapter).filter(
@@ -1682,7 +1996,11 @@ class NovelLLMService:
                     if not isinstance(inc, list):
                         inc = []
                     if field == "open_plots_resolved":
-                        inc_norm = NovelLLMService._open_plot_bodies_from_mixed(inc)
+                        inc_norm = NovelLLMService._filter_key_resolved_plot_bodies(
+                            NovelLLMService._open_plot_bodies_from_mixed(inc),
+                            plot_lookup=active_plot_lookup,
+                            current_chapter_no=chapter_no,
+                        )
                         new_list = _dedupe_str_list([*old_list, *inc_norm])
                     else:
                         new_list = _dedupe_str_list([*old_list, *inc])
@@ -1697,6 +2015,35 @@ class NovelLLMService:
                         b = str(x.get("body") or "").strip()
                         if b:
                             bodies_add.append(b)
+                            plot = db.query(NovelMemoryNormPlot).filter(
+                                NovelMemoryNormPlot.novel_id == novel_id,
+                                NovelMemoryNormPlot.body == b,
+                            ).first()
+                            if plot:
+                                plot.plot_type = normalize_plot_type(x.get("plot_type"))
+                                plot.priority = clamp_int(
+                                    x.get("priority"), minimum=0, maximum=100, default=0
+                                )
+                                plot.estimated_duration = max(
+                                    0,
+                                    clamp_int(
+                                        x.get("estimated_duration"),
+                                        minimum=0,
+                                        maximum=999,
+                                        default=0,
+                                    ),
+                                )
+                                plot.current_stage = str(
+                                    x.get("current_stage") or plot.current_stage or ""
+                                ).strip()[:2000]
+                                plot.resolve_when = str(
+                                    x.get("resolve_when") or plot.resolve_when or ""
+                                ).strip()[:2000]
+                                if chapter_no > 0:
+                                    if not getattr(plot, "introduced_chapter", 0):
+                                        plot.introduced_chapter = chapter_no
+                                    plot.last_touched_chapter = chapter_no
+                                active_plot_lookup[b] = plot
                     else:
                         s = str(x or "").strip()
                         if s:
@@ -1732,12 +2079,23 @@ class NovelLLMService:
         for plot_add in raw_top_add:
             if isinstance(plot_add, dict):
                 body = str(plot_add.get("body") or "").strip()
-                pt = str(plot_add.get("plot_type") or "Transient")[:32]
-                pr = int(plot_add.get("priority") or 0)
-                est = int(plot_add.get("estimated_duration") or 0)
+                pt = normalize_plot_type(plot_add.get("plot_type"))
+                pr = clamp_int(plot_add.get("priority"), minimum=0, maximum=100, default=0)
+                est = max(
+                    0,
+                    clamp_int(
+                        plot_add.get("estimated_duration"),
+                        minimum=0,
+                        maximum=999,
+                        default=0,
+                    ),
+                )
+                current_stage = str(plot_add.get("current_stage") or "").strip()
+                resolve_when = str(plot_add.get("resolve_when") or "").strip()
             else:
                 body = str(plot_add or "").strip()
                 pt, pr, est = "Transient", 0, 0
+                current_stage, resolve_when = "", ""
             if not body:
                 continue
             exists = db.query(NovelMemoryNormPlot).filter(
@@ -1759,18 +2117,32 @@ class NovelLLMService:
                     plot_type=pt,
                     priority=pr,
                     estimated_duration=est,
+                    current_stage=current_stage[:2000],
+                    resolve_when=resolve_when[:2000],
+                    introduced_chapter=latest_delta_chapter_no,
+                    last_touched_chapter=latest_delta_chapter_no,
                 )
                 db.add(new_plot)
+                active_plot_lookup[body] = new_plot
                 stats["open_plots_added"] += 1
             else:
                 exists.plot_type = pt
                 exists.priority = pr
                 exists.estimated_duration = est
+                exists.current_stage = (current_stage or exists.current_stage or "")[:2000]
+                exists.resolve_when = (resolve_when or exists.resolve_when or "")[:2000]
+                if latest_delta_chapter_no > 0:
+                    if not getattr(exists, "introduced_chapter", 0):
+                        exists.introduced_chapter = latest_delta_chapter_no
+                    exists.last_touched_chapter = latest_delta_chapter_no
                 exists.memory_version = memory_version
+                active_plot_lookup[body] = exists
 
         # 移除已结案的线索（与 plot.body 对齐：dict 取 body，禁止把 dict 绑进 SQL IN）
-        top_resolved = _dedupe_str_list(
-            NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
+        top_resolved = NovelLLMService._filter_key_resolved_plot_bodies(
+            NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved")),
+            plot_lookup=active_plot_lookup,
+            current_chapter_no=latest_delta_chapter_no,
         )
         if top_resolved:
             db.query(NovelMemoryNormPlot).filter(
@@ -1985,12 +2357,23 @@ class NovelLLMService:
                 db.query(NovelMemoryNormItem).filter(
                     NovelMemoryNormItem.novel_id == novel_id,
                     NovelMemoryNormItem.label.in_(removed_labels),
-                ).delete(synchronize_session=False)
+                ).update(
+                    {
+                        NovelMemoryNormItem.is_active: False,
+                        NovelMemoryNormItem.memory_version: memory_version,
+                    },
+                    synchronize_session=False,
+                )
 
             for raw in added:
                 label, detail_json = NovelLLMService._inventory_entry_label_and_detail(raw)
                 if not label:
                     continue
+                score = None
+                active = None
+                if isinstance(raw, dict):
+                    score = raw.get("influence_score")
+                    active = raw.get("is_active")
                 exists = db.query(NovelMemoryNormItem).filter(
                     NovelMemoryNormItem.novel_id == novel_id,
                     NovelMemoryNormItem.label == label,
@@ -2009,9 +2392,20 @@ class NovelLLMService:
                         sort_order=max_order + 1,
                         memory_version=memory_version,
                     )
+                    if score is not None:
+                        new_item.influence_score = clamp_int(score, minimum=0, maximum=100, default=0)
+                    if active is not None:
+                        new_item.is_active = bool(active)
                     db.add(new_item)
-                elif isinstance(raw, dict) and detail_json != "{}":
-                    exists.detail_json = detail_json
+                else:
+                    if isinstance(raw, dict) and detail_json != "{}":
+                        exists.detail_json = detail_json
+                    if score is not None:
+                        exists.influence_score = clamp_int(score, minimum=0, maximum=100, default=0)
+                    if active is not None:
+                        exists.is_active = bool(active)
+                    else:
+                        exists.is_active = True
                     exists.memory_version = memory_version
 
         # 6. 技能
@@ -2052,26 +2446,65 @@ class NovelLLMService:
                         if k != "name":
                             detail[k] = v
                     skill.detail_json = json.dumps(detail, ensure_ascii=False)
-                
+                    if item.get("influence_score") is not None:
+                        skill.influence_score = clamp_int(
+                            item.get("influence_score"), minimum=0, maximum=100, default=0
+                        )
+                    if item.get("is_active") is not None:
+                        skill.is_active = bool(item.get("is_active"))
+                    else:
+                        skill.is_active = True
                 skill.memory_version = memory_version
 
-        # 7. 更新 Outline (main_plot, world_rules 等)
+        # 6b. 宠物 / 同伴
+        pets_changed = delta.get("pets_changed")
+        if isinstance(pets_changed, dict):
+            added = pets_changed.get("added") or []
+            updated = pets_changed.get("updated") or []
+            for item in [*added, *updated]:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                else:
+                    name = str(item or "").strip()
+                if not name:
+                    continue
+                pet = db.query(NovelMemoryNormPet).filter(
+                    NovelMemoryNormPet.novel_id == novel_id,
+                    NovelMemoryNormPet.name == name,
+                ).first()
+                if not pet:
+                    max_order = db.query(func.max(NovelMemoryNormPet.sort_order)).filter(
+                        NovelMemoryNormPet.novel_id == novel_id
+                    ).scalar() or 0
+                    pet = NovelMemoryNormPet(
+                        novel_id=novel_id,
+                        name=name,
+                        sort_order=max_order + 1,
+                        memory_version=memory_version,
+                    )
+                    db.add(pet)
+                if isinstance(item, dict):
+                    detail = json.loads(pet.detail_json or "{}")
+                    for k, v in item.items():
+                        if k != "name":
+                            detail[k] = v
+                    pet.detail_json = json.dumps(detail, ensure_ascii=False)
+                    if item.get("influence_score") is not None:
+                        pet.influence_score = clamp_int(
+                            item.get("influence_score"), minimum=0, maximum=100, default=0
+                        )
+                    if item.get("is_active") is not None:
+                        pet.is_active = bool(item.get("is_active"))
+                    else:
+                        pet.is_active = True
+                pet.memory_version = memory_version
+
+        # 7. 更新 Outline (main_plot, forbidden_constraints 等)
         outline = db.get(NovelMemoryNormOutline, novel_id)
         if not outline:
             outline = NovelMemoryNormOutline(novel_id=novel_id)
             db.add(outline)
         
-        # 备注、事实等存入 notes_json
-        notes = json.loads(outline.notes_json or "[]")
-        new_notes = [
-            *notes,
-            *_dedupe_str_list(delta.get("facts_added", [])),
-            *_dedupe_str_list(delta.get("facts_updated", [])),
-            *_dedupe_str_list(delta.get("notes_added", [])),
-            *_dedupe_str_list(delta.get("conflicts_detected", [])),
-        ]
-        outline.notes_json = json.dumps(_dedupe_str_list(new_notes), ensure_ascii=False)
-
         fc_add = delta.get("forbidden_constraints_added", [])
         if isinstance(fc_add, list) and fc_add:
             fc = json.loads(outline.forbidden_constraints_json or "[]")
@@ -2101,6 +2534,7 @@ class NovelLLMService:
             "characters_updated": 0,
         }
 
+        # 1. 时间线处理
         canonical_map: dict[int, dict[str, Any]] = {}
         for item in _canonical_entries_from_payload(prev_data):
             normalized = self._normalize_delta_entry(item)
@@ -2119,190 +2553,221 @@ class NovelLLMService:
                 )
                 stats["canonical_entries"] += 1
 
-        ordered_timeline = [
-            canonical_map[k] for k in sorted(canonical_map.keys())
-        ]
+        ordered_timeline = [canonical_map[k] for k in sorted(canonical_map.keys())]
+        latest_timeline_chapter_no = (
+            ordered_timeline[-1]["chapter_no"] if ordered_timeline else 0
+        )
 
-        open_plots = _dedupe_str_list(prev_data.get("open_plots", []))
+        # 2. 核心 ID 删除逻辑：IDS TO REMOVE
+        ids_to_remove = set(delta.get("ids_to_remove") or [])
+
+        def _normalize_plot_obj(raw: Any, *, chapter_no: int = 0) -> dict[str, Any] | None:
+            if isinstance(raw, dict):
+                body = str(raw.get("body") or raw.get("text") or "").strip()
+                if not body:
+                    return None
+                iid = raw.get("id") or _short_id(body)
+                return {
+                    "id": iid,
+                    "body": body,
+                    "plot_type": normalize_plot_type(raw.get("plot_type")),
+                    "priority": clamp_int(raw.get("priority"), minimum=0, maximum=100, default=0),
+                    "estimated_duration": max(0, clamp_int(raw.get("estimated_duration"), minimum=0, maximum=999, default=0)),
+                    "current_stage": str(raw.get("current_stage") or "").strip()[:500],
+                    "resolve_when": str(raw.get("resolve_when") or "").strip()[:500],
+                    "introduced_chapter": max(0, clamp_int(raw.get("introduced_chapter"), minimum=0, maximum=20000, default=chapter_no)),
+                    "last_touched_chapter": max(0, clamp_int(raw.get("last_touched_chapter"), minimum=0, maximum=20000, default=chapter_no)),
+                }
+            body = str(raw or "").strip()
+            if not body: return None
+            return {
+                "id": _short_id(body), "body": body, "plot_type": "Transient", "priority": 0, 
+                "estimated_duration": 0, "current_stage": "", "resolve_when": "", 
+                "introduced_chapter": chapter_no, "last_touched_chapter": chapter_no
+            }
+
+        def _merge_plot_state(base: dict[str, Any] | None, incoming: dict[str, Any]) -> dict[str, Any]:
+            merged = dict(base or {})
+            merged["id"] = incoming.get("id") or merged.get("id") or _short_id(incoming["body"])
+            merged["body"] = incoming["body"]
+            merged["plot_type"] = normalize_plot_type(incoming.get("plot_type") or merged.get("plot_type"))
+            merged["priority"] = clamp_int(incoming.get("priority", merged.get("priority", 0)), minimum=0, maximum=100, default=0)
+            merged["estimated_duration"] = max(0, clamp_int(incoming.get("estimated_duration", merged.get("estimated_duration", 0)), minimum=0, maximum=999, default=0))
+            merged["current_stage"] = str(incoming.get("current_stage") or merged.get("current_stage") or "").strip()[:500]
+            merged["resolve_when"] = str(incoming.get("resolve_when") or merged.get("resolve_when") or "").strip()[:500]
+            introduced = max(0, clamp_int(merged.get("introduced_chapter") or incoming.get("introduced_chapter"), minimum=0, maximum=20000, default=0))
+            if introduced <= 0: introduced = latest_timeline_chapter_no
+            merged["introduced_chapter"] = introduced
+            merged["last_touched_chapter"] = max(
+                clamp_int(merged.get("last_touched_chapter"), minimum=0, maximum=20000, default=0),
+                clamp_int(incoming.get("last_touched_chapter"), minimum=0, maximum=20000, default=latest_timeline_chapter_no)
+            )
+            return merged
+
+        # 3. Open Plots 合并与清理
+        plot_map: dict[str, dict[str, Any]] = {}
+        prev_open_plots = prev_data.get("open_plots")
+        if isinstance(prev_open_plots, list):
+            for item in prev_open_plots:
+                normalized_plot = _normalize_plot_obj(item)
+                if normalized_plot: plot_map[normalized_plot["body"]] = normalized_plot
+        
+        # 移除 ID 在 ids_to_remove 中的项
+        plot_keys_to_del = [k for k, v in plot_map.items() if v.get("id") in ids_to_remove]
+        for k in plot_keys_to_del: plot_map.pop(k)
+
         raw_top_add = delta.get("open_plots_added", [])
-        top_added_bodies = self._open_plot_bodies_from_mixed(
-            raw_top_add if isinstance(raw_top_add, list) else []
-        )
-        top_resolved = _dedupe_str_list(
-            self._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
-        )
-        added_from_entries: list[str] = []
-        resolved_from_entries: list[str] = []
-        for entry in ordered_timeline:
-            added_from_entries.extend(
-                self._open_plot_bodies_from_mixed(entry.get("open_plots_added"))
-            )
-            resolved_from_entries.extend(
-                self._open_plot_bodies_from_mixed(entry.get("open_plots_resolved"))
-            )
-        resolved_set = set(_dedupe_str_list([*top_resolved, *resolved_from_entries]))
-        for item in _dedupe_str_list(
-            [*open_plots, *top_added_bodies, *added_from_entries]
-        ):
-            if item not in resolved_set:
-                open_plots.append(item)
-        data["open_plots"] = _dedupe_str_list(open_plots)
-        data["open_plots"] = [x for x in data["open_plots"] if x not in resolved_set]
-        stats["open_plots_added"] = len(
-            _dedupe_str_list([*top_added_bodies, *added_from_entries])
-        )
-        stats["open_plots_resolved"] = len(resolved_set)
+        top_added_bodies = self._open_plot_bodies_from_mixed(raw_top_add if isinstance(raw_top_add, list) else [])
+        for item in raw_top_add if isinstance(raw_top_add, list) else []:
+            normalized_plot = _normalize_plot_obj(item, chapter_no=latest_timeline_chapter_no)
+            if normalized_plot:
+                plot_map[normalized_plot["body"]] = _merge_plot_state(plot_map.get(normalized_plot["body"]), normalized_plot)
 
-        prev_characters = prev_data.get("characters", [])
+        # 4. 角色更新 (ID 化，虽然角色通常按名匹配)
         characters_by_name: dict[str, dict[str, Any]] = {}
+        prev_characters = prev_data.get("characters", [])
         if isinstance(prev_characters, list):
             for item in prev_characters:
                 if isinstance(item, dict):
                     name = str(item.get("name") or "").strip()
                     if name:
+                        # 分配 ID
+                        if "id" not in item: item["id"] = _short_id(name)
                         characters_by_name[name] = dict(item)
+        
+        # 移除 ID 在 ids_to_remove 中的项
+        char_names_to_del = [n for n, c in characters_by_name.items() if c.get("id") in ids_to_remove]
+        for n in char_names_to_del: characters_by_name.pop(n)
+
         incoming_chars = delta.get("characters_updated")
         if isinstance(incoming_chars, list):
             for item in incoming_chars:
-                if not isinstance(item, dict):
-                    continue
+                if not isinstance(item, dict): continue
                 name = str(item.get("name") or "").strip()
-                if not name:
-                    continue
-                base = characters_by_name.get(name, {"name": name})
+                if not name: continue
+                base = characters_by_name.get(name, {"name": name, "id": _short_id(name)})
                 for key in ("role", "status"):
                     val = str(item.get(key) or "").strip()
-                    if val:
-                        base[key] = val
+                    if val: base[key] = val
                 traits = item.get("traits")
-                if isinstance(traits, list):
-                    base["traits"] = _dedupe_str_list(traits)
-                elif isinstance(traits, str) and traits.strip():
-                    base["traits"] = _dedupe_str_list(
-                        [*(base.get("traits") or []), traits.strip()]
-                    )
+                if isinstance(traits, list): base["traits"] = _dedupe_str_list(traits)
                 if item.get("influence_score") is not None:
-                    try:
-                        base["influence_score"] = int(item["influence_score"])
-                    except (TypeError, ValueError):
-                        pass
-                if item.get("is_active") is not None:
-                    base["is_active"] = bool(item["is_active"])
+                    try: base["influence_score"] = clamp_int(item["influence_score"], minimum=0, maximum=100, default=0)
+                    except: pass
+                if item.get("is_active") is not None: base["is_active"] = bool(item["is_active"])
                 characters_by_name[name] = base
                 stats["characters_updated"] += 1
         data["characters"] = list(characters_by_name.values())
 
+        # 5. Forbidden Constraints (ID 化)
+        fc_map: dict[str, dict[str, Any]] = {}
         fc_prev = prev_data.get("forbidden_constraints", [])
-        if not isinstance(fc_prev, list):
-            fc_prev = []
+        if isinstance(fc_prev, list):
+            for x in fc_prev:
+                if isinstance(x, dict):
+                    body = str(x.get("body") or "").strip()
+                    iid = x.get("id") or _short_id(body)
+                    if body: fc_map[iid] = {"body": body, "id": iid}
+                else:
+                    body = str(x).strip()
+                    if body:
+                        iid = _short_id(body)
+                        fc_map[iid] = {"body": body, "id": iid}
+        
+        # 移除
+        for iid in ids_to_remove: fc_map.pop(iid, None)
+        
+        # 新增
         fc_add = delta.get("forbidden_constraints_added", [])
-        if not isinstance(fc_add, list):
-            fc_add = []
-        data["forbidden_constraints"] = _dedupe_str_list(
-            [
-                *[str(x).strip() for x in fc_prev if str(x).strip()],
-                *[str(x).strip() for x in fc_add if str(x).strip()],
-            ]
-        )
+        if isinstance(fc_add, list):
+            for x in fc_add:
+                body = str(x).strip()
+                if body:
+                    iid = _short_id(body)
+                    fc_map[iid] = {"body": body, "id": iid}
+        data["forbidden_constraints"] = list(fc_map.values())
 
+        # 6. Relations (ID 化)
+        relation_map: dict[str, dict[str, Any]] = {}
         prev_relations = prev_data.get("relations", [])
-        relation_map: dict[tuple[str, str], dict[str, str]] = {}
         if isinstance(prev_relations, list):
             for item in prev_relations:
-                if not isinstance(item, dict):
-                    continue
+                if not isinstance(item, dict): continue
                 src = str(item.get("from") or "").strip()
                 dst = str(item.get("to") or "").strip()
                 if src and dst:
-                    relation_map[(src, dst)] = {
-                        "from": src,
-                        "to": dst,
-                        "relation": str(item.get("relation") or "").strip(),
+                    iid = item.get("id") or _short_id(f"{src}-{dst}")
+                    relation_map[iid] = {
+                        "id": iid, "from": src, "to": dst, 
+                        "relation": str(item.get("relation") or "").strip()
                     }
+        # 移除
+        for iid in ids_to_remove: relation_map.pop(iid, None)
+        # 更新/新增
         incoming_relations = delta.get("relations_changed")
         if isinstance(incoming_relations, list):
             for item in incoming_relations:
-                if not isinstance(item, dict):
-                    continue
+                if not isinstance(item, dict): continue
                 src = str(item.get("from") or "").strip()
                 dst = str(item.get("to") or "").strip()
                 relation = str(item.get("relation") or "").strip()
                 if src and dst and relation:
-                    relation_map[(src, dst)] = {"from": src, "to": dst, "relation": relation}
+                    iid = _short_id(f"{src}-{dst}")
+                    relation_map[iid] = {"id": iid, "from": src, "to": dst, "relation": relation}
         data["relations"] = list(relation_map.values())
 
-        inventory = _dedupe_str_list(prev_data.get("inventory", []))
-        inventory_changed = delta.get("inventory_changed")
-        if isinstance(inventory_changed, dict):
-            removed = set(_dedupe_str_list(inventory_changed.get("removed", [])))
-            inventory = [x for x in inventory if x not in removed]
-            inventory = _dedupe_str_list(
-                [*inventory, *_dedupe_str_list(inventory_changed.get("added", []))]
-            )
-        data["inventory"] = inventory
-
-        def _merge_named_collection(
-            prev_items: Any, changed: Any
-        ) -> list[dict[str, Any] | str]:
-            base_map: dict[str, dict[str, Any]] = {}
-            unnamed: list[str] = []
+        # 7. Generic Collections: Inventory, Skills, Pets (ID 化)
+        def _merge_named_collection_with_id(key: str, changed_key: str):
+            prev_items = prev_data.get(key, [])
+            changed = delta.get(changed_key)
+            item_map: dict[str, dict[str, Any]] = {}
             if isinstance(prev_items, list):
-                for item in prev_items:
-                    if isinstance(item, dict):
-                        name = str(item.get("name") or "").strip()
-                        if name:
-                            base_map[name] = dict(item)
-                    else:
-                        text = str(item or "").strip()
-                        if text:
-                            unnamed.append(text)
+                for x in prev_items:
+                    if isinstance(x, dict):
+                        name = str(x.get("name") or x.get("label") or "").strip()
+                        iid = x.get("id") or _short_id(name)
+                        if name: item_map[iid] = {**x, "id": iid, "name": name}
+            
+            # 移除
+            for iid in ids_to_remove: item_map.pop(iid, None)
+            # LLM 手动指定的删除
             if isinstance(changed, dict):
+                removed = changed.get("removed", [])
+                if isinstance(removed, list):
+                    for r in removed:
+                        rid = str(r).strip()
+                        item_map.pop(rid, None)
+                        # 兜底：按名删
+                        to_del = [k for k, v in item_map.items() if v.get("name") == rid]
+                        for k in to_del: item_map.pop(k)
+
+                # 更新/新增
                 for field in ("added", "updated"):
                     bucket = changed.get(field)
-                    if not isinstance(bucket, list):
-                        continue
-                    for item in bucket:
-                        if isinstance(item, dict):
-                            name = str(item.get("name") or "").strip()
-                            if not name:
-                                continue
-                            base = base_map.get(name, {"name": name})
-                            for k, v in item.items():
-                                if k == "name":
-                                    continue
-                                if isinstance(v, list):
-                                    base[k] = _dedupe_str_list(v)
-                                elif str(v or "").strip():
-                                    base[k] = str(v).strip()
-                            base_map[name] = base
-                        else:
-                            text = str(item or "").strip()
-                            if text:
-                                unnamed.append(text)
-            return [*base_map.values(), *_dedupe_str_list(unnamed)]
+                    if isinstance(bucket, list):
+                        for raw in bucket:
+                            if not isinstance(raw, dict): continue
+                            name = str(raw.get("name") or raw.get("label") or "").strip()
+                            if not name: continue
+                            iid = raw.get("id") or _short_id(name)
+                            base = item_map.get(iid, {"id": iid, "name": name, "is_active": True})
+                            for k, v in raw.items():
+                                if k in ("id", "name"): continue
+                                base[k] = v
+                            item_map[iid] = base
+            data[key] = list(item_map.values())
 
-        data["skills"] = _merge_named_collection(prev_data.get("skills"), delta.get("skills_changed"))
-        data["pets"] = _merge_named_collection(prev_data.get("pets"), delta.get("pets_changed"))
+        _merge_named_collection_with_id("inventory", "inventory_changed")
+        _merge_named_collection_with_id("skills", "skills_changed")
+        _merge_named_collection_with_id("pets", "pets_changed")
 
-        notes = _dedupe_str_list(prev_data.get("notes", []))
-        notes = _dedupe_str_list(
-            [
-                *notes,
-                *_dedupe_str_list(delta.get("facts_added", [])),
-                *_dedupe_str_list(delta.get("facts_updated", [])),
-                *_dedupe_str_list(delta.get("notes_added", [])),
-                *_dedupe_str_list(delta.get("conflicts_detected", [])),
-            ]
-        )
-        data["notes"] = notes
+        # 8. 移除冗余模块
+        for old_key in ("notes", "world_rules", "arcs", "themes", "timeline_archive_summary", "main_plot_history"):
+            data.pop(old_key, None)
 
-        for key in ("world_rules", "arcs", "themes", "timeline_archive_summary"):
-            if key not in data or not isinstance(data.get(key), list):
-                data[key] = prev_data.get(key, [])
         if not isinstance(data.get("main_plot"), str) or not str(data.get("main_plot")).strip():
             data["main_plot"] = str(prev_data.get("main_plot") or "")
 
-        # 合并后的规范时间线写回，供 _postprocess_memory_layers 重建 hot/cold
         data["canonical_timeline"] = ordered_timeline
         data["canonical_timeline_hot"] = []
         data["canonical_timeline_cold"] = []
@@ -2314,54 +2779,42 @@ class NovelLLMService:
     ) -> str:
         data = _safe_json_dict(payload_json)
         prev_data = _safe_json_dict(prev_memory_json)
-        if not data:
-            return payload_json
+        if not data: return payload_json
 
-        for key in ("characters", "relations", "inventory", "skills", "pets"):
+        # 确保关键列表存在
+        for key in ("characters", "relations", "inventory", "skills", "pets", "open_plots", "forbidden_constraints"):
             if not isinstance(data.get(key), list):
                 data[key] = prev_data.get(key, []) if isinstance(prev_data.get(key), list) else []
-        for key in ("world_rules", "arcs", "themes", "timeline_archive_summary", "notes"):
-            if not isinstance(data.get(key), list):
-                data[key] = prev_data.get(key, []) if isinstance(prev_data.get(key), list) else []
+        
         if not isinstance(data.get("main_plot"), str):
             data["main_plot"] = str(prev_data.get("main_plot") or "")
-        if "forbidden_constraints" not in data or not isinstance(
-            data.get("forbidden_constraints"), list
-        ):
-            prev_fc = prev_data.get("forbidden_constraints", [])
-            data["forbidden_constraints"] = (
-                prev_fc if isinstance(prev_fc, list) else []
-            )
+
+        # 移除已弃用字段
+        for old_key in ("notes", "world_rules", "arcs", "themes", "timeline_archive_summary", "main_plot_history"):
+            data.pop(old_key, None)
+
+        # 确保 open_plots 都有 ID
+        if isinstance(data.get("open_plots"), list):
+            for p in data["open_plots"]:
+                if isinstance(p, dict) and "id" not in p:
+                    p["id"] = _short_id(str(p.get("body") or ""))
 
         full_entries = _canonical_entries_from_payload(data)
         normalized_entries: list[dict[str, Any]] = []
         for item in full_entries:
             normalized = self._normalize_delta_entry(item)
-            if normalized is not None:
-                normalized_entries.append(normalized)
+            if normalized: normalized_entries.append(normalized)
         normalized_entries.sort(key=lambda x: x["chapter_no"])
 
         hot_n = max(1, int(settings.novel_timeline_hot_n))
         hot = normalized_entries[-hot_n:] if len(normalized_entries) > hot_n else normalized_entries
         cold = normalized_entries[:-hot_n] if len(normalized_entries) > hot_n else []
 
-        resolved_set: set[str] = set()
-        added_set: set[str] = set()
-        for item in normalized_entries:
-            resolved_set.update(
-                _dedupe_str_list(
-                    NovelLLMService._open_plot_bodies_from_mixed(item.get("open_plots_resolved"))
-                )
-            )
-            added_set.update(
-                set(self._open_plot_bodies_from_mixed(item.get("open_plots_added")))
-            )
-        open_plots = _dedupe_str_list([*prev_data.get("open_plots", []), *data.get("open_plots", []), *list(added_set)])
-        data["open_plots"] = [x for x in open_plots if x not in resolved_set]
         data["canonical_timeline_hot"] = hot
         data["canonical_timeline_cold"] = cold
         data["canonical_timeline"] = hot
         return json.dumps(data, ensure_ascii=False)
+
 
     def _validate_memory_with_db(
         self,
@@ -2369,32 +2822,13 @@ class NovelLLMService:
         novel_id: str,
         delta: dict[str, Any],
         candidate_json: str,
-    ) -> list[str]:
+    ) -> dict[str, list[str]]:
         """
         利用数据库当前状态，校验 LLM 返回的增量是否合法，防止幻觉导致的误删除或冲突。
         """
-        errors = []
-        
-        # 1. 校验 open_plots_resolved 是否确实存在于 DB 中
-        resolved = _dedupe_str_list(
-            NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_resolved"))
-        )
-        if resolved:
-            # 获取当前 DB 中的所有活跃 plot
-            db_plots = {p.body for p in db.query(NovelMemoryNormPlot).filter(
-                NovelMemoryNormPlot.novel_id == novel_id
-            ).all()}
-            # 允许在本批次中新增并立即解决（虽然不推荐，但逻辑上通）
-            added_in_delta = set(
-                NovelLLMService._open_plot_bodies_from_mixed(delta.get("open_plots_added"))
-            )
-            valid_pool = db_plots | added_in_delta
-            
-            for item in resolved:
-                if item not in valid_pool:
-                    errors.append(f"幻觉警告：试图收束一个不存在的线索：{item}")
+        result = self._empty_validation_result()
 
-        # 2. 校验时间线章节号是否重复或冲突
+        # 1. 时间线章节号是否重复（格式/一致性）
         incoming_entries = delta.get("canonical_entries")
         if isinstance(incoming_entries, list):
             seen_nos = set()
@@ -2403,10 +2837,12 @@ class NovelLLMService:
                 if not isinstance(cn, int):
                     continue
                 if cn in seen_nos:
-                    errors.append(f"数据冲突：本批次中包含重复的章节号 {cn}")
+                    result["blocking_errors"].append(
+                        f"数据冲突：本批次中包含重复的章节号 {cn}"
+                    )
                 seen_nos.add(cn)
 
-        # 3. 校验角色更新
+        # 2. 校验角色更新
         incoming_chars = delta.get("characters_updated")
         if isinstance(incoming_chars, list):
             for item in incoming_chars:
@@ -2418,7 +2854,140 @@ class NovelLLMService:
                 # 但在这里我们允许 Upsert，所以也许不需要报错，除非它是误删了其他信息
                 pass
 
-        return errors
+        return self._merge_validation_results(result)
+
+    @staticmethod
+    def _empty_validation_result() -> dict[str, list[str]]:
+        return {
+            "blocking_errors": [],
+            "warnings": [],
+            "auto_pass_notes": [],
+        }
+
+    @staticmethod
+    def _merge_validation_results(*parts: dict[str, list[str]]) -> dict[str, list[str]]:
+        merged = NovelLLMService._empty_validation_result()
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            for key in merged:
+                vals = part.get(key)
+                if isinstance(vals, list):
+                    merged[key].extend(str(v).strip() for v in vals if str(v).strip())
+        for key in merged:
+            merged[key] = _dedupe_str_list(merged[key])
+        return merged
+
+    def _classify_removed_open_plots(
+        self,
+        db: Session | None,
+        novel_id: str | None,
+        removed_open: set[str],
+    ) -> dict[str, list[str]]:
+        result = self._empty_validation_result()
+        if not removed_open:
+            return result
+        if not db or not novel_id:
+            result["warnings"].append(
+                "活跃 open_plots 被无理由删除：" + "；".join(sorted(removed_open)[:5])
+            )
+            return result
+
+        latest_chapter_no = (
+            db.query(func.max(NovelMemoryNormChapter.chapter_no))
+            .filter(NovelMemoryNormChapter.novel_id == novel_id)
+            .scalar()
+            or 0
+        )
+        rows = (
+            db.query(NovelMemoryNormPlot)
+            .filter(
+                NovelMemoryNormPlot.novel_id == novel_id,
+                NovelMemoryNormPlot.body.in_(list(removed_open)),
+            )
+            .all()
+        )
+        by_body = {str(row.body or "").strip(): row for row in rows}
+        for body in sorted(removed_open):
+            row = by_body.get(body)
+            if row is None:
+                result["warnings"].append(f"活跃 open_plots 疑似被删除：{body}")
+                continue
+            plot_type = str(getattr(row, "plot_type", "Transient") or "Transient")
+            priority = int(getattr(row, "priority", 0) or 0)
+            estimated_duration = int(getattr(row, "estimated_duration", 0) or 0)
+            touched = max(
+                int(getattr(row, "last_touched_chapter", 0) or 0),
+                int(getattr(row, "introduced_chapter", 0) or 0),
+            )
+            is_stale = (
+                estimated_duration > 0
+                and touched > 0
+                and latest_chapter_no > 0
+                and (latest_chapter_no - touched)
+                > (estimated_duration + settings.novel_open_plot_stale_grace_chapters)
+            )
+            can_auto_pass = (
+                plot_type.lower() == "transient"
+                and priority <= 3
+                and (is_stale or (0 < estimated_duration <= 3))
+            )
+            if can_auto_pass:
+                note = (
+                    f"自动放行：低风险待收束线可移出热层：{body}"
+                    f"（plot_type={plot_type}，priority={priority}，estimated_duration={estimated_duration}"
+                )
+                if is_stale:
+                    note += "，已 stale"
+                note += "）"
+                result["auto_pass_notes"].append(note)
+            else:
+                result["warnings"].append(
+                    f"活跃 open_plots 疑似被删除：{body}"
+                    f"（plot_type={plot_type}，priority={priority}，estimated_duration={estimated_duration}）"
+                )
+        return self._merge_validation_results(result)
+
+    def _classify_removed_characters(
+        self,
+        db: Session | None,
+        novel_id: str | None,
+        missing_chars: set[str],
+    ) -> dict[str, list[str]]:
+        result = self._empty_validation_result()
+        if not missing_chars:
+            return result
+        if not db or not novel_id:
+            result["warnings"].append("已有角色被删除：" + "；".join(sorted(missing_chars)[:5]))
+            return result
+
+        rows = (
+            db.query(NovelMemoryNormCharacter)
+            .filter(
+                NovelMemoryNormCharacter.novel_id == novel_id,
+                NovelMemoryNormCharacter.name.in_(list(missing_chars)),
+            )
+            .all()
+        )
+        by_name = {str(row.name or "").strip(): row for row in rows}
+        for name in sorted(missing_chars):
+            row = by_name.get(name)
+            if row is None:
+                result["warnings"].append(f"已有角色疑似被删除：{name}")
+                continue
+            influence_score = int(getattr(row, "influence_score", 0) or 0)
+            is_active = bool(getattr(row, "is_active", True))
+            if (not is_active) or influence_score <= 2:
+                result["auto_pass_notes"].append(
+                    f"自动放行：低影响或已退场角色可从热层移出：{name}"
+                    f"（影响力={influence_score}，{'活跃' if is_active else '已退场'}）"
+                )
+            else:
+                result["warnings"].append(
+                    f"已有角色疑似被删除：{name}"
+                    f"（影响力={influence_score}，{'活跃' if is_active else '已退场'}）"
+                )
+        return self._merge_validation_results(result)
 
     def _validate_memory_payload(
         self,
@@ -2426,21 +2995,24 @@ class NovelLLMService:
         prev_memory_json: str,
         *,
         delta: dict[str, Any] | None = None,
-    ) -> list[str]:
+        db: Session | None = None,
+        novel_id: str | None = None,
+    ) -> dict[str, list[str]]:
         data = _safe_json_dict(candidate_json)
         prev_data = _safe_json_dict(prev_memory_json)
-        errors: list[str] = []
+        result = self._empty_validation_result()
         if not data:
-            return ["候选记忆不是合法 JSON 对象"]
+            result["blocking_errors"].append("候选记忆不是合法 JSON 对象")
+            return result
 
         for key in ("characters", "relations", "inventory", "skills", "pets", "open_plots"):
             if not isinstance(data.get(key), list):
-                errors.append(f"{key} 必须为数组")
+                result["blocking_errors"].append(f"{key} 必须为数组")
         for key in ("world_rules", "arcs", "themes", "notes", "timeline_archive_summary"):
             if key in data and not isinstance(data.get(key), list):
-                errors.append(f"{key} 必须为数组")
+                result["blocking_errors"].append(f"{key} 必须为数组")
         if "main_plot" in data and not isinstance(data.get("main_plot"), str):
-            errors.append("main_plot 必须为字符串")
+            result["blocking_errors"].append("main_plot 必须为字符串")
 
         entries = _canonical_entries_from_payload(data)
         last_no = 0
@@ -2448,18 +3020,18 @@ class NovelLLMService:
         for entry in entries:
             normalized = self._normalize_delta_entry(entry)
             if normalized is None:
-                errors.append("canonical_timeline 存在非法条目")
+                result["blocking_errors"].append("canonical_timeline 存在非法条目")
                 continue
             chapter_no = normalized["chapter_no"]
             if chapter_no in seen:
-                errors.append(f"canonical_timeline 第 {chapter_no} 章重复")
+                result["blocking_errors"].append(f"canonical_timeline 第 {chapter_no} 章重复")
             if chapter_no < last_no:
-                errors.append("canonical_timeline 章节号必须递增")
+                result["blocking_errors"].append("canonical_timeline 章节号必须递增")
             seen.add(chapter_no)
             last_no = max(last_no, chapter_no)
 
-        prev_open = set(_dedupe_str_list(prev_data.get("open_plots", [])))
-        new_open = set(_dedupe_str_list(data.get("open_plots", [])))
+        prev_open = set(self._open_plot_bodies_from_mixed(prev_data.get("open_plots", [])))
+        new_open = set(self._open_plot_bodies_from_mixed(data.get("open_plots", [])))
         removed_open = prev_open - new_open
         resolved = set()
         for entry in entries:
@@ -2477,29 +3049,12 @@ class NovelLLMService:
             )
         unexpected_removed = removed_open - resolved
         if unexpected_removed:
-            errors.append(
-                "活跃 open_plots 被无理由删除：" + "；".join(sorted(unexpected_removed)[:5])
+            result = self._merge_validation_results(
+                result,
+                self._classify_removed_open_plots(db, novel_id, unexpected_removed),
             )
 
-        if delta:
-            entry_added: list[str] = []
-            incoming_entries = delta.get("canonical_entries")
-            if isinstance(incoming_entries, list):
-                for item in incoming_entries:
-                    if isinstance(item, dict):
-                        entry_added.extend(
-                            self._open_plot_bodies_from_mixed(item.get("open_plots_added"))
-                        )
-            top_add = delta.get("open_plots_added", [])
-            top_bodies = self._open_plot_bodies_from_mixed(
-                top_add if isinstance(top_add, list) else []
-            )
-            valid_resolve_pool = prev_open | set(
-                _dedupe_str_list([*top_bodies, *entry_added])
-            )
-            for item in resolved:
-                if item not in valid_resolve_pool:
-                    errors.append(f"open_plots_resolved 存在历史中未激活的条目：{item}")
+        # 不再校验 open_plots_resolved 是否落在「历史激活池」内，避免表述微差导致阻断；格式与非空由 JSON 结构保证。
 
         prev_chars = {
             str(item.get("name") or "").strip()
@@ -2513,9 +3068,12 @@ class NovelLLMService:
         }
         missing_chars = prev_chars - new_chars
         if missing_chars:
-            errors.append("已有角色被删除：" + "；".join(sorted(missing_chars)[:5]))
+            result = self._merge_validation_results(
+                result,
+                self._classify_removed_characters(db, novel_id, missing_chars),
+            )
 
-        return _dedupe_str_list(errors)
+        return self._merge_validation_results(result)
 
     @staticmethod
     def _get_latest_memory_version(db: Session, novel_id: str) -> int:
@@ -2537,14 +3095,19 @@ class NovelLLMService:
             web_search=self._novel_web_search(db, flow="memory_refresh"),
             timeout=settings.novel_memory_refresh_batch_timeout,
             max_tokens=settings.novel_memory_delta_max_tokens,
+            **self._bill_kw(db, self._billing_user_id),
         )
         delta = self._parse_refresh_memory_response(raw)
         if not delta:
             return {
                 "ok": False,
+                "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": "{}",
                 "errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "warnings": [],
+                "auto_pass_notes": [],
                 "stats": {},
             }
         
@@ -2555,24 +3118,38 @@ class NovelLLMService:
         )
         
         # 2. 校验
-        errors = self._validate_memory_payload(candidate_json, prev_memory, delta=delta)
+        validation = self._validate_memory_payload(
+            candidate_json,
+            prev_memory,
+            delta=delta,
+            db=db if isinstance(db, Session) else None,
+            novel_id=novel.id if db else None,
+        )
         if db:
-            db_errors = self._validate_memory_with_db(db, novel.id, delta, candidate_json)
-            errors = _dedupe_str_list([*errors, *db_errors])
-            
-        if errors:
+            db_validation = self._validate_memory_with_db(db, novel.id, delta, candidate_json)
+            validation = self._merge_validation_results(validation, db_validation)
+
+        blocking_errors = validation["blocking_errors"]
+        warnings = validation["warnings"]
+        auto_pass_notes = validation["auto_pass_notes"]
+
+        if blocking_errors:
             return {
                 "ok": False,
+                "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": candidate_json,
-                "errors": errors,
+                "errors": blocking_errors,
+                "blocking_errors": blocking_errors,
+                "warnings": warnings,
+                "auto_pass_notes": auto_pass_notes,
                 "stats": stats,
                 "delta": delta,
             }
 
-        # 3. 如果校验通过且有 db，则执行规范化表更新
+        # 3. 如果没有 warning 且有 db，则执行规范化表更新
         new_version = 0
-        if db:
+        if db and not warnings:
             try:
                 # 使用 Savepoint 保护事务，防止局部失败导致全局回滚（如章节审批状态丢失）
                 with db.begin_nested():
@@ -2619,9 +3196,13 @@ class NovelLLMService:
         
         return {
             "ok": True,
+            "status": "warning" if warnings else "ok",
             "payload_json": candidate_json,
             "candidate_json": candidate_json,
             "errors": [],
+            "blocking_errors": [],
+            "warnings": warnings,
+            "auto_pass_notes": auto_pass_notes,
             "stats": stats,
             "delta": delta,
             "version": new_version,
@@ -2641,14 +3222,19 @@ class NovelLLMService:
             timeout=settings.novel_memory_refresh_batch_timeout,
             web_search=self._novel_web_search(db, flow="memory_refresh"),
             max_tokens=settings.novel_memory_delta_max_tokens,
+            **self._bill_kw(db, self._billing_user_id),
         )
         delta = self._parse_refresh_memory_response(raw)
         if not delta:
             return {
                 "ok": False,
+                "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": "{}",
                 "errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "warnings": [],
+                "auto_pass_notes": [],
                 "stats": {},
             }
         
@@ -2659,24 +3245,38 @@ class NovelLLMService:
         )
         
         # 2. 校验
-        errors = self._validate_memory_payload(candidate_json, prev_memory, delta=delta)
+        validation = self._validate_memory_payload(
+            candidate_json,
+            prev_memory,
+            delta=delta,
+            db=db if isinstance(db, Session) else None,
+            novel_id=novel.id if db else None,
+        )
         if db:
-            db_errors = self._validate_memory_with_db(db, novel.id, delta, candidate_json)
-            errors = _dedupe_str_list([*errors, *db_errors])
-            
-        if errors:
+            db_validation = self._validate_memory_with_db(db, novel.id, delta, candidate_json)
+            validation = self._merge_validation_results(validation, db_validation)
+
+        blocking_errors = validation["blocking_errors"]
+        warnings = validation["warnings"]
+        auto_pass_notes = validation["auto_pass_notes"]
+
+        if blocking_errors:
             return {
                 "ok": False,
+                "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": candidate_json,
-                "errors": errors,
+                "errors": blocking_errors,
+                "blocking_errors": blocking_errors,
+                "warnings": warnings,
+                "auto_pass_notes": auto_pass_notes,
                 "stats": stats,
                 "delta": delta,
             }
 
-        # 3. 如果校验通过且有 db，则执行规范化表更新
+        # 3. 如果没有 warning 且有 db，则执行规范化表更新
         new_version = 0
-        if db:
+        if db and not warnings:
             try:
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1
@@ -2718,9 +3318,13 @@ class NovelLLMService:
         
         return {
             "ok": True,
+            "status": "warning" if warnings else "ok",
             "payload_json": candidate_json,
             "candidate_json": candidate_json,
             "errors": [],
+            "blocking_errors": [],
+            "warnings": warnings,
+            "auto_pass_notes": auto_pass_notes,
             "stats": stats,
             "delta": delta,
             "version": new_version,
@@ -2739,6 +3343,8 @@ class NovelLLMService:
         )
         current_memory = prev_memory
         total_stats = {"canonical_entries": 0, "open_plots_added": 0, "open_plots_resolved": 0, "characters_updated": 0}
+        collected_warnings: list[str] = []
+        collected_auto_pass_notes: list[str] = []
         batch_num = 0
         pos = 0
         while pos < summary_len:
@@ -2759,14 +3365,20 @@ class NovelLLMService:
                 result["batch"] = batch_num
                 return result
             current_memory = result["payload_json"]
+            collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
+            collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
         out: dict[str, Any] = {
             "ok": True,
+            "status": "warning" if collected_warnings else "ok",
             "payload_json": current_memory,
             "candidate_json": current_memory,
             "errors": [],
+            "blocking_errors": [],
+            "warnings": _dedupe_str_list(collected_warnings),
+            "auto_pass_notes": _dedupe_str_list(collected_auto_pass_notes),
             "stats": total_stats,
         }
         if db:
@@ -2781,6 +3393,8 @@ class NovelLLMService:
         summary_len = len(chapters_summary or "")
         current_memory = prev_memory
         total_stats = {"canonical_entries": 0, "open_plots_added": 0, "open_plots_resolved": 0, "characters_updated": 0}
+        collected_warnings: list[str] = []
+        collected_auto_pass_notes: list[str] = []
         batch_num = 0
         pos = 0
         while pos < summary_len:
@@ -2801,14 +3415,20 @@ class NovelLLMService:
                 result["batch"] = batch_num
                 return result
             current_memory = result["payload_json"]
+            collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
+            collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
         out_sync: dict[str, Any] = {
             "ok": True,
+            "status": "warning" if collected_warnings else "ok",
             "payload_json": current_memory,
             "candidate_json": current_memory,
             "errors": [],
+            "blocking_errors": [],
+            "warnings": _dedupe_str_list(collected_warnings),
+            "auto_pass_notes": _dedupe_str_list(collected_auto_pass_notes),
             "stats": total_stats,
         }
         if db:
@@ -2847,7 +3467,9 @@ class NovelLLMService:
                 facts.extend([str(x).strip() for x in kf if str(x).strip()])
         if not facts:
             return {"ok": True, "skipped": True, "reason": "no_facts"}
-        facts = facts[:250]
+        irreversible = [fact for fact in facts if is_irreversible_fact(fact)]
+        reversible = [fact for fact in facts if fact not in irreversible]
+        facts = [*irreversible[:150], *reversible[:100]]
         router = self._router(db=db)
         sys = (
             "你是长篇连载编辑。将下列「早期章节关键事实」压缩为 3～12 条阶段性摘要短句，"
@@ -2862,6 +3484,7 @@ class NovelLLMService:
             temperature=0.25,
             web_search=False,
             timeout=180.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
         bullets = [ln.strip() for ln in (raw or "").splitlines() if ln.strip()][:16]
         arch = json.loads(outline.timeline_archive_json or "[]")
@@ -2935,6 +3558,7 @@ class NovelLLMService:
             temperature=0.15,
             web_search=False,
             timeout=180.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
         parsed = self._parse_refresh_memory_response(raw)
         v = parsed.get("violations") if isinstance(parsed, dict) else []
@@ -2980,12 +3604,15 @@ class NovelLLMService:
     ) -> str:
         router = self._router(db=db)
         return await router.chat_text(
-            messages=_revise_chapter_messages(
-                novel, chapter, memory_json, feedback_bodies, user_prompt
+            messages=self._budget_chapter_messages(
+                _revise_chapter_messages(
+                    novel, chapter, memory_json, feedback_bodies, user_prompt
+                )
             ),
             temperature=0.65,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         )
 
     def revise_chapter_sync(
@@ -2999,10 +3626,13 @@ class NovelLLMService:
     ) -> str:
         router = self._router(db=db)
         return router.chat_text_sync(
-            messages=_revise_chapter_messages(
-                novel, chapter, memory_json, feedback_bodies, user_prompt
+            messages=self._budget_chapter_messages(
+                _revise_chapter_messages(
+                    novel, chapter, memory_json, feedback_bodies, user_prompt
+                )
             ),
             temperature=0.65,
             timeout=600.0,
             web_search=self._novel_web_search(db, flow="default"),
+            **self._bill_kw(db, self._billing_user_id),
         )

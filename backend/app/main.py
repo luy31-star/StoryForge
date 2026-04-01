@@ -12,13 +12,20 @@ from app.core.db_migrate import (
     ensure_app_config_row,
     ensure_novel_memory_norm_extended_columns,
     ensure_novel_target_chapters,
+    ensure_user_isolation_columns,
+    relax_novel_memory_norm_columns,
 )
+from app.core.database import SessionLocal
+from app.core.seed_data import ensure_default_model_prices
 import app.models.app_config  # noqa: F401 — ensure metadata registers
+import app.models.user  # noqa: F401 — users / billing 表
 import app.models.novel  # noqa: F401 — 确保 metadata 建表
 import app.models.novel_memory_norm  # noqa: F401 — 规范化记忆表
 import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
+import app.models.project  # noqa: F401 — projects.user_id
+import app.models.workflow  # noqa: F401 — workflows.user_id
 from app.middleware.request_log import RequestLoggingMiddleware
-from app.routers import agents, llm, media, novel, volume, websocket, workflow
+from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow
 
 logger = logging.getLogger(__name__)
 logging.getLogger("vocalflow.request").setLevel(logging.INFO)
@@ -41,6 +48,9 @@ app.add_middleware(
 # 最后注册，作为最外层：记录含 CORS 在内的整段耗时
 app.add_middleware(RequestLoggingMiddleware)
 
+app.include_router(auth.router)
+app.include_router(billing.router)
+app.include_router(billing.admin_router)
 app.include_router(workflow.router)
 app.include_router(agents.router)
 app.include_router(llm.router)
@@ -53,10 +63,19 @@ app.include_router(websocket.router)
 @app.on_event("startup")
 def on_startup() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_user_isolation_columns(engine)
     ensure_novel_target_chapters(engine)
     ensure_novel_memory_norm_extended_columns(engine)
+    relax_novel_memory_norm_columns(engine)
     ensure_app_config_columns(engine)
     ensure_app_config_row(engine)
+    db = SessionLocal()
+    try:
+        ensure_default_model_prices(db)
+    except Exception:
+        logger.exception("ensure_default_model_prices failed")
+    finally:
+        db.close()
     if settings.oss_region and settings.oss_bucket:
         logger.info(
             "OSS: region=%s bucket=%s endpoint=%s",

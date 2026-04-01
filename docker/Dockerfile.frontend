@@ -1,3 +1,4 @@
+# 默认 DaoCloud Hub 镜像；海外构建可：--build-arg DOCKER_HUB_PREFIX=docker.io/library
 ARG DOCKER_HUB_PREFIX=docker.m.daocloud.io/library
 FROM ${DOCKER_HUB_PREFIX}/node:20-alpine AS build
 WORKDIR /app

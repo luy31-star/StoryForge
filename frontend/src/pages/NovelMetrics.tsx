@@ -13,6 +13,12 @@ import { getNovelMetrics } from "@/services/novelApi";
 
 type NovelMetrics = Awaited<ReturnType<typeof getNovelMetrics>>;
 
+function ringTone(value01: number) {
+  if (value01 >= 0.75) return "text-emerald-500";
+  if (value01 >= 0.45) return "text-amber-500";
+  return "text-rose-500";
+}
+
 function clamp01(n: number) {
   if (Number.isNaN(n)) return 0;
   return Math.max(0, Math.min(1, n));
@@ -35,8 +41,8 @@ function RiskRing({
   const dashOffset = c * (1 - value);
 
   return (
-    <div className="relative flex items-center gap-4 rounded-lg border border-border bg-card/60 p-4 shadow-sm">
-      <div className="flex h-12 w-12 items-center justify-center rounded-md bg-primary/10 text-primary">
+    <div className="glass-panel-subtle relative flex items-center gap-4 p-4">
+      <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-primary/10 text-primary">
         <Icon className="size-5" />
       </div>
       <div className="flex flex-1 items-center justify-between gap-4">
@@ -75,7 +81,7 @@ function RiskRing({
             />
           </svg>
           <div className="absolute text-center">
-            <div className="text-xl font-semibold tabular-nums">
+            <div className={`text-xl font-semibold tabular-nums ${ringTone(value)}`}>
               {Math.round(value * 100)}%
             </div>
             <div className="mt-[-2px] text-[11px] text-muted-foreground">证据</div>
@@ -83,6 +89,14 @@ function RiskRing({
         </div>
       </div>
     </div>
+  );
+}
+
+function metricChip(label: string, value: string) {
+  return (
+    <span className="glass-chip px-3 py-1.5 text-xs">
+      {label}：<span className="font-medium text-foreground">{value}</span>
+    </span>
   );
 }
 
@@ -155,11 +169,33 @@ export function NovelMetricsPage() {
   }
 
   const { novel, config, summary } = metrics;
+  const nextChapterNo = summary.next_chapter_no ?? null;
+  const currentArcTitle = summary.current_arc_title || "（未命中 arcs）";
+  const currentArcFrom =
+    typeof summary.current_arc_from === "number" || typeof summary.current_arc_from === "string"
+      ? String(summary.current_arc_from)
+      : null;
+  const currentArcTo =
+    typeof summary.current_arc_to === "number" || typeof summary.current_arc_to === "string"
+      ? String(summary.current_arc_to)
+      : null;
+  const currentArcRange =
+    currentArcFrom != null && currentArcTo != null
+      ? `第${currentArcFrom}—${currentArcTo}章`
+      : null;
+  const pacingFlags = summary.pacing_flags ?? [];
+  const volumesCount = summary.volumes_count ?? 0;
+  const plannedChaptersCount = summary.planned_chapters_count ?? 0;
+  const hasNextChapterPlan = summary.has_next_chapter_plan ?? false;
+  const canonicalTimelineLastAdded =
+    summary.canonical_timeline_last_editable?.open_plots_added.length ?? 0;
+  const canonicalTimelineLastResolved =
+    summary.canonical_timeline_last_editable?.open_plots_resolved.length ?? 0;
 
   return (
-    <div className="min-h-screen bg-background p-6">
-      <div className="mx-auto max-w-5xl space-y-4">
-        <div className="relative overflow-hidden rounded-2xl border border-border bg-card/60 p-6">
+    <div className="novel-shell">
+      <div className="novel-container space-y-5">
+        <div className="glass-panel relative overflow-hidden p-6 md:p-8">
           <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-primary/20 via-accent/10 to-transparent" />
           <div className="relative flex flex-wrap items-start justify-between gap-4">
             <div className="space-y-2">
@@ -167,7 +203,7 @@ export function NovelMetricsPage() {
                 <BookOpen className="size-4" />
                 <span className="text-sm">连贯性观察指标</span>
               </div>
-              <h1 className="text-2xl font-bold tracking-tight">{novel.title}</h1>
+              <h1 className="text-3xl font-semibold tracking-tight">{novel.title}</h1>
               <p className="text-sm text-muted-foreground">
                 framework：{novel.framework_confirmed ? "已确认" : "未确认"} · 状态：{novel.status}
               </p>
@@ -183,9 +219,23 @@ export function NovelMetricsPage() {
           </div>
         </div>
 
+        <div className="grid gap-4 md:grid-cols-4">
+          {[
+            ["已审定章节", String(summary.approved_count)],
+            ["未完结线", String(summary.open_plots_count)],
+            ["时间线账本", String(summary.canonical_timeline_count)],
+            ["记忆版本", String(summary.memory_version)],
+          ].map(([label, value]) => (
+            <div key={label} className="glass-panel-subtle p-4">
+              <p className="text-xs text-muted-foreground">{label}</p>
+              <p className="mt-2 text-2xl font-semibold tracking-tight text-foreground">{value}</p>
+            </div>
+          ))}
+        </div>
+
         <div className="grid gap-4 lg:grid-cols-3">
           <div className="lg:col-span-2 space-y-4">
-            <Card className="overflow-hidden bg-card/60">
+            <Card className="overflow-hidden">
               <CardHeader>
                 <CardTitle>防偏移 · 连贯性证据（越高越好）</CardTitle>
                 <CardDescription>
@@ -217,58 +267,51 @@ export function NovelMetricsPage() {
                   value01={riskModel.continuityEvidence}
                   icon={Thermometer}
                 />
-                <div className="rounded-lg border border-border bg-muted/20 p-4">
+                <div className="glass-panel-subtle p-4">
                   <div className="flex items-center justify-between">
                     <p className="text-sm font-medium">综合证据</p>
                     <p className="text-sm text-muted-foreground">
                       {Math.round(riskModel.overallEvidence * 100)}%
                     </p>
                   </div>
-                  <div className="mt-3 flex items-center gap-3 text-xs text-muted-foreground">
-                    <span className="rounded bg-primary/10 px-2 py-1">
-                      总体策略：偏连贯（tail/head/核对）
-                    </span>
-                    <span className="rounded bg-accent/10 px-2 py-1">
-                      提示：如果长期证据偏低，建议刷新记忆/提高 tail/head 或开启核对
-                    </span>
+                  <div className="mt-3 flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+                    {metricChip("总体策略", "偏连贯（tail/head/核对）")}
+                    {metricChip("提示", "长期偏低时建议刷新记忆或提高 tail/head")}
                   </div>
                 </div>
               </CardContent>
             </Card>
 
-            <Card className="bg-card/60">
+            <Card>
               <CardHeader>
                 <CardTitle>关键指标卡片</CardTitle>
                 <CardDescription>把你最关心的内容直接列出来，方便肉眼检查。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <p className="text-sm font-medium">节奏对齐（下一章导航）</p>
                   <p className="mt-1 text-xs text-muted-foreground">
                     下一章：第{" "}
                     <span className="font-semibold">
-                      {(summary as any).next_chapter_no ?? "-"}
+                      {nextChapterNo ?? "-"}
                     </span>{" "}
                     章 · 当前弧线：{" "}
                     <span className="font-semibold">
-                      {(summary as any).current_arc_title || "（未命中 arcs）"}
+                      {currentArcTitle}
                     </span>
-                    {(summary as any).current_arc_from != null &&
-                    (summary as any).current_arc_to != null ? (
-                      <span className="ml-2">
-                        （第{String((summary as any).current_arc_from)}—{String((summary as any).current_arc_to)}章）
-                      </span>
+                    {currentArcRange ? (
+                      <span className="ml-2">（{currentArcRange}）</span>
                     ) : null}
                   </p>
                   <p className="mt-2 text-xs text-muted-foreground">
                     弧线节拍信息：{" "}
                     <span className="font-semibold">
-                      {(summary as any).current_arc_has_beats ? "已提供" : "缺失"}
+                      {summary.current_arc_has_beats ? "已提供" : "缺失"}
                     </span>
                   </p>
-                  {(summary as any).pacing_flags?.length ? (
+                  {pacingFlags.length ? (
                     <ul className="mt-2 list-disc space-y-1 pl-5 text-xs text-amber-200/90">
-                      {(summary as any).pacing_flags.map((x: string, i: number) => (
+                      {pacingFlags.map((x, i) => (
                         <li key={`${i}-${x}`}>{x}</li>
                       ))}
                     </ul>
@@ -278,28 +321,28 @@ export function NovelMetricsPage() {
                     </p>
                   )}
                   <div className="mt-3 grid gap-2 sm:grid-cols-3">
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">卷数 volumes</p>
                       <p className="mt-1 text-lg font-semibold">
-                        {String((summary as any).volumes_count ?? 0)}
+                        {volumesCount}
                       </p>
                     </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">已计划章节</p>
                       <p className="mt-1 text-lg font-semibold">
-                        {String((summary as any).planned_chapters_count ?? 0)}
+                        {plannedChaptersCount}
                       </p>
                     </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">下一章有计划</p>
                       <p className="mt-1 text-lg font-semibold">
-                        {(summary as any).has_next_chapter_plan ? "是" : "否"}
+                        {hasNextChapterPlan ? "是" : "否"}
                       </p>
                     </div>
                   </div>
                 </div>
                 <div className="grid gap-3 md:grid-cols-2">
-                  <div className="rounded-xl border border-border bg-background/30 p-4">
+                  <div className="glass-panel-subtle p-4">
                     <p className="text-sm font-medium">open_plots（未完结线）</p>
                     <p className="mt-1 text-xs text-muted-foreground">
                       当前未完结线数量：<span className="font-semibold">{summary.open_plots_count}</span>
@@ -319,7 +362,7 @@ export function NovelMetricsPage() {
                     </div>
                   </div>
 
-                  <div className="rounded-xl border border-border bg-background/30 p-4">
+                  <div className="glass-panel-subtle p-4">
                     <p className="text-sm font-medium">canonical_timeline（时间线账本）</p>
                     <p className="mt-1 text-xs text-muted-foreground">
                       条目数：<span className="font-semibold">{summary.canonical_timeline_count}</span>
@@ -336,11 +379,11 @@ export function NovelMetricsPage() {
                     <p className="mt-1 text-xs text-muted-foreground">
                       最近一条：新增坑{" "}
                       <span className="font-semibold">
-                        {String((summary as any).canonical_timeline_last_added_n ?? 0)}
+                        {canonicalTimelineLastAdded}
                       </span>{" "}
                       · 收束坑{" "}
                       <span className="font-semibold">
-                        {String((summary as any).canonical_timeline_last_resolved_n ?? 0)}
+                        {canonicalTimelineLastResolved}
                       </span>
                     </p>
                     <div className="mt-3 space-y-2">
@@ -361,24 +404,24 @@ export function NovelMetricsPage() {
                   </div>
                 </div>
 
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <p className="text-sm font-medium">章节状态分布</p>
                   <div className="mt-3 grid gap-2 sm:grid-cols-4">
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">已审定 approved</p>
                       <p className="mt-1 text-lg font-semibold">{summary.approved_count}</p>
                     </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">待审 pending_review</p>
                       <p className="mt-1 text-lg font-semibold">{summary.pending_review_count}</p>
                     </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">最后已审定</p>
                       <p className="mt-1 text-lg font-semibold">
                         {summary.last_approved_chapter_no ?? "-"}
                       </p>
                     </div>
-                    <div className="rounded-lg border border-border bg-muted/20 p-3">
+                    <div className="glass-panel-subtle p-3">
                       <p className="text-xs text-muted-foreground">记忆版本</p>
                       <p className="mt-1 text-lg font-semibold">{summary.memory_version}</p>
                     </div>
@@ -400,45 +443,35 @@ export function NovelMetricsPage() {
           </div>
 
           <div className="space-y-4">
-            <Card className="bg-card/60">
+            <Card>
               <CardHeader>
                 <CardTitle>当前设定（连贯性策略）</CardTitle>
                 <CardDescription>这是后端当前生效的关键参数快照（不含任何密钥）。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <p className="text-sm font-medium">摘要刷新</p>
                   <div className="mt-3 flex flex-wrap gap-2">
-                    <span className="rounded-full border border-border bg-muted/20 px-3 py-1 text-xs">
-                      参与章数：{config.novel_memory_refresh_chapters}
-                    </span>
-                    <span className="rounded-full border border-border bg-muted/20 px-3 py-1 text-xs">
-                      mode：{config.novel_chapter_summary_mode}
-                    </span>
-                    <span className="rounded-full border border-border bg-muted/20 px-3 py-1 text-xs">
-                      tail：{config.novel_chapter_summary_tail_chars}c
-                    </span>
-                    <span className="rounded-full border border-border bg-muted/20 px-3 py-1 text-xs">
-                      head：{config.novel_chapter_summary_head_chars}c
-                    </span>
+                    {metricChip("参与章数", String(config.novel_memory_refresh_chapters))}
+                    {metricChip("mode", config.novel_chapter_summary_mode)}
+                    {metricChip("tail", `${config.novel_chapter_summary_tail_chars}c`)}
+                    {metricChip("head", `${config.novel_chapter_summary_head_chars}c`)}
                   </div>
                 </div>
 
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <p className="text-sm font-medium">生成一致性核对</p>
                   <div className="mt-3 flex flex-wrap gap-2">
                     <span
                       className={
                         config.novel_consistency_check_chapter
-                          ? "rounded-full border border-primary/30 bg-primary/10 px-3 py-1 text-xs text-primary"
-                          : "rounded-full border border-border bg-muted/20 px-3 py-1 text-xs text-muted-foreground"
+                          ? "glass-chip border-primary/30 bg-primary/10 text-primary"
+                          : "glass-chip"
                       }
                     >
                       {config.novel_consistency_check_chapter ? "开启" : "关闭"}
                     </span>
-                    <span className="rounded-full border border-border bg-muted/20 px-3 py-1 text-xs">
-                      temperature：{config.novel_consistency_check_temperature}
-                    </span>
+                    {metricChip("temperature", String(config.novel_consistency_check_temperature))}
                   </div>
                   <p className="mt-3 text-xs text-muted-foreground">
                     启用后每章会额外进行一次低温核对/小幅修订，显著降低设定偏移风险。
@@ -447,13 +480,13 @@ export function NovelMetricsPage() {
               </CardContent>
             </Card>
 
-            <Card className="bg-card/60">
+            <Card>
               <CardHeader>
                 <CardTitle>观察指标清单（你该看什么）</CardTitle>
                 <CardDescription>这是一份“肉眼检查清单”，用于几十章长连载滚动复查。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <div className="flex items-center gap-2 text-sm font-medium">
                     <Gauge className="size-4" />
                     偏移风险最高的三件事
@@ -470,7 +503,7 @@ export function NovelMetricsPage() {
                     </li>
                   </ul>
                 </div>
-                <div className="rounded-xl border border-border bg-background/30 p-4">
+                <div className="glass-panel-subtle p-4">
                   <p className="text-sm font-medium">建议操作（当指标偏低）</p>
                   <p className="mt-2 text-xs text-muted-foreground">
                     先点一次“根据已审定章节刷新记忆”，再观察 `open_plots` 是否收敛；

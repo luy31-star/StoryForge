@@ -4,8 +4,12 @@
 #   docker compose up --build -d
 # 访问：http://localhost:8080 ；API 直连调试：http://localhost:8000
 #
-# 基础镜像默认经 DaoCloud 拉取，避免直连 registry-1.docker.io 超时。
-# 能直连 Docker Hub 时可在 .env 设置：DOCKER_HUB_PREFIX=docker.io/library
+# 基础镜像默认走 DaoCloud 对 Docker Hub 的镜像（docker.m.daocloud.io/library）。海外或镜像不可用时在 .env 设：
+#   DOCKER_HUB_PREFIX=docker.io/library
+#
+# 若报错 lookup *.io on *:53: i/o timeout：本机 DNS（常为公司路由）对 Docker 不可用。请在 Docker
+# Desktop → Settings → Docker Engine 合并 docker/daemon.json.example（含 dns + 国内 registry-mirrors），
+# 应用并重启 Docker；Rancher Desktop 见 scripts/rancher-desktop-docker-mirror.sh。
 
 services:
   postgres:

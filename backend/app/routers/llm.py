@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from __future__ import annotations
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.deps import get_current_admin
+from app.models.user import User
 from app.services.runtime_llm_config import (
     get_runtime_llm_config,
     get_runtime_web_search_config,
@@ -67,7 +67,11 @@ def get_llm_config(db: Session = Depends(get_db)) -> LLMConfigOut:
 
 
 @router.post("/config")
-def set_llm_config(body: LLMConfigIn, db: Session = Depends(get_db)) -> LLMConfigOut:
+def set_llm_config(
+    body: LLMConfigIn,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+) -> LLMConfigOut:
     try:
         row = set_runtime_llm_config(
             db=db,

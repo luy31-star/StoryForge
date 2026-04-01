@@ -14,12 +14,15 @@ if TYPE_CHECKING:
 
 
 class Novel(Base):
-    """单用户小说；不挂 user_id。"""
+    """小说；多用户下通过 user_id 隔离。"""
 
     __tablename__ = "novels"
 
     id: Mapped[str] = mapped_column(
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
+    )
+    user_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("users.id"), nullable=True, index=True
     )
     title: Mapped[str] = mapped_column(String(512))
     intro: Mapped[str] = mapped_column(Text, default="")
@@ -45,6 +48,7 @@ class Novel(Base):
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )
 
+    owner = relationship("User", back_populates="novels")
     chapters = relationship(
         "Chapter", back_populates="novel", cascade="all, delete-orphan"
     )
@@ -70,7 +74,7 @@ class Chapter(Base):
     status: Mapped[str] = mapped_column(String(32), default="draft")
     source: Mapped[str] = mapped_column(
         String(32), default="manual"
-    )  # manual | daily_job | user_prompt
+    )  # manual | batch_auto | daily_job | user_prompt
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

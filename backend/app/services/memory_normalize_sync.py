@@ -9,6 +9,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.novel_memory_norm import (
     NovelMemoryNormChapter,
     NovelMemoryNormCharacter,
@@ -18,6 +19,12 @@ from app.models.novel_memory_norm import (
     NovelMemoryNormPlot,
     NovelMemoryNormRelation,
     NovelMemoryNormSkill,
+)
+from app.services.memory_schema import (
+    clamp_int,
+    dedupe_clean_strs,
+    extract_aliases,
+    normalize_plot_type,
 )
 
 
@@ -68,13 +75,7 @@ def _json_list(val: Any) -> str:
 
 
 def _parse_influence_active(item: dict[str, Any]) -> tuple[int, bool]:
-    inf = 0
-    raw_inf = item.get("influence_score")
-    if raw_inf is not None:
-        try:
-            inf = int(raw_inf)
-        except (TypeError, ValueError):
-            inf = 0
+    inf = clamp_int(item.get("influence_score"), minimum=0, maximum=100, default=0)
     active = item.get("is_active")
     is_active = True if active is None else bool(active)
     return inf, is_active
@@ -267,15 +268,9 @@ def _plot_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 body = str(x.get("body") or x.get("text") or "").strip()
                 if not body:
                     continue
-                try:
-                    prio = int(x.get("priority") or 0)
-                except (TypeError, ValueError):
-                    prio = 0
-                try:
-                    est = int(x.get("estimated_duration") or 0)
-                except (TypeError, ValueError):
-                    est = 0
-                ptype = str(x.get("plot_type") or "Transient").strip()[:32] or "Transient"
+                prio = clamp_int(x.get("priority"), minimum=0, maximum=100, default=0)
+                est = max(0, clamp_int(x.get("estimated_duration"), minimum=0, maximum=999, default=0))
+                ptype = normalize_plot_type(x.get("plot_type"))
                 out.append(
                     {
                         "sort_order": i,
@@ -283,6 +278,14 @@ def _plot_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "plot_type": ptype,
                         "priority": prio,
                         "estimated_duration": est,
+                        "current_stage": str(x.get("current_stage") or "").strip(),
+                        "resolve_when": str(x.get("resolve_when") or "").strip(),
+                        "introduced_chapter": max(
+                            0, clamp_int(x.get("introduced_chapter"), minimum=0, maximum=20000, default=0)
+                        ),
+                        "last_touched_chapter": max(
+                            0, clamp_int(x.get("last_touched_chapter"), minimum=0, maximum=20000, default=0)
+                        ),
                     }
                 )
             else:
@@ -295,6 +298,10 @@ def _plot_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                             "plot_type": "Transient",
                             "priority": 0,
                             "estimated_duration": 0,
+                            "current_stage": "",
+                            "resolve_when": "",
+                            "introduced_chapter": 0,
+                            "last_touched_chapter": 0,
                         }
                     )
     elif isinstance(raw, str) and raw.strip():
@@ -305,6 +312,10 @@ def _plot_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "plot_type": "Transient",
                 "priority": 0,
                 "estimated_duration": 0,
+                "current_stage": "",
+                "resolve_when": "",
+                "introduced_chapter": 0,
+                "last_touched_chapter": 0,
             }
         )
     return out
@@ -346,13 +357,9 @@ def replace_normalized_from_payload(
         novel_id=novel_id,
         memory_version=memory_version,
         main_plot=str(data.get("main_plot") or ""),
-        world_rules_json=_json_list(data.get("world_rules")),
-        arcs_json=_json_list(data.get("arcs")),
-        themes_json=_json_list(data.get("themes")),
-        notes_json=_json_list(data.get("notes")),
         timeline_archive_json=_json_list(data.get("timeline_archive_summary")),
         forbidden_constraints_json=json.dumps(
-            [str(x).strip() for x in fc_raw if str(x).strip()],
+            [x for x in fc_raw if x],
             ensure_ascii=False,
         ),
     )
@@ -430,6 +437,10 @@ def replace_normalized_from_payload(
                 plot_type=str(row.get("plot_type") or "Transient")[:32],
                 priority=int(row.get("priority") or 0),
                 estimated_duration=int(row.get("estimated_duration") or 0),
+                current_stage=str(row.get("current_stage") or ""),
+                resolve_when=str(row.get("resolve_when") or ""),
+                introduced_chapter=int(row.get("introduced_chapter") or 0),
+                last_touched_chapter=int(row.get("last_touched_chapter") or 0),
             )
         )
 
@@ -498,57 +509,68 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
     rels = rows(NovelMemoryNormRelation, NovelMemoryNormRelation.sort_order)
     plots = rows(NovelMemoryNormPlot, NovelMemoryNormPlot.sort_order)
     chs = rows(NovelMemoryNormChapter, NovelMemoryNormChapter.chapter_no)
+    latest_chapter_no = chs[-1].chapter_no if chs else 0
+
+    def _detail_with_aliases(raw_json: str) -> tuple[dict[str, Any], list[str]]:
+        try:
+            detail = json.loads(raw_json or "{}")
+        except json.JSONDecodeError:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        aliases = extract_aliases(detail)
+        return detail, aliases
 
     return {
         "memory_version": outline.memory_version,
         "outline": {
             "main_plot": outline.main_plot,
-            "world_rules": json.loads(outline.world_rules_json or "[]"),
-            "arcs": json.loads(outline.arcs_json or "[]"),
-            "themes": json.loads(outline.themes_json or "[]"),
-            "notes": json.loads(outline.notes_json or "[]"),
             "timeline_archive_summary": json.loads(outline.timeline_archive_json or "[]"),
             "forbidden_constraints": json.loads(
                 getattr(outline, "forbidden_constraints_json", None) or "[]"
             ),
         },
         "skills": [
-            {
+            (lambda detail, aliases: {
                 "name": s.name,
-                "detail": json.loads(s.detail_json or "{}"),
+                "detail": detail,
+                "aliases": aliases,
                 "influence_score": getattr(s, "influence_score", 0) or 0,
                 "is_active": getattr(s, "is_active", True),
-            }
+            })(*_detail_with_aliases(s.detail_json))
             for s in skills
         ],
         "inventory": [
-            {
+            (lambda detail, aliases: {
                 "label": s.label,
-                "detail": json.loads(s.detail_json or "{}"),
+                "detail": detail,
+                "aliases": aliases,
                 "influence_score": getattr(s, "influence_score", 0) or 0,
                 "is_active": getattr(s, "is_active", True),
-            }
+            })(*_detail_with_aliases(s.detail_json))
             for s in items
         ],
         "pets": [
-            {
+            (lambda detail, aliases: {
                 "name": p.name,
-                "detail": json.loads(p.detail_json or "{}"),
+                "detail": detail,
+                "aliases": aliases,
                 "influence_score": getattr(p, "influence_score", 0) or 0,
                 "is_active": getattr(p, "is_active", True),
-            }
+            })(*_detail_with_aliases(p.detail_json))
             for p in pets
         ],
         "characters": [
-            {
+            (lambda detail, aliases: {
                 "name": c.name,
                 "role": c.role,
                 "status": c.status,
                 "traits": json.loads(c.traits_json or "[]"),
-                "detail": json.loads(c.detail_json or "{}"),
+                "detail": detail,
+                "aliases": aliases,
                 "influence_score": getattr(c, "influence_score", 0) or 0,
                 "is_active": getattr(c, "is_active", True),
-            }
+            })(*_detail_with_aliases(c.detail_json))
             for c in chars
         ],
         "relations": [
@@ -560,6 +582,23 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
                 "plot_type": getattr(p, "plot_type", "Transient") or "Transient",
                 "priority": getattr(p, "priority", 0) or 0,
                 "estimated_duration": getattr(p, "estimated_duration", 0) or 0,
+                "current_stage": getattr(p, "current_stage", "") or "",
+                "resolve_when": getattr(p, "resolve_when", "") or "",
+                "introduced_chapter": getattr(p, "introduced_chapter", 0) or 0,
+                "last_touched_chapter": getattr(p, "last_touched_chapter", 0) or 0,
+                "is_stale": bool(
+                    latest_chapter_no > 0
+                    and getattr(p, "estimated_duration", 0)
+                    and (
+                        latest_chapter_no
+                        - max(
+                            getattr(p, "last_touched_chapter", 0) or 0,
+                            getattr(p, "introduced_chapter", 0) or 0,
+                        )
+                    )
+                    > settings.novel_open_plot_stale_grace_chapters
+                    + int(getattr(p, "estimated_duration", 0) or 0)
+                ),
             }
             for p in plots
         ],
@@ -601,10 +640,6 @@ def sync_json_snapshot_from_normalized(
     outline = norm.get("outline", {})
     payload = {
         "main_plot": outline.get("main_plot", ""),
-        "world_rules": outline.get("world_rules", []),
-        "arcs": outline.get("arcs", []),
-        "themes": outline.get("themes", []),
-        "notes": outline.get("notes", []),
         "timeline_archive_summary": outline.get("timeline_archive_summary", []),
         "forbidden_constraints": outline.get("forbidden_constraints", []),
         "skills": [],
@@ -617,6 +652,9 @@ def sync_json_snapshot_from_normalized(
     }
     for s in norm.get("skills", []):
         d = dict(s.get("detail") or {})
+        aliases = dedupe_clean_strs(s.get("aliases"))
+        if aliases:
+            d["aliases"] = aliases
         if "influence_score" in s:
             d["influence_score"] = s["influence_score"]
         if "is_active" in s:
@@ -624,6 +662,9 @@ def sync_json_snapshot_from_normalized(
         payload["skills"].append({"name": s["name"], **d})
     for s in norm.get("inventory", []):
         d = dict(s.get("detail") or {})
+        aliases = dedupe_clean_strs(s.get("aliases"))
+        if aliases:
+            d["aliases"] = aliases
         if "influence_score" in s:
             d["influence_score"] = s["influence_score"]
         if "is_active" in s:
@@ -631,6 +672,9 @@ def sync_json_snapshot_from_normalized(
         payload["inventory"].append({"name": s["label"], **d})
     for s in norm.get("pets", []):
         d = dict(s.get("detail") or {})
+        aliases = dedupe_clean_strs(s.get("aliases"))
+        if aliases:
+            d["aliases"] = aliases
         if "influence_score" in s:
             d["influence_score"] = s["influence_score"]
         if "is_active" in s:
@@ -645,6 +689,9 @@ def sync_json_snapshot_from_normalized(
             "traits": c["traits"],
             **d,
         }
+        aliases = dedupe_clean_strs(c.get("aliases"))
+        if aliases:
+            entry["aliases"] = aliases
         if "influence_score" in c:
             entry["influence_score"] = c["influence_score"]
         if "is_active" in c:
