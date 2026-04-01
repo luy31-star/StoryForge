@@ -35,6 +35,7 @@ export function NovelNew() {
   const [style, setStyle] = useState("");
   const [targetChapters, setTargetChapters] = useState(1500);
   const [dailyChapters, setDailyChapters] = useState(0);
+  const [dailyTime, setDailyTime] = useState("14:30");
   const [file, setFile] = useState<File | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -93,6 +94,7 @@ export function NovelNew() {
         style,
         target_chapters: targetChapters,
         daily_auto_chapters: dailyChapters,
+        daily_auto_time: dailyTime,
       });
       if (file) {
         const verr = validateReferenceFile(file);
@@ -450,6 +452,16 @@ export function NovelNew() {
                     max={20}
                     value={dailyChapters}
                     onChange={(e) => setDailyChapters(Number(e.target.value))}
+                    className="field-shell mt-1 h-11"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="dailyTime">每日自动撰写时间</Label>
+                  <Input
+                    id="dailyTime"
+                    type="time"
+                    value={dailyTime}
+                    onChange={(e) => setDailyTime(e.target.value)}
                     className="field-shell mt-1 h-11"
                   />
                 </div>

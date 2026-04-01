@@ -88,149 +88,54 @@ def _append_refresh_log(
 @celery_app.task(name="novel.daily_chapters")
 def novel_daily_chapters() -> dict[str, int]:
     """
-    每日定时：对 daily_auto_chapters > 0 且已确认框架的书，自动生成指定章数，
-    状态为已审定（approved），与自动续写一致；正文生成后已在流程中更新工作记忆。
+    每分钟定时：检查当前时间 (HH:MM)，查找设定在这个时间自动生成的小说，并触发全自动 Pipeline。
+    加入了 last_auto_date 防重防漏机制。
     """
     db = SessionLocal()
     processed = 0
-    started = time.perf_counter()
+    
+    # 获取当前东八区时间 HH:MM 和日期 YYYY-MM-DD
+    from datetime import datetime
+    import pytz
+    tz = pytz.timezone("Asia/Shanghai")
+    now = datetime.now(tz)
+    now_hh_mm = now.strftime("%H:%M")
+    today_str = now.strftime("%Y-%m-%d")
+    
     try:
+        # 查询需要自动生成的小说
         novels = (
             db.query(Novel)
-            .filter(Novel.daily_auto_chapters > 0, Novel.framework_confirmed.is_(True))
+            .filter(
+                Novel.daily_auto_chapters > 0, 
+                Novel.framework_confirmed.is_(True)
+            )
             .all()
         )
         for n in novels:
-            llm = _novel_llm_for_novel(n)
-            try:
-                novel_started = time.perf_counter()
-                mem = latest_memory_json(db, n.id)
-                base_no = next_chapter_no_from_approved(db, n.id)
-                logger.info(
-                    "daily_chapters start novel | novel_id=%s title=%r count=%s base_no=%s mem_chars=%s",
-                    n.id,
-                    n.title,
-                    n.daily_auto_chapters,
-                    base_no,
-                    len(mem or ""),
-                )
-                for idx in range(n.daily_auto_chapters):
-                    step_started = time.perf_counter()
-                    continuity = format_continuity_excerpts(
-                        db, n.id, approved_only=True
-                    )
-                    full_context = format_recent_approved_fulltext_context(
-                        db,
+            # 判断是否到了或过了设定的时间，且今天还没执行过
+            if n.daily_auto_time <= now_hh_mm and (n.last_auto_date or "") < today_str:
+                batch_id = f"auto-{int(time.time())}-{n.id[:8]}"
+                try:
+                    # 触发后台全自动 Pipeline 任务
+                    novel_auto_pipeline_task.delay(
                         n.id,
-                        max_chapters=max(1, settings.novel_recent_full_context_chapters),
+                        getattr(n, "user_id", None),
+                        batch_id,
+                        n.daily_auto_chapters
                     )
-                    no = base_no + idx
-                    raw_content = llm.generate_chapter_sync(
-                        n, no, "", mem, continuity, full_context, db=db
-                    )
-                    content = raw_content
-                    draft_metrics = chapter_content_metrics(raw_content)
-                    if settings.novel_consistency_check_chapter:
-                        try:
-                            content = llm.check_and_fix_chapter_sync(
-                                n, no, "", mem, continuity, raw_content, db=db
-                            )
-                        except Exception:
-                            logger.exception(
-                                "daily_chapters consistency failed, fallback raw | novel_id=%s chapter_no=%s",
-                                n.id,
-                                no,
-                            )
-                            content = raw_content
-                    try:
-                        memory_delta_result = llm.propose_memory_update_from_chapter_sync(
-                            n,
-                            chapter_no=no,
-                            chapter_title=f"第{no}章",
-                            chapter_text=content,
-                            prev_memory=mem,
-                            db=db,
-                        )
-                        if memory_delta_result.get("ok"):
-                            mem = str(memory_delta_result.get("payload_json") or mem)
-                        else:
-                            logger.warning(
-                                "daily_chapters memory delta invalid | novel_id=%s chapter_no=%s errors=%s",
-                                n.id,
-                                no,
-                                memory_delta_result.get("errors") or [],
-                            )
-                    except Exception:
-                        logger.exception(
-                            "daily_chapters memory delta failed | novel_id=%s chapter_no=%s",
-                            n.id,
-                            no,
-                        )
-                    saved_metrics = chapter_content_metrics(content)
-                    ch = (
-                        db.query(Chapter)
-                        .filter(Chapter.novel_id == n.id, Chapter.chapter_no == no)
-                        .order_by(Chapter.updated_at.desc())
-                        .first()
-                    )
-                    if ch:
-                        ch.title = f"第{no}章"
-                        ch.content = content
-                        ch.pending_content = ""
-                        ch.pending_revision_prompt = ""
-                        ch.status = "approved"
-                        ch.source = "daily_job"
-                    else:
-                        ch = Chapter(
-                            novel_id=n.id,
-                            chapter_no=no,
-                            title=f"第{no}章",
-                            content=content,
-                            status="approved",
-                            source="daily_job",
-                        )
-                        db.add(ch)
-                        db.flush()
                     processed += 1
-                    logger.info(
-                        "daily_chapters step done | novel_id=%s chapter_no=%s draft_body_chars=%s saved_body_chars=%s paragraphs=%s elapsed=%.2fs",
-                        n.id,
-                        no,
-                        draft_metrics["body_chars"],
-                        saved_metrics["body_chars"],
-                        saved_metrics["paragraph_count"],
-                        time.perf_counter() - step_started,
-                    )
-                db.commit()
-                logger.info(
-                    "daily_chapters novel done | novel_id=%s elapsed=%.2fs",
-                    n.id,
-                    time.perf_counter() - novel_started,
-                )
-            except RuntimeError as e:
-                db.rollback()
-                msg = str(e)
-                if "积分" in msg or "不足" in msg:
-                    logger.warning(
-                        "daily_chapters novel skipped (billing) | novel_id=%s err=%s",
-                        n.id,
-                        msg,
-                    )
-                    continue
-                logger.exception("daily_chapters novel failed | novel_id=%s", n.id)
-                raise
-            except Exception:
-                db.rollback()
-                logger.exception("daily_chapters novel failed | novel_id=%s", n.id)
-                raise
+                    logger.info("daily_chapters triggered pipeline | novel_id=%s time=%s today=%s", n.id, now_hh_mm, today_str)
+                    
+                    # 更新最后执行日期
+                    n.last_auto_date = today_str
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception("daily_chapters trigger failed | novel_id=%s", n.id)
     finally:
         db.close()
-    logger.info(
-        "daily_chapters finished | chapters_written=%s elapsed=%.2fs",
-        processed,
-        time.perf_counter() - started,
-    )
-    return {"chapters_written": processed}
+    return {"triggered": processed}
 
 
 @celery_app.task(name="novel.auto_refresh_memories")
@@ -1022,6 +927,89 @@ def novel_consolidate_memory(novel_id: str) -> dict[str, Any]:
     except Exception:
         db.rollback()
         logger.exception("novel.consolidate_memory failed | novel_id=%s", novel_id)
+        raise
+    finally:
+        db.close()
+
+
+@celery_app.task(name="novel.ai_create_and_start_task")
+def novel_ai_create_and_start_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+    style: str,
+    length_type: str,
+    target_generate_chapters: int,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        from app.services.novel_auto_pipeline import run_ai_create_and_start_sync
+        return run_ai_create_and_start_sync(
+            db=db,
+            novel_id=novel_id,
+            style=style,
+            length_type=length_type,
+            target_generate_chapters=target_generate_chapters,
+            billing_user_id=user_id,
+            batch_id=batch_id,
+        )
+    except Exception as e:
+        logger.exception("novel_ai_create_and_start_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
+        try:
+            db.rollback()
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="ai_create_failed",
+                level="error",
+                message=f"AI 一键建书失败：{e}",
+                meta={"error": str(e)}
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        db.close()
+
+
+@celery_app.task(name="novel.auto_pipeline_task")
+def novel_auto_pipeline_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+    target_count: int,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        from app.services.novel_auto_pipeline import run_full_auto_generation_sync
+        return run_full_auto_generation_sync(
+            db=db,
+            novel_id=novel_id,
+            target_count=target_count,
+            billing_user_id=user_id,
+            batch_id=batch_id,
+            use_cold_recall=False,
+            cold_recall_items=5,
+            auto_consistency_check=bool(settings.novel_consistency_check_chapter)
+        )
+    except Exception as e:
+        logger.exception("novel_auto_pipeline_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
+        try:
+            db.rollback()
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_failed",
+                level="error",
+                message=f"全自动生成失败：{e}",
+                meta={"error": str(e)}
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
         raise
     finally:
         db.close()

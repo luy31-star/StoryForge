@@ -9,7 +9,17 @@ import {
   CardHeader,
   CardTitle,
 } from "@/components/ui/card";
-import { deleteNovel, listNovels } from "@/services/novelApi";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { deleteNovel, listNovels, aiCreateAndStartNovel } from "@/services/novelApi";
 
 export function NovelShelf() {
   const [items, setItems] = useState<
@@ -17,6 +27,14 @@ export function NovelShelf() {
   >([]);
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+
+  const [aiCreateOpen, setAiCreateOpen] = useState(false);
+  const [aiCreateBusy, setAiCreateBusy] = useState(false);
+  const [aiCreateStyle, setAiCreateStyle] = useState("都市修仙");
+  const [aiCreateLength, setAiCreateLength] = useState("long");
+  const [aiCreateInitChapters, setAiCreateInitChapters] = useState(10);
+  const [aiCreateDailyChapters, setAiCreateDailyChapters] = useState(0);
+  const [aiCreateDailyTime, setAiCreateDailyTime] = useState("14:30");
 
   const reload = useCallback(() => {
     listNovels()
@@ -46,6 +64,33 @@ export function NovelShelf() {
   const confirmedCount = items.filter((item) => item.framework_confirmed).length;
   const draftingCount = items.filter((item) => item.status !== "archived").length;
 
+  async function handleAiCreate() {
+    setErr(null);
+    setAiCreateBusy(true);
+    try {
+      await aiCreateAndStartNovel({
+        style: aiCreateStyle,
+        length_type: aiCreateLength,
+        target_generate_chapters: aiCreateInitChapters,
+        daily_auto_chapters: aiCreateDailyChapters,
+        daily_auto_time: aiCreateDailyTime,
+      });
+      setAiCreateOpen(false);
+      reload();
+    } catch (e: any) {
+      setErr(e.message || "一键AI建书失败");
+    } finally {
+      setAiCreateBusy(false);
+    }
+  }
+
+  const presets = [
+    "都市修仙", "爽文", "凡人修仙", "都市兵王", "霸道总裁", "穿越异世", 
+    "重生复仇", "末世废土", "游戏异界", "虚拟网游", "科幻机甲", "星际战争", 
+    "恐怖惊悚", "悬疑推理", "灵异奇谈", "历史架空", "军事争霸", "宫廷权谋", 
+    "古言宅斗", "现言种田", "青春校园", "娱乐明星"
+  ];
+
   return (
     <div className="novel-shell">
       <div className="novel-container space-y-6">
@@ -70,6 +115,9 @@ export function NovelShelf() {
                     <Plus className="size-4" />
                     新建小说
                   </Link>
+                </Button>
+                <Button size="lg" variant="secondary" onClick={() => setAiCreateOpen(true)}>
+                  一键AI建书
                 </Button>
                 <Button asChild size="lg" variant="glass">
                   <Link to="/">返回首页</Link>
@@ -206,6 +254,104 @@ export function NovelShelf() {
           </div>
         </section>
       </div>
+
+      <Dialog open={aiCreateOpen} onOpenChange={setAiCreateOpen}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>一键 AI 全自动建书</DialogTitle>
+            <DialogDescription>
+              选择你想要的小说题材和篇幅，AI 将自动构思书名、简介、背景、设定、大纲框架，并可以立即开始自动创作。
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-6 py-4">
+            <div className="space-y-3">
+              <Label>小说题材 / 风格</Label>
+              <div className="flex flex-wrap gap-2">
+                {presets.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setAiCreateStyle(p)}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors ${
+                      aiCreateStyle === p
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-muted-foreground hover:bg-muted/50"
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <Input
+                value={aiCreateStyle}
+                onChange={(e) => setAiCreateStyle(e.target.value)}
+                placeholder="也可以手动输入你想写的任何题材..."
+                className="mt-2"
+              />
+            </div>
+
+            <div className="space-y-3">
+              <Label>预期篇幅</Label>
+              <select
+                value={aiCreateLength}
+                onChange={(e) => setAiCreateLength(e.target.value)}
+                className="flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                <option value="short">短篇小说（10万字以内，约50-100章）</option>
+                <option value="medium">中篇小说（20-50万字，约100-250章）</option>
+                <option value="long">长篇小说（100万字以上，约500章以上）</option>
+              </select>
+            </div>
+
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2">
+                <Label>建书后立刻生成章数</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={50}
+                  value={aiCreateInitChapters}
+                  onChange={(e) => setAiCreateInitChapters(Number(e.target.value))}
+                />
+                <p className="text-[11px] text-muted-foreground">设定为0则只生成大纲不写正文</p>
+              </div>
+
+              <div className="space-y-2">
+                <Label>每日定时自动写多少章</Label>
+                <Input
+                  type="number"
+                  min={0}
+                  max={20}
+                  value={aiCreateDailyChapters}
+                  onChange={(e) => setAiCreateDailyChapters(Number(e.target.value))}
+                />
+                <p className="text-[11px] text-muted-foreground">设定为0则不开启每日定时写</p>
+              </div>
+
+              {aiCreateDailyChapters > 0 && (
+                <div className="space-y-2 sm:col-span-2">
+                  <Label>每日定时任务时间</Label>
+                  <Input
+                    type="time"
+                    value={aiCreateDailyTime}
+                    onChange={(e) => setAiCreateDailyTime(e.target.value)}
+                  />
+                </div>
+              )}
+            </div>
+          </div>
+
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setAiCreateOpen(false)} disabled={aiCreateBusy}>
+              取消
+            </Button>
+            <Button onClick={handleAiCreate} disabled={aiCreateBusy || !aiCreateStyle.trim()}>
+              {aiCreateBusy ? "正在后台执行..." : "确认开启全自动建书"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

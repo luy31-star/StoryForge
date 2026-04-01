@@ -91,6 +91,14 @@ def _sse(event: str, data: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 
+class AiCreateAndStartBody(BaseModel):
+    style: str
+    length_type: str
+    target_generate_chapters: int = Field(default=10, ge=0, le=50)
+    daily_auto_chapters: int = Field(default=0, ge=0, le=20)
+    daily_auto_time: str = Field(default="14:30")
+
+
 class NovelCreate(BaseModel):
     title: str
     intro: str = ""
@@ -98,6 +106,7 @@ class NovelCreate(BaseModel):
     style: str = ""
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
+    daily_auto_time: str = Field(default="14:30")
 
 
 class NovelPatch(BaseModel):
@@ -107,6 +116,7 @@ class NovelPatch(BaseModel):
     style: str | None = None
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
+    daily_auto_time: str | None = None
     status: str | None = None
 
 
@@ -414,10 +424,68 @@ def list_novels(
             "status": n.status,
             "framework_confirmed": n.framework_confirmed,
             "daily_auto_chapters": n.daily_auto_chapters,
+            "daily_auto_time": n.daily_auto_time,
             "updated_at": n.updated_at.isoformat() if n.updated_at else None,
         }
         for n in rows
     ]
+
+
+@router.post("/ai-create-and-start")
+def ai_create_and_start(
+    body: AiCreateAndStartBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = Novel(
+        title=f"[AI构思中] {body.style}",
+        intro="",
+        background="",
+        style="",
+        target_chapters=300,
+        daily_auto_chapters=body.daily_auto_chapters,
+        daily_auto_time=body.daily_auto_time,
+        user_id=user.id,
+        status="draft",
+        framework_confirmed=False
+    )
+    db.add(n)
+    db.commit()
+    db.refresh(n)
+
+    batch_id = f"aicreate-{int(time.time())}-{n.id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=n.id,
+        batch_id=batch_id,
+        event="ai_create_queued",
+        message=f"已入队全自动建书任务，题材：{body.style}，篇幅：{body.length_type}",
+        meta={"style": body.style, "length_type": body.length_type, "target_generate_chapters": body.target_generate_chapters},
+    )
+    db.commit()
+
+    try:
+        from app.tasks.novel_tasks import novel_ai_create_and_start_task
+        task = novel_ai_create_and_start_task.delay(
+            n.id, 
+            str(user.id), 
+            batch_id, 
+            body.style, 
+            body.length_type, 
+            body.target_generate_chapters
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("ai_create_and_start enqueue failed")
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+
+    return {
+        "status": "queued",
+        "id": n.id,
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "AI建书已在后台执行，稍后可在列表中查看",
+    }
 
 
 @router.post("")
@@ -433,6 +501,7 @@ def create_novel(
         style=body.style,
         target_chapters=body.target_chapters,
         daily_auto_chapters=body.daily_auto_chapters,
+        daily_auto_time=body.daily_auto_time,
         user_id=user.id,
     )
     db.add(n)
@@ -456,6 +525,7 @@ def get_novel(
         "style": n.style,
         "target_chapters": n.target_chapters,
         "daily_auto_chapters": n.daily_auto_chapters,
+        "daily_auto_time": n.daily_auto_time,
         "reference_filename": n.reference_filename,
         "reference_public_url": n.reference_public_url,
         "framework_confirmed": n.framework_confirmed,
@@ -916,6 +986,53 @@ def consistency_fix_chapter(
         "batch_id": batch_id,
         "task_id": task_id,
         "message": "一致性修订已在后台执行，可在生成日志中查看进度",
+    }
+
+
+class AutoGenerateBody(BaseModel):
+    target_count: int = Field(default=10, ge=1, le=50)
+
+
+@router.post("/{novel_id}/auto-generate")
+async def start_auto_pipeline(
+    novel_id: str,
+    body: AutoGenerateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = require_novel_access(db, novel_id, user)
+    if not n.framework_confirmed:
+        raise HTTPException(400, "请先确认小说框架")
+    
+    if has_pending_chapter_generation_batch(db, novel_id):
+        raise HTTPException(409, "当前已有章节生成任务进行中，请稍后再试")
+        
+    batch_id = f"auto-{int(time.time())}-{novel_id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="auto_pipeline_queued",
+        message=f"已入队全自动生成，目标生成 {body.target_count} 章",
+        meta={"target_count": body.target_count},
+    )
+    db.commit()
+    
+    try:
+        from app.tasks.novel_tasks import novel_auto_pipeline_task
+        task = novel_auto_pipeline_task.delay(
+            novel_id, str(user.id), batch_id, body.target_count
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("start_auto_pipeline enqueue failed | novel_id=%s", novel_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+        
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "全自动生成已在后台执行，可在生成日志中查看进度",
     }
 
 

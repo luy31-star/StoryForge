@@ -317,6 +317,7 @@ export async function createNovel(body: {
   style?: string;
   target_chapters?: number;
   daily_auto_chapters?: number;
+  daily_auto_time?: string;
 }) {
   const r = await apiFetch(BASE, {
     method: "POST",
@@ -324,6 +325,21 @@ export async function createNovel(body: {
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{ id: string }>;
+}
+
+export async function aiCreateAndStartNovel(body: {
+  style: string;
+  length_type: string;
+  target_generate_chapters?: number;
+  daily_auto_chapters?: number;
+  daily_auto_time?: string;
+}) {
+  const r = await apiFetch(`${BASE}/ai-create-and-start`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ id: string; status: string; message: string }>;
 }
 
 export async function getNovel(id: string) {
@@ -445,6 +461,35 @@ export async function generateChapters(
     chapter_nos?: number[];
     requested_count?: number;
     actual_count?: number;
+  }>;
+}
+
+export async function autoGenerateChapters(
+  novelId: string,
+  targetCount: number
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/auto-generate`, {
+    method: "POST",
+    body: JSON.stringify({ target_count: targetCount }),
+  });
+  if (!r.ok) {
+    let detail = "";
+    try {
+      const data = (await r.clone().json()) as { detail?: unknown; message?: unknown };
+      if (typeof data.detail === "string") detail = data.detail;
+      else if (typeof data.message === "string") detail = data.message;
+      else if (data.detail != null) detail = JSON.stringify(data.detail);
+    } catch {
+      detail = "";
+    }
+    if (!detail) detail = (await r.text()).trim();
+    throw new Error(detail || `生成失败（HTTP ${r.status}）`);
+  }
+  return r.json() as Promise<{
+    status: string;
+    batch_id?: string;
+    task_id?: string | null;
+    message?: string;
   }>;
 }
 

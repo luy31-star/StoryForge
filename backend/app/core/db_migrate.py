@@ -37,21 +37,59 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
             dialect = engine.dialect.name
             if dialect == "sqlite":
                 if _has_column_sqlite(conn, "novels", "target_chapters"):
-                    return
-                conn.execute(
-                    text("ALTER TABLE novels ADD COLUMN target_chapters INTEGER DEFAULT 300")
-                )
-                logger.info("db migrate: added novels.target_chapters (sqlite)")
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN target_chapters INTEGER DEFAULT 300")
+                    )
+                    logger.info("db migrate: added novels.target_chapters (sqlite)")
+                
+                if _has_column_sqlite(conn, "novels", "daily_auto_time"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN daily_auto_time VARCHAR(16) DEFAULT '14:30'")
+                    )
+                    logger.info("db migrate: added novels.daily_auto_time (sqlite)")
+
+                if _has_column_sqlite(conn, "novels", "last_auto_date"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN last_auto_date VARCHAR(10) DEFAULT ''")
+                    )
+                    logger.info("db migrate: added novels.last_auto_date (sqlite)")
                 return
             if dialect in ("postgresql", "postgres"):
                 if _has_column_postgres(conn, "novels", "target_chapters"):
-                    return
-                conn.execute(
-                    text(
-                        "ALTER TABLE novels ADD COLUMN target_chapters INTEGER DEFAULT 300"
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN target_chapters INTEGER DEFAULT 300"
+                        )
                     )
-                )
-                logger.info("db migrate: added novels.target_chapters (postgres)")
+                    logger.info("db migrate: added novels.target_chapters (postgres)")
+                
+                if _has_column_postgres(conn, "novels", "daily_auto_time"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN daily_auto_time VARCHAR(16) DEFAULT '14:30'"
+                        )
+                    )
+                    logger.info("db migrate: added novels.daily_auto_time (postgres)")
+
+                if _has_column_postgres(conn, "novels", "last_auto_date"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN last_auto_date VARCHAR(10) DEFAULT ''"
+                        )
+                    )
+                    logger.info("db migrate: added novels.last_auto_date (postgres)")
                 return
             logger.warning("db migrate: unsupported dialect=%s, skip", dialect)
     except Exception:

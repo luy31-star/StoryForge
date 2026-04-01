@@ -30,10 +30,7 @@ celery_app.conf.include = [
 celery_app.conf.beat_schedule = {
     "novel-daily-auto-chapters": {
         "task": "novel.daily_chapters",
-        "schedule": crontab(
-            hour=settings.novel_beat_hour,
-            minute=settings.novel_beat_minute,
-        ),
+        "schedule": crontab(minute="*"),
     },
     "novel-auto-refresh-memories": {
         "task": "novel.auto_refresh_memories",

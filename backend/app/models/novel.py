@@ -34,6 +34,10 @@ class Novel(Base):
     target_word_count: Mapped[int] = mapped_column(Integer, default=100_000)
     # 每日自动撰写并进入「待审」的章节数；0 表示不自动
     daily_auto_chapters: Mapped[int] = mapped_column(Integer, default=0)
+    # 每日自动撰写定时（HH:MM）
+    daily_auto_time: Mapped[str] = mapped_column(String(16), default="14:30")
+    # 记录最后一次执行每日自动撰写的日期（YYYY-MM-DD），防止重复执行
+    last_auto_date: Mapped[str] = mapped_column(String(10), default="")
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")
     reference_public_url: Mapped[str] = mapped_column(String(2048), default="")
     reference_filename: Mapped[str] = mapped_column(String(512), default="")
