@@ -13,6 +13,7 @@ from app.core.deps import get_current_admin, get_current_user
 from app.models.user import ModelPrice, PointsTransaction, User
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
+# 以下 admin_router 路由均通过 Depends(get_current_admin) 校验管理员身份
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
 
 
@@ -58,6 +59,8 @@ class ModelPriceOut(BaseModel):
     id: str
     model_id: str
     price_cny_per_million_tokens: float
+    prompt_price_cny_per_million_tokens: float
+    completion_price_cny_per_million_tokens: float
     enabled: bool
     display_name: str
 
@@ -76,6 +79,8 @@ def list_public_model_prices(db: Session = Depends(get_db)) -> list[ModelPriceOu
             id=r.id,
             model_id=r.model_id,
             price_cny_per_million_tokens=float(r.price_cny_per_million_tokens or 0),
+            prompt_price_cny_per_million_tokens=float(r.prompt_price_cny_per_million_tokens or 0),
+            completion_price_cny_per_million_tokens=float(r.completion_price_cny_per_million_tokens or 0),
             enabled=bool(r.enabled),
             display_name=r.display_name or r.model_id,
         )
@@ -86,12 +91,16 @@ def list_public_model_prices(db: Session = Depends(get_db)) -> list[ModelPriceOu
 class ModelPriceCreate(BaseModel):
     model_id: str = Field(..., min_length=1, max_length=128)
     price_cny_per_million_tokens: float = Field(default=1.0, ge=0)
+    prompt_price_cny_per_million_tokens: float = Field(default=1.0, ge=0)
+    completion_price_cny_per_million_tokens: float = Field(default=1.0, ge=0)
     enabled: bool = True
     display_name: str = ""
 
 
 class ModelPricePatch(BaseModel):
     price_cny_per_million_tokens: float | None = None
+    prompt_price_cny_per_million_tokens: float | None = None
+    completion_price_cny_per_million_tokens: float | None = None
     enabled: bool | None = None
     display_name: str | None = None
 
@@ -107,6 +116,8 @@ def admin_list_model_prices(
             id=r.id,
             model_id=r.model_id,
             price_cny_per_million_tokens=float(r.price_cny_per_million_tokens or 0),
+            prompt_price_cny_per_million_tokens=float(r.prompt_price_cny_per_million_tokens or 0),
+            completion_price_cny_per_million_tokens=float(r.completion_price_cny_per_million_tokens or 0),
             enabled=bool(r.enabled),
             display_name=r.display_name or r.model_id,
         )
@@ -127,6 +138,8 @@ def admin_create_model_price(
         id=str(uuid.uuid4()),
         model_id=mid,
         price_cny_per_million_tokens=body.price_cny_per_million_tokens,
+        prompt_price_cny_per_million_tokens=body.prompt_price_cny_per_million_tokens,
+        completion_price_cny_per_million_tokens=body.completion_price_cny_per_million_tokens,
         enabled=body.enabled,
         display_name=body.display_name or mid,
     )
@@ -137,6 +150,8 @@ def admin_create_model_price(
         id=row.id,
         model_id=row.model_id,
         price_cny_per_million_tokens=float(row.price_cny_per_million_tokens or 0),
+        prompt_price_cny_per_million_tokens=float(row.prompt_price_cny_per_million_tokens or 0),
+        completion_price_cny_per_million_tokens=float(row.completion_price_cny_per_million_tokens or 0),
         enabled=bool(row.enabled),
         display_name=row.display_name or row.model_id,
     )
@@ -161,6 +176,8 @@ def admin_patch_model_price(
         id=row.id,
         model_id=row.model_id,
         price_cny_per_million_tokens=float(row.price_cny_per_million_tokens or 0),
+        prompt_price_cny_per_million_tokens=float(row.prompt_price_cny_per_million_tokens or 0),
+        completion_price_cny_per_million_tokens=float(row.completion_price_cny_per_million_tokens or 0),
         enabled=bool(row.enabled),
         display_name=row.display_name or row.model_id,
     )

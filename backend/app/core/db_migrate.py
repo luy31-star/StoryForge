@@ -27,6 +27,16 @@ def _has_column_postgres(conn, table: str, column: str) -> bool:
     return row is not None
 
 
+def _has_column_mysql(conn, table: str, column: str) -> bool:
+    """MySQL 的 information_schema 检查。"""
+    q = text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_schema = DATABASE() AND table_name = :t AND column_name = :c LIMIT 1"
+    )
+    row = conn.execute(q, {"t": table, "c": column}).fetchone()
+    return row is not None
+
+
 def ensure_novel_target_chapters(engine: Engine) -> None:
     """
     轻量自动迁移：给 novels 表补 target_chapters 列。
@@ -90,6 +100,31 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.last_auto_date (postgres)")
+                return
+            if dialect == "mysql":
+                if _has_column_mysql(conn, "novels", "target_chapters"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN target_chapters INTEGER DEFAULT 300")
+                    )
+                    logger.info("db migrate: added novels.target_chapters (mysql)")
+                
+                if _has_column_mysql(conn, "novels", "daily_auto_time"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN daily_auto_time VARCHAR(16) DEFAULT '14:30'")
+                    )
+                    logger.info("db migrate: added novels.daily_auto_time (mysql)")
+
+                if _has_column_mysql(conn, "novels", "last_auto_date"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN last_auto_date VARCHAR(10) DEFAULT ''")
+                    )
+                    logger.info("db migrate: added novels.last_auto_date (mysql)")
                 return
             logger.warning("db migrate: unsupported dialect=%s, skip", dialect)
     except Exception:
@@ -171,6 +206,19 @@ def ensure_app_config_columns(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added app_config.%s (postgres)", c)
+                elif dialect == "mysql":
+                    if _has_column_mysql(conn, "app_config", c):
+                        continue
+                    conn.execute(
+                        text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT FALSE")
+                    )
+                    conn.execute(
+                        text(
+                            f"UPDATE app_config SET {c} = COALESCE(novel_web_search, FALSE) "
+                            f"WHERE {c} IS NULL OR {c} = FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added app_config.%s (mysql)", c)
                 else:
                     logger.warning("db migrate: unsupported dialect=%s, skip %s", dialect, c)
     except Exception:
@@ -239,6 +287,13 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
                         continue
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
                     logger.info("db migrate: added %s.%s (postgres)", table, col)
+            elif dialect == "mysql":
+                for table, ddl in pg_alters:
+                    col = ddl.split()[0]
+                    if _has_column_mysql(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (mysql)", table, col)
             else:
                 logger.warning(
                     "db migrate: ensure_novel_memory_norm_extended_columns unsupported dialect=%s",
@@ -280,6 +335,13 @@ def ensure_user_isolation_columns(engine: Engine) -> None:
                         continue
                     conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
                     logger.info("db migrate: added %s.%s (postgres)", table, col)
+            elif dialect == "mysql":
+                for table, ddl in pg_specs:
+                    col = ddl.split()[0]
+                    if _has_column_mysql(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (mysql)", table, col)
             else:
                 logger.warning(
                     "db migrate: ensure_user_isolation_columns unsupported dialect=%s",
@@ -308,6 +370,16 @@ def relax_novel_memory_norm_columns(engine: Engine) -> None:
                             )
                         )
                         logger.info("db migrate: relaxed novel_memory_norm_outline.%s (postgres)", c)
+            elif dialect == "mysql":
+                for c in cols:
+                    if _has_column_mysql(conn, "novel_memory_norm_outline", c):
+                        # MySQL DROP NOT NULL is MODIFY
+                        conn.execute(
+                            text(
+                                f"ALTER TABLE novel_memory_norm_outline MODIFY {c} TEXT NULL"
+                            )
+                        )
+                        logger.info("db migrate: relaxed novel_memory_norm_outline.%s (mysql)", c)
             elif dialect == "sqlite":
                 # SQLite 不支持直接 DROP NOT NULL，且我们不再向这些列写数据，
                 # 如果是新创建的表，这些列根本不存在；如果是旧表，SQLite 默认允许 NULL（除非显式指定）。
@@ -316,4 +388,66 @@ def relax_novel_memory_norm_columns(engine: Engine) -> None:
                 pass
     except Exception:
         logger.exception("db migrate: relax_novel_memory_norm_columns failed")
+
+
+def ensure_model_price_split_columns(engine: Engine) -> None:
+    """补齐 ModelPrice 的输入输出单价列。"""
+    specs = [
+        ("model_prices", "prompt_price_cny_per_million_tokens FLOAT DEFAULT 1.0"),
+        ("model_prices", "completion_price_cny_per_million_tokens FLOAT DEFAULT 1.0"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            for table, ddl in specs:
+                col = ddl.split()[0]
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, table, col)
+                elif dialect == "mysql":
+                    exists = _has_column_mysql(conn, table, col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, table, col)
+
+                if not exists:
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    # 同步旧的通用价格到新列
+                    conn.execute(text(f"UPDATE {table} SET {col} = price_cny_per_million_tokens"))
+                    logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_model_price_split_columns failed")
+
+
+def ensure_user_config_columns(engine: Engine) -> None:
+    """补齐 User 表个性化 LLM 配置列。"""
+    specs = [
+        ("users", "llm_model VARCHAR(255) DEFAULT ''"),
+        ("users", "novel_web_search BOOLEAN DEFAULT 0"),
+        ("users", "novel_generate_web_search BOOLEAN DEFAULT 0"),
+        ("users", "novel_volume_plan_web_search BOOLEAN DEFAULT 0"),
+        ("users", "novel_memory_refresh_web_search BOOLEAN DEFAULT 0"),
+        ("users", "novel_inspiration_web_search BOOLEAN DEFAULT 1"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            for table, ddl in specs:
+                col = ddl.split()[0]
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, table, col)
+                elif dialect == "mysql":
+                    exists = _has_column_mysql(conn, table, col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, table, col)
+
+                if not exists:
+                    # 对于非 SQLite，DEFAULT 0/1 会自动转为 FALSE/TRUE
+                    if dialect in ("postgresql", "postgres") and "BOOLEAN" in ddl:
+                        ddl = ddl.replace("DEFAULT 0", "DEFAULT FALSE").replace("DEFAULT 1", "DEFAULT TRUE")
+                    
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_user_config_columns failed")
 

@@ -1,16 +1,22 @@
 # 默认 DaoCloud Hub 镜像；海外时在项目根 .env 设 DOCKER_HUB_PREFIX=docker.io/library
 
 services:
-  postgres:
-    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+  mysql:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/mysql:8
     environment:
-      POSTGRES_DB: vocalflow
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      MYSQL_DATABASE: vocalflow
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: rootpassword
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - mysql_data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "user", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/redis:alpine
@@ -18,4 +24,4 @@ services:
       - "6379:6379"
 
 volumes:
-  postgres_data:
+  mysql_data:

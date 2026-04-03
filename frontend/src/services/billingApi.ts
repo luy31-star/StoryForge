@@ -13,6 +13,8 @@ export type ModelPriceRow = {
   id: string;
   model_id: string;
   price_cny_per_million_tokens: number;
+  prompt_price_cny_per_million_tokens: number;
+  completion_price_cny_per_million_tokens: number;
   enabled: boolean;
   display_name: string;
 };
@@ -33,6 +35,8 @@ export async function adminPatchModelPrice(
   priceId: string,
   patch: Partial<{
     price_cny_per_million_tokens: number;
+    prompt_price_cny_per_million_tokens: number;
+    completion_price_cny_per_million_tokens: number;
     enabled: boolean;
     display_name: string;
   }>
@@ -48,6 +52,8 @@ export async function adminPatchModelPrice(
 export async function adminCreateModelPrice(body: {
   model_id: string;
   price_cny_per_million_tokens?: number;
+  prompt_price_cny_per_million_tokens?: number;
+  completion_price_cny_per_million_tokens?: number;
   enabled?: boolean;
   display_name?: string;
 }) {

@@ -1,7 +1,6 @@
-import { useRef, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Sparkles } from "lucide-react";
-import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -18,14 +17,9 @@ import {
   uploadReference,
   validateReferenceFile,
 } from "@/services/novelApi";
+import { ensureLlmReady } from "@/services/llmReady";
 
 type ChatTurn = { role: "user" | "assistant"; content: string };
-type LlmConfirmState = {
-  title: string;
-  description: string;
-  confirmLabel: string;
-  details: string[];
-};
 
 export function NovelNew() {
   const nav = useNavigate();
@@ -47,36 +41,6 @@ export function NovelNew() {
   const [inspireErr, setInspireErr] = useState<string | null>(null);
   const [inspireThinking, setInspireThinking] = useState("");
   const [inspireAbort, setInspireAbort] = useState<AbortController | null>(null);
-  const [llmConfirm, setLlmConfirm] = useState<LlmConfirmState | null>(null);
-  const [llmConfirmBusy, setLlmConfirmBusy] = useState(false);
-  const llmConfirmActionRef = useRef<null | (() => Promise<void>)>(null);
-
-  function openLlmConfirm(
-    config: LlmConfirmState,
-    action: () => Promise<void>
-  ) {
-    llmConfirmActionRef.current = action;
-    setLlmConfirm(config);
-  }
-
-  function handleLlmConfirmOpenChange(open: boolean) {
-    if (open || llmConfirmBusy) return;
-    llmConfirmActionRef.current = null;
-    setLlmConfirm(null);
-  }
-
-  async function runConfirmedLlmAction() {
-    const action = llmConfirmActionRef.current;
-    if (!action) return;
-    setLlmConfirmBusy(true);
-    try {
-      await action();
-      llmConfirmActionRef.current = null;
-      setLlmConfirm(null);
-    } finally {
-      setLlmConfirmBusy(false);
-    }
-  }
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -116,6 +80,8 @@ export function NovelNew() {
   async function sendInspiration() {
     const text = inspireInput.trim();
     if (!text || inspireBusy) return;
+    const ready = await ensureLlmReady();
+    if (!ready) return;
     setInspireErr(null);
     setInspireThinking("");
     setInspireBusy(true);
@@ -164,20 +130,7 @@ export function NovelNew() {
 
   function confirmSendInspiration() {
     if (!inspireInput.trim() || inspireBusy) return;
-    openLlmConfirm(
-      {
-        title: "确认发送灵感问题？",
-        description: "这会调用大模型回答你的创作问题，并把当前灵感对话历史一起带上。",
-        confirmLabel: "确认发送",
-        details: [
-          "模型会结合当前多轮对话继续生成，问题越具体，结果通常越稳。",
-          "这一步会消耗一定时间与额度，返回内容也可能直接影响你的简介、设定和文风。",
-        ],
-      },
-      async () => {
-        await sendInspiration();
-      }
-    );
+    void sendInspiration();
   }
 
   const lastAssistant =
@@ -197,16 +150,16 @@ export function NovelNew() {
                 <h1 className="text-3xl font-semibold tracking-tight text-foreground md:text-4xl">
                   先把一本书的气质定下来，再开始长跑。
                 </h1>
-                <p className="text-sm leading-6 text-muted-foreground md:text-base">
+                <p className="text-sm leading-6 text-foreground/70 dark:text-muted-foreground md:text-base font-medium">
                   在这里先确定书名、简介、世界设定和写作基调。你也可以先与模型聊灵感，再把结果直接带入表单。
                 </p>
               </div>
               <div className="flex flex-wrap gap-3">
-                <Button type="button" size="lg" onClick={() => setInspireOpen(true)}>
+                <Button type="button" size="lg" onClick={() => setInspireOpen(true)} className="font-semibold">
                   <Sparkles className="h-4 w-4" />
                   打开灵感对话
                 </Button>
-                <Button type="button" size="lg" variant="outline" asChild>
+                <Button type="button" size="lg" variant="outline" asChild className="font-semibold">
                   <Link to="/novels">返回书架</Link>
                 </Button>
               </div>
@@ -218,8 +171,8 @@ export function NovelNew() {
                 ["最后进入", "小说工作台"],
               ].map(([label, value]) => (
                 <div key={label} className="glass-panel-subtle p-4">
-                  <p className="text-xs text-muted-foreground">{label}</p>
-                  <p className="mt-2 text-base font-semibold tracking-tight text-foreground">
+                  <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">{label}</p>
+                  <p className="mt-2 text-base font-bold tracking-tight text-foreground">
                     {value}
                   </p>
                 </div>
@@ -231,17 +184,17 @@ export function NovelNew() {
         <div className="glass-panel-subtle p-4">
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="space-y-1">
-              <p className="font-medium text-foreground">
+              <p className="font-bold text-foreground">
                 与大模型对话获取创作灵感
               </p>
-              <p className="text-xs leading-5 text-muted-foreground">
+              <p className="text-xs leading-5 text-foreground/60 dark:text-muted-foreground font-medium">
                 使用“全局模型设置”并开启联网搜索。可多轮追问后把回复一键填入简介、背景或文风。
               </p>
             </div>
             <Button
               type="button"
               variant="glass"
-              className="shrink-0 gap-2 sm:min-w-[200px]"
+              className="shrink-0 gap-2 sm:min-w-[200px] font-bold"
               onClick={() => setInspireOpen(true)}
             >
               <Sparkles className="h-4 w-4" />
@@ -253,11 +206,11 @@ export function NovelNew() {
         <Dialog open={inspireOpen} onOpenChange={setInspireOpen}>
           <DialogContent className="max-h-[90vh] max-w-2xl overflow-hidden sm:max-w-2xl">
             <DialogHeader>
-              <DialogTitle>创作灵感 · 联网对话</DialogTitle>
-              <DialogDescription>
+              <DialogTitle className="text-xl font-bold">创作灵感 · 联网对话</DialogTitle>
+              <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
                 使用当前“全局模型设置”，并开启
                 <a
-                  className="text-primary underline"
+                  className="text-primary underline font-bold px-1"
                   href="https://doc.302.ai/260112819e0"
                   target="_blank"
                   rel="noreferrer"
@@ -269,7 +222,7 @@ export function NovelNew() {
             </DialogHeader>
             <div className="soft-scroll flex max-h-[48vh] flex-col gap-3 overflow-y-auto rounded-[1.4rem] border border-border/70 bg-muted/30 p-3 text-sm">
               {inspireTurns.length === 0 ? (
-                <p className="text-muted-foreground">
+                <p className="text-foreground/50 dark:text-muted-foreground italic font-medium">
                   例如：「帮我查一下 2025 年流行的无限流设定，给一个适合新人作者的梗概方向」
                 </p>
               ) : null}
@@ -282,10 +235,10 @@ export function NovelNew() {
                       : "mr-4 rounded-[1.25rem] border border-border/60 bg-background/80 px-3.5 py-3 shadow-sm"
                   }
                 >
-                  <span className="text-xs font-medium text-muted-foreground">
+                  <span className={`text-xs font-bold ${t.role === 'user' ? 'text-primary' : 'text-foreground/70 dark:text-muted-foreground'}`}>
                     {t.role === "user" ? "你" : "助手"}
                   </span>
-                  <pre className="mt-1 whitespace-pre-wrap font-sans text-xs">{t.content}</pre>
+                  <pre className="mt-1 whitespace-pre-wrap font-sans text-xs text-foreground font-medium">{t.content}</pre>
                 </div>
               ))}
             </div>
@@ -364,60 +317,49 @@ export function NovelNew() {
           </DialogContent>
         </Dialog>
 
-        <LlmActionConfirmDialog
-          open={Boolean(llmConfirm)}
-          onOpenChange={handleLlmConfirmOpenChange}
-          title={llmConfirm?.title ?? "确认调用大模型"}
-          description={llmConfirm?.description ?? ""}
-          confirmLabel={llmConfirm?.confirmLabel}
-          details={llmConfirm?.details ?? []}
-          busy={llmConfirmBusy}
-          onConfirm={runConfirmedLlmAction}
-        />
-
         <form onSubmit={onSubmit} className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
           <div className="glass-panel-subtle space-y-4 p-5">
             <div>
-              <p className="section-heading">作品基础信息</p>
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p className="section-heading text-foreground font-bold">作品基础信息</p>
+              <p className="mt-1 text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                 先描述这本书是什么、讲谁、在什么世界里展开。字段不必一次写满，先把骨架立住更重要。
               </p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="title">书名</Label>
+              <Label htmlFor="title" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">书名</Label>
               <Input
                 id="title"
                 value={title}
                 onChange={(e) => setTitle(e.target.value)}
-                className="field-shell mt-1 h-11"
+                className="field-shell mt-1 h-11 text-foreground"
                 required
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="intro">简介</Label>
+              <Label htmlFor="intro" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">简介</Label>
               <textarea
                 id="intro"
                 value={intro}
                 onChange={(e) => setIntro(e.target.value)}
-                className="field-shell-textarea min-h-[110px]"
+                className="field-shell-textarea min-h-[110px] text-foreground text-sm"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="bg">背景与设定</Label>
+              <Label htmlFor="bg" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">背景与设定</Label>
               <textarea
                 id="bg"
                 value={background}
                 onChange={(e) => setBackground(e.target.value)}
-                className="field-shell-textarea min-h-[160px]"
+                className="field-shell-textarea min-h-[160px] text-foreground text-sm"
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="style">文风</Label>
+              <Label htmlFor="style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风</Label>
               <Input
                 id="style"
                 value={style}
                 onChange={(e) => setStyle(e.target.value)}
-                className="field-shell mt-1 h-11"
+                className="field-shell mt-1 h-11 text-foreground"
               />
             </div>
           </div>
@@ -425,14 +367,14 @@ export function NovelNew() {
           <div className="space-y-4">
             <div className="glass-panel-subtle space-y-4 p-5">
               <div>
-                <p className="section-heading">创作节奏</p>
-                <p className="mt-1 text-sm text-muted-foreground">
+                <p className="section-heading text-foreground font-bold">创作节奏</p>
+                <p className="mt-1 text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                   这部分决定作品规模和默认推进速度，后续也能在工作台再调整。
                 </p>
               </div>
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label htmlFor="tc">目标章节数</Label>
+                  <Label htmlFor="tc" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">目标章节数</Label>
                   <Input
                     id="tc"
                     type="number"
@@ -440,11 +382,11 @@ export function NovelNew() {
                     max={20000}
                     value={targetChapters}
                     onChange={(e) => setTargetChapters(Number(e.target.value))}
-                    className="field-shell mt-1 h-11"
+                    className="field-shell mt-1 h-11 text-foreground"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="daily">每日自动撰写章数</Label>
+                  <Label htmlFor="daily" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写章数</Label>
                   <Input
                     id="daily"
                     type="number"
@@ -452,46 +394,46 @@ export function NovelNew() {
                     max={20}
                     value={dailyChapters}
                     onChange={(e) => setDailyChapters(Number(e.target.value))}
-                    className="field-shell mt-1 h-11"
+                    className="field-shell mt-1 h-11 text-foreground"
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="dailyTime">每日自动撰写时间（北京时间）</Label>
+                  <Label htmlFor="dailyTime" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写时间（北京时间）</Label>
                   <Input
                     id="dailyTime"
                     type="time"
                     value={dailyTime}
                     onChange={(e) => setDailyTime(e.target.value)}
-                    className="field-shell mt-1 h-11"
+                    className="field-shell mt-1 h-11 text-foreground"
                   />
-                  <p className="text-[11px] text-muted-foreground">
-                    后台定时任务按北京时间（UTC+8 / Asia/Shanghai）执行。
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                    由后台系统自动执行。
                   </p>
                 </div>
               </div>
-              <p className="text-xs text-muted-foreground">
-                `0` 表示关闭自动撰写；开启后需要 Celery Beat 正常运行。
+              <p className="text-xs text-foreground/50 dark:text-muted-foreground font-medium">
+                设置为 0 表示关闭自动撰写。
               </p>
             </div>
 
             <div className="glass-panel-subtle space-y-4 p-5">
               <div>
-                <p className="section-heading">参考素材</p>
-                <p className="mt-1 text-sm text-muted-foreground">
+                <p className="section-heading text-foreground font-bold">参考素材</p>
+                <p className="mt-1 text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                   可上传一份 `.txt` 作为风格或设定参考，后续进入工作台后再慢慢补充。
                 </p>
               </div>
               <div className="space-y-2">
-                <Label htmlFor="ref">参考 txt（可选，最大 15MB）</Label>
+                <Label htmlFor="ref" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">参考 txt（可选，最大 15MB）</Label>
                 <Input
                   id="ref"
                   type="file"
                   accept=".txt,text/plain"
-                  className="field-shell mt-1 h-11 pt-2"
+                  className="field-shell mt-1 h-11 pt-2 text-foreground"
                   onChange={(e) => setFile(e.target.files?.[0] ?? null)}
                 />
                 {file ? (
-                  <p className="text-xs text-muted-foreground">已选择：{file.name}</p>
+                  <p className="text-xs text-foreground/70 dark:text-muted-foreground font-medium">已选择：{file.name}</p>
                 ) : null}
               </div>
               {err ? (

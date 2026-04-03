@@ -29,7 +29,7 @@ from app.models.novel_memory_norm import (
 )
 from app.services.memory_normalize_sync import sync_json_snapshot_from_normalized
 from app.services.ai302_client import AI302Client
-from app.services.llm_router import LLMProvider, LLMRouter
+from app.services.llm_router import LLMRouter
 from app.services.novel_repo import (
     build_hot_memory_for_prompt,
     build_hot_memory_from_db,
@@ -289,7 +289,7 @@ def _chapter_messages(
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
         "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
         "3) 第二行留空一行，再开始正文。\n"
-        "4) 正文（不含标题行）目标体量约 2200～3800 汉字；明显偏短视为不合格；"
+        "4) 正文（不含标题行）目标体量约 3000 汉字左右（建议在 2800～3500 汉字之间）；明显偏短视为不合格；"
         "用场景、对白与细节描写支撑篇幅，避免用一两段概括带过。\n"
         "5) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
         "6) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
@@ -547,8 +547,8 @@ class NovelLLMService:
                     attempt,
                     attempts,
                     timeout,
-                    router.provider,
-                    router.model or settings.ai302_novel_model,
+                    "ai302",
+                    router.model or "-",
                 )
                 if attempt >= attempts:
                     raise
@@ -577,8 +577,8 @@ class NovelLLMService:
                     attempt,
                     attempts,
                     timeout,
-                    router.provider,
-                    router.model or settings.ai302_novel_model,
+                    "ai302",
+                    router.model or "-",
                 )
                 if attempt >= attempts:
                     raise
@@ -590,9 +590,6 @@ class NovelLLMService:
             return {"billing_user_id": billing_user_id, "billing_db": db}
         return {}
 
-    def _model(self) -> str:
-        return settings.ai302_novel_model or settings.ai302_chat_model
-
     def _router(
         self,
         *,
@@ -600,12 +597,8 @@ class NovelLLMService:
         model: str | None = None,
         db: Any = None,
     ) -> LLMRouter:
-        p: str | None = None
-        if provider is not None:
-            p = (provider or "").strip().lower() or None
-            if p not in (None, "ai302", "custom"):
-                p = "ai302"
-        return LLMRouter(provider=p, model=model, db=db)
+        # 仅支持 302.AI；ignore provider
+        return LLMRouter(model=model, user_id=self._billing_user_id, db=db)
 
     def _novel_web_search(
         self,
@@ -628,7 +621,7 @@ class NovelLLMService:
             use_db = SessionLocal()
             close_db = True
         try:
-            cfg = get_runtime_web_search_config(use_db)
+            cfg = get_runtime_web_search_config(use_db, user_id=self._billing_user_id)
             if flow == "inspiration":
                 return bool(cfg.novel_inspiration_web_search)
             if flow == "generate":
@@ -1182,12 +1175,17 @@ class NovelLLMService:
         """生成单批次章计划"""
         router = self._router(db=db)
         batch_chapter_count = to_chapter - from_chapter + 1
+
+        # 根据篇幅获取对应的防重复约束
+        anti_repetition_block = self._get_anti_repetition_constraints(novel, batch_chapter_count)
+
         sys = (
             "你是网络小说总策划。请为指定章节区间生成「章计划」，用于后续逐章写作。"
             "你必须严格输出一个 JSON 对象，不要输出任何解释性文字、不要 Markdown、不要代码块围栏。"
             "输出必须以 { 开头，以 } 结尾；除 JSON 外不得包含任何字符。"
             "【JSON 语法硬要求】所有字符串值内禁止直接换行；若需分段请使用 \\n 转义。"
             "剧情文本中避免使用未转义的英文双引号；可用中文「」或单引号代替。"
+            "【核心原则】剧情必须递进，禁止原地踏步式的重复！每一章都必须推动故事前进，不得重复已有的冲突模式。"
         )
 
         # 构建前文上下文提示
@@ -1252,7 +1250,8 @@ class NovelLLMService:
             "7) 输出前自检：若某章 plot_summary、turn 或 hook 与该章 must_not、或 reserved_for_later 中 not_before_chapter 大于该章 chapter_no 的条目冲突，必须改写该章直至一致；\n"
             "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致；\n"
             "9) 每章必须填写 stage_position 与 pacing_justification，且与 plot_summary、must_not 一致；\n"
-            "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件。\n"
+            "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件；\n"
+            f"{anti_repetition_block}"
         )
         return await router.chat_text(
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
@@ -1262,6 +1261,47 @@ class NovelLLMService:
             max_tokens=8192,
             **self._bill_kw(db, self._billing_user_id),
         )
+
+    @staticmethod
+    def _get_anti_repetition_constraints(novel: Novel, batch_chapter_count: int) -> str:
+        """根据小说篇幅返回对应的防重复约束提示词
+
+        篇幅定义：
+        - 短篇：≤50章 - 节奏紧凑，每章必须推进
+        - 中篇：51-200章 - 适度推进，允许过渡和蓄势
+        - 长篇：>200章 - 张弛有度，允许支线、人物发展、休整章节
+        """
+        target = getattr(novel, "target_chapters", 0) or 0
+
+        # 短篇：严格紧凑
+        if target <= 50:
+            return """【短篇节奏约束 - 严格推进】
+11) 短篇节奏必须紧凑：每章必须有实质性推进，不允许「纯过渡/纯对话/纯描述」章节；
+12) 禁止重复使用相同的心理活动模式：如「心里乱成一团」、「感到深深的疲惫」等固定句式；
+13) 禁止重复的环境描写开场：同一卷内各章的场景氛围必须有所变化；
+14) 每章 conflict 必须与前3章有本质区别或递进，不得「换汤不换药」；
+15) 人物情绪必须递进：不得在同一情绪层级反复横跳，必须朝向解决或恶化方向演进。
+"""
+
+        # 长篇：张弛有度
+        if target > 200:
+            return """【长篇节奏约束 - 张弛有度】
+11) 长篇允许节奏变化：章节可分为「推进章」「蓄势章」「过渡章」「人物章」「支线章」等不同类型，不必每章都推进主线；
+12) 避免固定套路化描写即可，但不要求每章都完全不同：相似的心理状态可在不同情境下出现，但需有合理差异；
+13) 环境描写可适当重复（如同一地点的多次到访），但需体现时间、氛围、人物心境的变化；
+14) conflict 可有层次地展开：允许在同一冲突主题下分多章逐步升级，不必每章都是新冲突；
+15) 人物情绪发展允许反复和挣扎：真实的人物塑造允许情绪回退、自我怀疑、短暂动摇，不必单向递进；
+16) 多线叙事鼓励：允许并鼓励支线发展、配角视角、背景铺陈，这些「非主线推进」内容对长篇质量至关重要。
+"""
+
+        # 中篇：平衡策略（默认）
+        return """【中篇节奏约束 - 平衡推进】
+11) 中篇需保持适度推进：每1-2章应有可见的进展，允许必要的过渡和蓄势章节；
+12) 避免固定套路化描写：不重复使用完全相同的心理/环境描写句式；
+13) 同一卷内场景氛围需有变化：但允许相关章节的场景延续；
+14) conflict 需有递进或变化：同一主题可分章展开，但需体现层次升级；
+15) 人物情绪应总体递进：允许短暂波动，但总体趋势应朝向发展或变化。
+"""
 
     def _generate_single_batch_plan_sync(
         self,
@@ -1278,12 +1318,17 @@ class NovelLLMService:
         """生成单批次章计划（同步，供 Celery worker 使用）。"""
         router = self._router(db=db)
         batch_chapter_count = to_chapter - from_chapter + 1
+
+        # 根据篇幅获取对应的防重复约束
+        anti_repetition_block = self._get_anti_repetition_constraints(novel, batch_chapter_count)
+
         sys = (
             "你是网络小说总策划。请为指定章节区间生成「章计划」，用于后续逐章写作。"
             "你必须严格输出一个 JSON 对象，不要输出任何解释性文字、不要 Markdown、不要代码块围栏。"
             "输出必须以 { 开头，以 } 结尾；除 JSON 外不得包含任何字符。"
             "【JSON 语法硬要求】所有字符串值内禁止直接换行；若需分段请使用 \\n 转义。"
             "剧情文本中避免使用未转义的英文双引号；可用中文「」或单引号代替。"
+            "【核心原则】剧情必须递进，禁止原地踏步式的重复！每一章都必须推动故事前进，不得重复已有的冲突模式。"
         )
         continuity_hint = ""
         if prev_batch_context:
@@ -1345,7 +1390,13 @@ class NovelLLMService:
             "7) 输出前自检：若某章 plot_summary、turn 或 hook 与该章 must_not、或 reserved_for_later 中 not_before_chapter 大于该章 chapter_no 的条目冲突，必须改写该章直至一致；\n"
             "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致；\n"
             "9) 每章必须填写 stage_position 与 pacing_justification，且与 plot_summary、must_not 一致；\n"
-            "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件。\n"
+            "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件；\n"
+            "【防剧情重复硬约束 - 必须遵守】\n"
+            "11) 自检：若前批次已出现「质疑-举证-被否定」的冲突循环，本批次不得再使用相同模式，必须让剧情进入新阶段（如：误会加深导致关系破裂、发现新证据、引入新人物、冲突升级等）；\n"
+            "12) 禁止重复使用相同的心理活动描写模式：如「心里乱成一团」、「感到深深的疲惫」、「嘴角挂着冷笑」等固定句式，同一卷内不得在不同章重复出现；\n"
+            "13) 禁止重复的环境描写开场：如「月光惨白」、「村里的狗吠」、「红木桌子」等，同一卷内各章的场景氛围必须有所变化（时间、天气、环境、氛围）；\n"
+            "14) 每章的 conflict 必须与前3章的冲突有本质区别或递进，不得只是换汤不换药的重复争吵；自检：如果本章 conflict 只是前章的「再来一次」，必须重新设计；\n"
+            "15) 人物情绪必须递进：如二舅对男主的态度应从信任→怀疑→动摇→愤怒→决裂逐步演变，不得在同一情绪层级反复横跳。\n"
         )
         return router.chat_text_sync(
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
@@ -1559,7 +1610,7 @@ class NovelLLMService:
             cold_recall_items=cold_recall_items,
         )
         messages = self._budget_chapter_messages(messages)
-        model = llm_model or settings.llm_model or settings.ai302_novel_model
+        model = (llm_model or router.model or "").strip() or "-"
         web_search = self._novel_web_search(db, flow="generate")
         timeout = settings.novel_chapter_timeout
         start = time.perf_counter()
@@ -1626,7 +1677,7 @@ class NovelLLMService:
             cold_recall_items=cold_recall_items,
         )
         messages = self._budget_chapter_messages(messages)
-        model = router.model or settings.ai302_novel_model
+        model = (router.model or "").strip() or "-"
         web_search = self._novel_web_search(db, flow="generate")
         timeout = settings.novel_chapter_timeout
         start = time.perf_counter()
@@ -1796,6 +1847,33 @@ class NovelLLMService:
         for key, value in parsed.items():
             normalized[key] = value
 
+        # 1. 章节项去重（按 chapter_no）
+        raw_entries = normalized.get("canonical_entries")
+        if isinstance(raw_entries, list):
+            unique_entries_map: dict[int, dict[str, Any]] = {}
+            for item in raw_entries:
+                norm_item = cls._normalize_delta_entry(item)
+                if norm_item:
+                    cno = norm_item["chapter_no"]
+                    if cno in unique_entries_map:
+                        # 如果重复，合并它们
+                        unique_entries_map[cno] = cls._merge_timeline_entry(unique_entries_map[cno], norm_item)
+                    else:
+                        unique_entries_map[cno] = norm_item
+            normalized["canonical_entries"] = [unique_entries_map[k] for k in sorted(unique_entries_map.keys())]
+
+        # 2. 角色更新去重（按 name）
+        raw_chars = normalized.get("characters_updated")
+        if isinstance(raw_chars, list):
+            unique_chars_map: dict[str, dict[str, Any]] = {}
+            for item in raw_chars:
+                if isinstance(item, dict):
+                    name = str(item.get("name") or "").strip()
+                    if name:
+                        unique_chars_map[name] = item
+            normalized["characters_updated"] = list(unique_chars_map.values())
+
+        # 3. 其他常规字段清理
         inventory_changed = normalized.get("inventory_changed")
         if not isinstance(inventory_changed, dict):
             inventory_changed = {}
@@ -1897,6 +1975,20 @@ class NovelLLMService:
         }
 
     @classmethod
+    def _extract_chapter_no(cls, item: Any) -> int | None:
+        """从条目提取章节号，处理各种格式（字符串、整数等）"""
+        if not isinstance(item, dict):
+            return None
+        cn = item.get("chapter_no")
+        if isinstance(cn, int):
+            return cn if cn > 0 else None
+        if isinstance(cn, str):
+            cn = cn.strip()
+            if cn.isdigit():
+                return int(cn)
+        return None
+
+    @classmethod
     def _supplement_missing_canonical_entries(
         cls,
         delta: dict[str, Any],
@@ -1910,12 +2002,29 @@ class NovelLLMService:
         if not isinstance(existing_entries, list):
             existing_entries = []
 
+        # 1. 先清理和去重已有条目（按 chapter_no）
         existing_nos: set[int] = set()
+        unique_entries: list[dict[str, Any]] = []
         for item in existing_entries:
-            normalized = cls._normalize_delta_entry(item)
-            if normalized is not None:
-                existing_nos.add(normalized["chapter_no"])
+            cno = cls._extract_chapter_no(item)
+            if cno is None:
+                # 格式不正确的条目保留，但不参与去重判断
+                unique_entries.append(item)
+                continue
+            if cno in existing_nos:
+                # 重复条目：找到已存在的并合并
+                for idx, existing in enumerate(unique_entries):
+                    if cls._extract_chapter_no(existing) == cno:
+                        norm_existing = cls._normalize_delta_entry(existing)
+                        norm_item = cls._normalize_delta_entry(item)
+                        if norm_existing and norm_item:
+                            unique_entries[idx] = cls._merge_timeline_entry(norm_existing, norm_item)
+                        break
+            else:
+                existing_nos.add(cno)
+                unique_entries.append(item)
 
+        # 2. 为缺失的章节创建兜底条目
         missing_entries: list[dict[str, Any]] = []
         missing_nos: list[int] = []
         for blob in blobs:
@@ -1935,7 +2044,7 @@ class NovelLLMService:
             return delta, []
 
         patched = dict(delta)
-        patched["canonical_entries"] = [*existing_entries, *missing_entries]
+        patched["canonical_entries"] = [*unique_entries, *missing_entries]
         return patched, missing_nos
 
     @classmethod
@@ -3166,17 +3275,18 @@ class NovelLLMService:
         """
         result = self._empty_validation_result()
 
-        # 1. 时间线章节号是否重复（格式/一致性）
+        # 1. 时间线章节号去重（自动修复，不再报错阻断）
         incoming_entries = delta.get("canonical_entries")
         if isinstance(incoming_entries, list):
-            seen_nos = set()
+            seen_nos: set[int] = set()
             for item in incoming_entries:
-                cn = item.get("chapter_no")
-                if not isinstance(cn, int):
+                cn = self._extract_chapter_no(item)
+                if cn is None:
                     continue
                 if cn in seen_nos:
-                    result["blocking_errors"].append(
-                        f"数据冲突：本批次中包含重复的章节号 {cn}"
+                    # 自动去重，记录警告但不阻断
+                    result["warnings"].append(
+                        f"检测到重复章节号 {cn}，已自动合并"
                     )
                 seen_nos.add(cn)
 
@@ -3190,7 +3300,28 @@ class NovelLLMService:
                 # 如果只有 role/status 更新，检查角色是否存在
                 # 如果是全新的角色（没有在 DB 中），这通常意味着模型在“更新”一个它认为存在的但实际不存在的角色
                 # 但在这里我们允许 Upsert，所以也许不需要报错，除非它是误删了其他信息
-                pass
+            
+            # 自动去重角色更新
+            seen_char_names: set[str] = set()
+            unique_chars: list[dict[str, Any]] = []
+            for item in incoming_chars:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if not name:
+                    continue
+                if name in seen_char_names:
+                    result["warnings"].append(f"角色 '{name}' 重复更新，已合并")
+                    for idx, existing in enumerate(unique_chars):
+                        if str(existing.get("name", "")).strip() == name:
+                            unique_chars[idx] = {**existing, **item}
+                            break
+                else:
+                    seen_char_names.add(name)
+                    unique_chars.append(item)
+            
+            if unique_chars:
+                delta["characters_updated"] = unique_chars
 
         return self._merge_validation_results(result)
 
@@ -3444,8 +3575,8 @@ class NovelLLMService:
             logger.warning(
                 "memory delta invalid json(async) | novel_id=%s provider=%s model=%s raw_preview=%r",
                 novel.id,
-                router.provider,
-                router.model or settings.ai302_novel_model,
+                "ai302",
+                router.model or "-",
                 (raw or "")[:800],
             )
             delta = await self._repair_refresh_memory_response(
@@ -3598,8 +3729,8 @@ class NovelLLMService:
             logger.warning(
                 "memory delta invalid json(sync) | novel_id=%s provider=%s model=%s raw_preview=%r",
                 novel.id,
-                router.provider,
-                router.model or settings.ai302_novel_model,
+                "ai302",
+                router.model or "-",
                 (raw or "")[:800],
             )
             delta = self._repair_refresh_memory_response_sync(

@@ -11,6 +11,7 @@ from app.core.deps import get_current_admin
 from app.models.user import User, TokenUsage
 from app.models.novel import Novel, Chapter
 
+# 本模块路由均通过 Depends(get_current_admin) 校验管理员身份
 router = APIRouter(prefix="/api/admin", tags=["admin-dashboard"])
 
 

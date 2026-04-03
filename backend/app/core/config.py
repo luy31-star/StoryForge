@@ -9,18 +9,15 @@ class Settings(BaseSettings):
     redis_url: str = "redis://localhost:6379/0"
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
-    # 直连（可选；优先使用 302.AI）
-    gemini_api_key: str = ""
     seedance_api_key: str = ""
     azure_speech_key: str = ""
-    openai_api_key: str = ""
 
     # 302.AI 中转（OpenAI 兼容 Chat / TTS 等，见 https://doc.302.ai/ ）
     ai302_base_url: str = "https://api.302ai.cn/v1"
     ai302_api_key: str = ""
-    ai302_chat_model: str = "gemini-2.0-flash"
-    # 小说创作专用（302 智谱 GLM，见 https://302.ai/product/detail/zhipu-glm-4-7 ）
-    ai302_novel_model: str = "glm-4.7"
+    # 兼容旧 .env；运行时 Chat 不再回退到这两项，须配置「模型计价」与全站 LLM
+    ai302_chat_model: str = "Doubao-Seed-2.0-pro"
+    ai302_novel_model: str = "Doubao-Seed-2.0-pro"
     # 小说相关请求是否开启 302「联网搜索」（文档 https://doc.302.ai/260112819e0 ）
     ai302_novel_web_search: bool = True
     # 语音：常用为 OpenAI 兼容 POST /audio/speech；或按控制台填完整路径
@@ -29,21 +26,9 @@ class Settings(BaseSettings):
     # 视频：不同套餐路径不同，留空则仅走占位 + Celery 状态
     ai302_video_submit_path: str = ""
 
-    # === LLM 路由：支持 302.AI + 自建代理 ===
-    # llm_provider:
-    # - ai302: 默认走 302 OpenAI 兼容（/chat/completions）；若模型以 kimi- 开头则走 /messages（Kimi）
-    # - custom: 走自建 OpenAI 兼容代理（默认 /v1/chat/completions）
-    llm_provider: str = "ai302"  # ai302 | custom
-    llm_model: str = ""  # 留空表示按 provider 使用默认模型（如 ai302_novel_model 或 custom_llm_model）
-
-    # 302.AI 扩展：Kimi 与 Doubao 仅用于"模型名"切换（路径由客户端自动选择）
-    ai302_kimi_model: str = "kimi-k2-thinking-turbo"
-    ai302_doubao_model: str = "Doubao-Seed-2.0-pro"
-
-    # 自建代理（OpenAI 兼容）
-    custom_llm_base_url: str = ""
-    custom_llm_api_key: str = ""
-    custom_llm_model: str = "243-gpt-5__2025-08-07"
+    # 全局默认（仅新建 app_config 行时的初始值；实际以 DB app_config + 模型计价为准）
+    llm_provider: str = "ai302"
+    llm_model: str = ""
 
     # 阿里云 OSS（凭证用环境变量 OSS_ACCESS_KEY_ID / OSS_ACCESS_KEY_SECRET，见官方文档）
     oss_region: str = ""

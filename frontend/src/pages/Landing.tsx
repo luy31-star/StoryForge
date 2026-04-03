@@ -1,6 +1,7 @@
 import { Link } from "react-router-dom";
 import { ArrowRight, BookMarked, Brain, GitBranch } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { useAuthStore } from "@/stores/authStore";
 import {
   Card,
   CardContent,
@@ -10,6 +11,8 @@ import {
 } from "@/components/ui/card";
 
 export function Landing() {
+  const user = useAuthStore((s) => s.user);
+
   return (
     <div className="min-h-screen bg-gradient-to-b from-background via-background to-muted/30">
       <div className="mx-auto max-w-4xl px-6 py-16 space-y-12">
@@ -31,9 +34,11 @@ export function Landing() {
                 <ArrowRight className="ml-2 size-4" />
               </Link>
             </Button>
-            <Button size="lg" variant="outline" asChild>
-              <Link to="/login">登录</Link>
-            </Button>
+            {!user && (
+              <Button size="lg" variant="outline" asChild>
+                <Link to="/login">登录</Link>
+              </Button>
+            )}
           </div>
         </header>
 

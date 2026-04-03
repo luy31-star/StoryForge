@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import time
+import random
+import asyncio
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -11,6 +13,18 @@ import httpx
 from app.core.config import settings
 
 logger = logging.getLogger(__name__)
+
+_MISSING_CHAT_MODEL = (
+    "未配置模型：请在管理后台「模型计价」中添加已启用模型并设置全站默认，"
+    "或在调用处传入 model。"
+)
+
+
+def _require_chat_model(model: str | None) -> str:
+    m = (model or "").strip()
+    if not m:
+        raise RuntimeError(_MISSING_CHAT_MODEL)
+    return m
 
 
 class AI302Client:
@@ -44,50 +58,78 @@ class AI302Client:
         web_search=True 时附加 302「联网搜索」能力（见 https://doc.302.ai/260112819e0 ）。
         """
         url = f"{self._base}/chat/completions"
+        resolved = _require_chat_model(model)
         body: dict[str, Any] = {
-            "model": model or settings.ai302_chat_model,
+            "model": resolved,
             "messages": messages,
             "temperature": temperature,
         }
         if web_search:
             body["web-search"] = True
+        logger.info("AI302 Request: POST %s | model=%s", url, resolved)
         start = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                r = await client.post(url, headers=self._headers(), json=body)
-                r.raise_for_status()
-                data = r.json()
-        except httpx.TimeoutException:
-            elapsed = time.perf_counter() - start
-            logger.exception(
-                "AI302 chat timeout after %.2fs | model=%s | web_search=%s | timeout=%.1fs",
-                elapsed,
-                body.get("model"),
-                web_search,
-                timeout,
-            )
-            raise
-        except httpx.HTTPStatusError as e:
-            elapsed = time.perf_counter() - start
-            resp_text = (e.response.text or "")[:1200]
-            logger.exception(
-                "AI302 chat http error after %.2fs | status=%s | model=%s | web_search=%s | body=%s",
-                elapsed,
-                e.response.status_code,
-                body.get("model"),
-                web_search,
-                resp_text,
-            )
-            raise
-        except httpx.RequestError:
-            elapsed = time.perf_counter() - start
-            logger.exception(
-                "AI302 chat request error after %.2fs | model=%s | web_search=%s",
-                elapsed,
-                body.get("model"),
-                web_search,
-            )
-            raise
+
+        max_retries = 3
+        data = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(url, headers=self._headers(), json=body)
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                is_transient = False
+                if isinstance(e, httpx.HTTPStatusError):
+                    if e.response.status_code in (429, 500, 502, 503, 504):
+                        is_transient = True
+                else:
+                    is_transient = True
+
+                if is_transient and attempt < max_retries:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "AI302 chat attempt %d failed (%s), retrying in %.2fs... | model=%s",
+                        attempt + 1, e, wait, resolved
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                # Handle failure after retries
+                if isinstance(e, httpx.TimeoutException):
+                    elapsed = time.perf_counter() - start
+                    logger.exception(
+                        "AI302 chat timeout after %d attempts and %.2fs | model=%s",
+                        attempt + 1, elapsed, resolved
+                    )
+                elif isinstance(e, httpx.HTTPStatusError):
+                    elapsed = time.perf_counter() - start
+                    resp_text = (e.response.text or "")[:1200]
+                    logger.exception(
+                        "AI302 chat http error after %d attempts and %.2fs | status=%s | model=%s | resp=%s",
+                        attempt + 1, elapsed, e.response.status_code, resolved, resp_text
+                    )
+                else:
+                    elapsed = time.perf_counter() - start
+                    logger.exception(
+                        "AI302 chat request error after %d attempts and %.2fs | model=%s",
+                        attempt + 1, elapsed, resolved
+                    )
+                raise
+
+        if data is None:
+            raise RuntimeError("AI302 chat failed to return data")
+
+        # Log usage if available
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            tt = usage.get("total_tokens", 0)
+            logger.info("AI302 Usage: prompt=%d, completion=%d, total=%d | model=%s", pt, ct, tt, resolved)
+        else:
+            logger.info("AI302 Done | model=%s [No usage data]", resolved)
+
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -109,8 +151,9 @@ class AI302Client:
         - {"type": "text", "delta": "..."}
         """
         url = f"{self._base}/chat/completions"
+        resolved = _require_chat_model(model)
         body: dict[str, Any] = {
-            "model": model or settings.ai302_chat_model,
+            "model": resolved,
             "messages": messages,
             "temperature": temperature,
             "stream": True,
@@ -118,49 +161,71 @@ class AI302Client:
         if web_search:
             body["web-search"] = True
 
+        logger.info("AI302 Request (Stream): POST %s | model=%s", url, resolved)
         start = time.perf_counter()
-        try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream(
-                    "POST", url, headers=self._headers(), json=body
-                ) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        if not line.startswith("data:"):
-                            continue
-                        payload = line[5:].strip()
-                        if not payload:
-                            continue
-                        if payload == "[DONE]":
-                            break
-                        try:
-                            evt = json.loads(payload)
-                        except json.JSONDecodeError:
-                            continue
-                        delta = (
-                            (evt.get("choices") or [{}])[0].get("delta") or {}
-                            if isinstance(evt, dict)
-                            else {}
-                        )
-                        if not isinstance(delta, dict):
-                            continue
-                        think = delta.get("reasoning_content")
-                        if isinstance(think, str) and think:
-                            yield {"type": "think", "delta": think}
-                        txt = delta.get("content")
-                        if isinstance(txt, str) and txt:
-                            yield {"type": "text", "delta": txt}
-        except Exception:
-            elapsed = time.perf_counter() - start
-            logger.exception(
-                "AI302 chat(stream) failed after %.2fs | model=%s web_search=%s",
-                elapsed,
-                body.get("model"),
-                web_search,
-            )
-            raise
+        max_retries = 3
+        for attempt in range(max_retries + 1):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    async with client.stream(
+                        "POST", url, headers=self._headers(), json=body
+                    ) as resp:
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line:
+                                continue
+                            if not line.startswith("data:"):
+                                continue
+                            payload = line[5:].strip()
+                            if not payload:
+                                continue
+                            if payload == "[DONE]":
+                                break
+                            try:
+                                evt = json.loads(payload)
+                            except json.JSONDecodeError:
+                                continue
+                            delta = (
+                                (evt.get("choices") or [{}])[0].get("delta") or {}
+                                if isinstance(evt, dict)
+                                else {}
+                            )
+                            if not isinstance(delta, dict):
+                                continue
+                            think = delta.get("reasoning_content")
+                            if isinstance(think, str) and think:
+                                yield {"type": "think", "delta": think}
+                            txt = delta.get("content")
+                            if isinstance(txt, str) and txt:
+                                yield {"type": "text", "delta": txt}
+                return  # 成功完成
+
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                is_transient = False
+                if isinstance(e, httpx.HTTPStatusError):
+                    if e.response.status_code in (429, 500, 502, 503, 504):
+                        is_transient = True
+                else:
+                    is_transient = True
+
+                if is_transient and attempt < max_retries:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "AI302 chat stream attempt %d failed (%s), retrying in %.2fs... | model=%s",
+                        attempt + 1, e, wait, resolved
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                elapsed = time.perf_counter() - start
+                logger.exception(
+                    "AI302 chat stream failed after %d attempts and %.2fs | model=%s web_search=%s",
+                    attempt + 1,
+                    elapsed,
+                    resolved,
+                    web_search,
+                )
+                raise
 
     def chat_completions_sync(
         self,
@@ -173,50 +238,77 @@ class AI302Client:
     ) -> str:
         """供 Celery 等同步环境调用。"""
         url = f"{self._base}/chat/completions"
+        resolved = _require_chat_model(model)
         body: dict[str, Any] = {
-            "model": model or settings.ai302_chat_model,
+            "model": resolved,
             "messages": messages,
             "temperature": temperature,
         }
         if web_search:
             body["web-search"] = True
+        logger.info("AI302 Request: POST %s | model=%s", url, resolved)
         start = time.perf_counter()
-        try:
-            with httpx.Client(timeout=timeout) as client:
-                r = client.post(url, headers=self._headers(), json=body)
-                r.raise_for_status()
-                data = r.json()
-        except httpx.TimeoutException:
-            elapsed = time.perf_counter() - start
-            logger.exception(
-                "AI302 chat(sync) timeout after %.2fs | model=%s | web_search=%s | timeout=%.1fs",
-                elapsed,
-                body.get("model"),
-                web_search,
-                timeout,
-            )
-            raise
-        except httpx.HTTPStatusError as e:
-            elapsed = time.perf_counter() - start
-            resp_text = (e.response.text or "")[:1200]
-            logger.exception(
-                "AI302 chat(sync) http error after %.2fs | status=%s | model=%s | web_search=%s | body=%s",
-                elapsed,
-                e.response.status_code,
-                body.get("model"),
-                web_search,
-                resp_text,
-            )
-            raise
-        except httpx.RequestError:
-            elapsed = time.perf_counter() - start
-            logger.exception(
-                "AI302 chat(sync) request error after %.2fs | model=%s | web_search=%s",
-                elapsed,
-                body.get("model"),
-                web_search,
-            )
-            raise
+
+        max_retries = 3
+        data = None
+        for attempt in range(max_retries + 1):
+            try:
+                with httpx.Client(timeout=timeout) as client:
+                    r = client.post(url, headers=self._headers(), json=body)
+                    r.raise_for_status()
+                    data = r.json()
+                    break
+            except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                is_transient = False
+                if isinstance(e, httpx.HTTPStatusError):
+                    if e.response.status_code in (429, 500, 502, 503, 504):
+                        is_transient = True
+                else:
+                    is_transient = True
+
+                if is_transient and attempt < max_retries:
+                    wait = (2 ** attempt) + random.uniform(0, 1)
+                    logger.warning(
+                        "AI302 chat(sync) attempt %d failed (%s), retrying in %.2fs... | model=%s",
+                        attempt + 1, e, wait, resolved
+                    )
+                    time.sleep(wait)
+                    continue
+
+                if isinstance(e, httpx.TimeoutException):
+                    elapsed = time.perf_counter() - start
+                    logger.exception(
+                        "AI302 chat(sync) timeout after %d attempts and %.2fs | model=%s",
+                        attempt + 1, elapsed, resolved
+                    )
+                elif isinstance(e, httpx.HTTPStatusError):
+                    elapsed = time.perf_counter() - start
+                    resp_text = (e.response.text or "")[:1200]
+                    logger.exception(
+                        "AI302 chat(sync) http error after %d attempts and %.2fs | status=%s | model=%s | resp=%s",
+                        attempt + 1, elapsed, e.response.status_code, resolved, resp_text
+                    )
+                else:
+                    elapsed = time.perf_counter() - start
+                    logger.exception(
+                        "AI302 chat(sync) request error after %d attempts and %.2fs | model=%s",
+                        attempt + 1, elapsed, resolved
+                    )
+                raise
+
+        if data is None:
+            raise RuntimeError("AI302 chat(sync) failed to return data")
+
+        # Log usage if available
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            pt = usage.get("prompt_tokens", 0)
+            ct = usage.get("completion_tokens", 0)
+            tt = usage.get("total_tokens", 0)
+            logger.info("AI302 Usage(Sync): prompt=%d, completion=%d, total=%d | model=%s", pt, ct, tt, resolved)
+        else:
+            logger.info("AI302 Done(Sync) | model=%s [No usage data]", resolved)
+
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):

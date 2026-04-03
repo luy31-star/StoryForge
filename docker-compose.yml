@@ -12,16 +12,17 @@
 # 应用并重启 Docker；Rancher Desktop 见 scripts/rancher-desktop-docker-mirror.sh。
 
 services:
-  postgres:
-    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+  mysql:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/mysql:8
     environment:
-      POSTGRES_DB: vocalflow
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      MYSQL_DATABASE: vocalflow
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: rootpassword
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mysqldata:/var/lib/mysql
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U user -d vocalflow"]
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "user", "-ppassword"]
       interval: 5s
       timeout: 5s
       retries: 8
@@ -44,7 +45,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      DATABASE_URL: mysql+pymysql://user:password@mysql:3306/vocalflow
       REDIS_URL: redis://redis:6379/0
       CORS_ORIGINS: http://localhost:8080,http://127.0.0.1:8080,http://localhost:3000,http://127.0.0.1:3000
       # 与 Bucket 地域一致；未在 .env 写 OSS_REGION 时默认北京（华北2）
@@ -56,7 +57,7 @@ services:
     volumes:
       - novel_uploads:/app/backend/uploads/novels
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -66,7 +67,7 @@ services:
     working_dir: /app/backend
     command: celery -A app.tasks.celery_app worker -l info -Q vocalflow,celery
     environment:
-      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      DATABASE_URL: mysql+pymysql://user:password@mysql:3306/vocalflow
       REDIS_URL: redis://redis:6379/0
       OSS_REGION: ${OSS_REGION:-cn-beijing}
       OSS_ENDPOINT: ${OSS_ENDPOINT:-oss-cn-beijing.aliyuncs.com}
@@ -76,7 +77,7 @@ services:
     volumes:
       - novel_uploads:/app/backend/uploads/novels
     depends_on:
-      postgres:
+      mysql:
         condition: service_healthy
       redis:
         condition: service_healthy
@@ -88,7 +89,7 @@ services:
     working_dir: /app/backend
     command: celery -A app.tasks.celery_app beat -l info
     environment:
-      DATABASE_URL: postgresql://user:password@postgres:5432/vocalflow
+      DATABASE_URL: mysql+pymysql://user:password@mysql:3306/vocalflow
       REDIS_URL: redis://redis:6379/0
       OSS_REGION: ${OSS_REGION:-cn-beijing}
       OSS_ENDPOINT: ${OSS_ENDPOINT:-oss-cn-beijing.aliyuncs.com}
@@ -113,5 +114,5 @@ services:
       - backend
 
 volumes:
-  pgdata:
+  mysqldata:
   novel_uploads:

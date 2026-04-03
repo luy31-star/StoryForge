@@ -1,5 +1,5 @@
 import { Link, Outlet, useNavigate } from "react-router-dom";
-import { LogOut, Settings, Sparkles, Wallet, User, Sun, Moon, Monitor, Check } from "lucide-react";
+import { LogOut, Settings, Sparkles, Wallet, User, Sun, Moon, Monitor, Check, HelpCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuthStore } from "@/stores/authStore";
 import { useEffect, useState } from "react";
@@ -7,12 +7,13 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogDescription, Di
 import { Label } from "@/components/ui/label";
 import { getLlmConfig, setLlmConfig } from "@/services/novelApi";
 import { listPublicModelPrices, type ModelPriceRow } from "@/services/billingApi";
+import { ModelPriceSelect } from "@/components/ModelPriceSelect";
+import { useLlmSettingsGateStore } from "@/stores/llmSettingsGateStore";
 
 export function AppLayout() {
   const user = useAuthStore((s) => s.user);
   const logout = useAuthStore((s) => s.logout);
   const nav = useNavigate();
-  const isAdmin = user?.is_admin;
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark" | "system">(
@@ -21,6 +22,7 @@ export function AppLayout() {
   const [llmCfg, setLlmCfg] = useState<{
     provider: string;
     model: string;
+    has_explicit_model?: boolean;
     novel_web_search?: boolean;
     novel_generate_web_search?: boolean;
     novel_volume_plan_web_search?: boolean;
@@ -29,6 +31,15 @@ export function AppLayout() {
   } | null>(null);
   const [settingsBusy, setSettingsBusy] = useState(false);
   const [availableModels, setAvailableModels] = useState<ModelPriceRow[]>([]);
+  const [settingsGateHint, setSettingsGateHint] = useState<string | null>(null);
+  const gateTick = useLlmSettingsGateStore((s) => s.gateTick);
+  const gateReason = useLlmSettingsGateStore((s) => s.reason);
+
+  useEffect(() => {
+    if (gateTick === 0) return;
+    setSettingsGateHint(gateReason);
+    setSettingsOpen(true);
+  }, [gateTick, gateReason]);
 
   useEffect(() => {
     const root = window.document.documentElement;
@@ -56,6 +67,24 @@ export function AppLayout() {
         .catch(console.error);
     }
   }, [settingsOpen]);
+
+  useEffect(() => {
+    if (!settingsOpen || !settingsGateHint) return;
+    const t = window.setTimeout(() => {
+      document.getElementById("settings-llm-section")?.scrollIntoView({ block: "nearest", behavior: "smooth" });
+    }, 80);
+    return () => window.clearTimeout(t);
+  }, [settingsOpen, settingsGateHint]);
+
+  /** 后端返回的 model 若与当前计价列表不一致，对齐为列表首项（与后端 resolve 一致） */
+  useEffect(() => {
+    if (!settingsOpen || !llmCfg || availableModels.length === 0) return;
+    const ids = new Set(availableModels.map((m) => m.model_id));
+    if (!llmCfg.model || !ids.has(llmCfg.model)) {
+      const first = availableModels[0].model_id;
+      setLlmCfg((prev) => (prev && prev.model !== first ? { ...prev, model: first } : prev));
+    }
+  }, [settingsOpen, availableModels, llmCfg?.model]);
 
   async function handleSaveSettings(payload: NonNullable<typeof llmCfg>) {
     setSettingsBusy(true);
@@ -105,12 +134,6 @@ export function AppLayout() {
                     管理后台
                   </Link>
                 </Button>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/settings">
-                    <Settings className="mr-1 size-3.5" />
-                    全局 LLM
-                  </Link>
-                </Button>
               </>
             ) : null}
             </nav>
@@ -132,8 +155,8 @@ export function AppLayout() {
                   <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary">
                     <User className="h-3 w-3" />
                   </div>
-                  <span className="text-xs font-medium text-muted-foreground">
-                    {user?.is_admin ? "管理员" : "用户"}
+                  <span className="text-xs font-semibold text-foreground/90 max-w-[100px] truncate">
+                    {user?.username || (user?.is_admin ? "管理员" : "用户")}
                   </span>
                 </div>
                 <Button
@@ -162,21 +185,32 @@ export function AppLayout() {
       </header>
       <Outlet />
 
-      <Dialog open={settingsOpen} onOpenChange={setSettingsOpen}>
+      <Dialog
+        open={settingsOpen}
+        onOpenChange={(open) => {
+          setSettingsOpen(open);
+          if (!open) setSettingsGateHint(null);
+        }}
+      >
         <DialogContent className="max-h-[90vh] max-w-2xl overflow-y-auto">
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Settings className="h-5 w-5" />
               用户设置
             </DialogTitle>
-            <DialogDescription>
-              配置全局大模型参数及界面风格。
+            <DialogDescription className="text-foreground/80 dark:text-muted-foreground leading-relaxed">
+              配置界面风格；用户可在此调整个人偏好的模型与联网搜索设置。
             </DialogDescription>
+            {settingsGateHint ? (
+              <p className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-left text-sm font-semibold text-amber-900 dark:text-amber-100">
+                {settingsGateHint}
+              </p>
+            ) : null}
           </DialogHeader>
 
           <div className="space-y-6 py-4">
             <section className="space-y-3">
-              <Label className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
+              <Label className="text-sm font-bold uppercase tracking-wider text-foreground/90 dark:text-foreground/70">
                 界面风格
               </Label>
               <div className="grid grid-cols-3 gap-3">
@@ -206,52 +240,43 @@ export function AppLayout() {
               </div>
             </section>
 
-            <section className="space-y-4 pt-2 border-t border-border">
-              <Label className="text-sm font-bold uppercase tracking-wider text-muted-foreground">
+            <section id="settings-llm-section" className="space-y-4 pt-2 border-t border-border scroll-mt-4">
+              <Label className="text-sm font-bold uppercase tracking-wider text-foreground/90 dark:text-foreground/70">
                 大模型配置
               </Label>
-              {!isAdmin ? (
-                <p className="text-xs text-muted-foreground">
-                  全局大模型与联网开关仅<strong>管理员</strong>可修改（侧边栏「全局 LLM」）。
-                </p>
-              ) : null}
+              <p className="text-xs text-foreground/80 dark:text-foreground/60 font-medium">
+                这里的配置仅对您当前账号生效。管理员在后台维护模型计价规则。
+              </p>
 
-              <div className={`grid gap-4 ${isAdmin ? 'sm:grid-cols-2' : 'sm:grid-cols-1'}`}>
-                {isAdmin ? (
-                  <div className="space-y-2">
-                    <Label>Provider</Label>
-                    <select
-                      value={llmCfg?.provider || "ai302"}
-                      onChange={(e) => setLlmCfg(prev => prev ? { ...prev, provider: e.target.value } : null)}
-                      className="field-shell h-10 w-full"
-                      disabled={settingsBusy || !isAdmin}
-                    >
-                      <option value="ai302">302AI</option>
-                      <option value="custom">自建代理</option>
-                    </select>
-                  </div>
-                ) : null}
-
+              <div className="grid gap-4 sm:grid-cols-1">
                 <div className="space-y-2">
-                  <Label>模型名称</Label>
-                  <select
+                  <div className="flex items-center gap-1.5">
+                    <Label className="text-foreground font-semibold">默认使用模型</Label>
+                    <span title="默认使用第一个已启用模型；您也可以在此指定自己偏好的模型。" className="cursor-help">
+                      <HelpCircle className="h-3.5 w-3.5 text-muted-foreground" />
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-foreground/70 dark:text-foreground/50 font-medium">
+                    计价单位为人民币/百万 token（入/出分列），扣费按积分换算。
+                  </p>
+                  <ModelPriceSelect
                     value={llmCfg?.model || ""}
-                    onChange={(e) => setLlmCfg(prev => prev ? { ...prev, model: e.target.value } : null)}
-                    className="field-shell h-10 w-full"
-                    disabled={settingsBusy || !isAdmin}
-                  >
-                    <option value="" disabled>请选择模型</option>
-                    {availableModels.map(m => (
-                      <option key={m.id} value={m.model_id}>
-                        {m.display_name || m.model_id}
-                      </option>
-                    ))}
-                  </select>
+                    onChange={(modelId) =>
+                      setLlmCfg((prev) => (prev ? { ...prev, model: modelId } : null))
+                    }
+                    models={availableModels}
+                    disabled={settingsBusy}
+                  />
                 </div>
               </div>
 
               <div className="glass-panel-subtle space-y-3 p-4">
-                <Label className="text-xs font-semibold text-muted-foreground italic">联网搜索 (Web Search)</Label>
+                <div className="flex items-center gap-1.5">
+                  <Label className="text-xs font-bold text-foreground/90 dark:text-foreground/70 italic">联网搜索 (Web Search)</Label>
+                  <span title="开启后，大模型在生成前会先搜索互联网实时信息（302.AI 提供）。" className="cursor-help">
+                    <HelpCircle className="h-3.5 w-3.5 text-muted-foreground" />
+                  </span>
+                </div>
                 <div className="grid gap-3 pt-1">
                   {[
                     { id: "novel_generate_web_search" as const, label: "章节续写" },
@@ -261,13 +286,13 @@ export function AppLayout() {
                     { id: "novel_web_search" as const, label: "其他(助手/框架)" },
                   ].map((field) => (
                     <label key={field.id} className="flex items-center justify-between group cursor-pointer">
-                      <span className="text-sm group-hover:text-foreground transition-colors">{field.label}</span>
+                      <span className="text-sm text-foreground group-hover:text-primary transition-colors font-semibold">{field.label}</span>
                       <input
                         type="checkbox"
                         checked={Boolean(llmCfg?.[field.id])}
                         onChange={(e) => setLlmCfg(prev => prev ? { ...prev, [field.id]: e.target.checked } : null)}
                         className="h-4 w-4 rounded border-gray-300 text-primary focus:ring-primary"
-                        disabled={settingsBusy || !isAdmin}
+                        disabled={settingsBusy}
                       />
                     </label>
                   ))}
@@ -286,10 +311,6 @@ export function AppLayout() {
             </Button>
             <Button
               onClick={() => {
-                if (!isAdmin) {
-                  setSettingsOpen(false);
-                  return;
-                }
                 if (llmCfg) {
                   handleSaveSettings(llmCfg).then(() => setSettingsOpen(false));
                 } else {
@@ -298,7 +319,7 @@ export function AppLayout() {
               }}
               disabled={settingsBusy}
             >
-              {settingsBusy ? "保存中..." : isAdmin ? "保存配置" : "关闭"}
+              {settingsBusy ? "保存中..." : "保存配置"}
             </Button>
           </DialogFooter>
         </DialogContent>

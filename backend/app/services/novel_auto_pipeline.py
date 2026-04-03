@@ -87,9 +87,11 @@ def _extract_brainstorm_payload(raw: str) -> dict[str, Any] | None:
     if text:
         candidates.append(text)
 
+    # 尝试提取代码块
     fence_blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", text, re.IGNORECASE)
     candidates.extend(block.strip() for block in fence_blocks if block.strip())
 
+    # 尝试提取第一个 { 到最后一个 }
     first = text.find("{")
     last = text.rfind("}")
     if first != -1 and last != -1 and last > first:
@@ -103,15 +105,22 @@ def _extract_brainstorm_payload(raw: str) -> dict[str, Any] | None:
         try:
             data = json.loads(candidate)
             if isinstance(data, dict):
+                # 再次清理标题中的引号
+                if "title" in data:
+                    data["title"] = str(data["title"]).strip("《》\"' ")
                 return data
         except Exception:
             pass
         try:
             data = ast.literal_eval(candidate)
             if isinstance(data, dict):
+                if "title" in data:
+                    data["title"] = str(data["title"]).strip("《》\"' ")
                 return data
         except Exception:
             pass
+
+    # 如果解析失败，尝试基于行正则提取（增加对 JSON 键引号的支持）
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     extracted: dict[str, Any] = {}
     label_map = {
@@ -122,10 +131,12 @@ def _extract_brainstorm_payload(raw: str) -> dict[str, Any] | None:
     }
     for field, labels in label_map.items():
         for line in lines:
-            clean = re.sub(r"^[\-*#\d\.\)\s]+", "", line)
+            # 清理行首的项目符号等，同时也要允许引号开头（针对 JSON 失败后的行解析）
+            clean = re.sub(r"^[\-*#\d\.\)\s]+", "", line).strip()
             for label in labels:
-                m = re.match(
-                    rf"^(?:{re.escape(label)})(?:\s*[:：]\s*|\s+)(.+)$",
+                # 兼容 "title": "xxx", title: xxx, "书名": "xxx" 等多种写法
+                m = re.search(
+                    rf'["\']?(?:{re.escape(label)})["\']?\s*[:：]\s*["\']?([^"\',}}]+)["\']?',
                     clean,
                     re.IGNORECASE,
                 )
@@ -178,19 +189,34 @@ def _build_brainstorm_fallback_payload(
     plain_lines = [line for line in plain_lines if line]
 
     title = ""
-    for line in plain_lines[:8]:
-        if len(line) <= 30 and not any(key in line for key in ["简介", "背景", "文风", "{", "}", ":"]):
-            title = line.strip("《》\"' ")
+    # 优先在文本块中找看起来像书名的内容（不超过 15 字，不含关键描述词）
+    for line in plain_lines[:12]:
+        line_clean = line.strip("《》\"' ")
+        # 排除包含“章”或者字数描述的行，这些通常是备注
+        if "章" in line_clean or "字" in line_clean or "篇幅" in line_clean:
+            continue
+        if len(line_clean) <= 15 and not any(key in line_clean for key in ["简介", "背景", "设定", "风格", "{", "}", ":"]):
+            title = line_clean
             break
-    if not title:
-        if notes_text:
-            first_note = re.split(r"[，。；\n]", notes_text, maxsplit=1)[0].strip()
-            if first_note:
-                title = f"{clean_styles[0]}：{first_note[:16]}"
+            
+    # 如果没找到，尝试从备注提取标题，但要过滤掉“章、字”等描述
+    if not title and notes_text:
+        # 寻找备注中不含“章、字”的第一句话
+        parts = re.split(r"[，。；\n]", notes_text)
+        for part in parts:
+            p = part.strip()
+            if p and "章" not in p and "字" not in p and len(p) <= 20:
+                title = f"{clean_styles[0]}：{p}"
+                break
+                
     if not title:
         title = f"{clean_styles[0]}小说"
 
-    text_blocks = [line for line in plain_lines if len(line) >= 8]
+    # 过滤掉明显的 JSON/代码块行，提取正文块作为简介
+    text_blocks = [
+        line for line in plain_lines 
+        if len(line) >= 8 and not line.startswith(("{", "[", '"', "'"))
+    ]
     intro = text_blocks[0] if text_blocks else f"这是一部以{ '、'.join(clean_styles[:3]) }为核心标签的小说。"
     background_parts = text_blocks[1:4]
     background = "\n".join(background_parts).strip()
@@ -257,30 +283,28 @@ def run_ai_create_and_start_sync(
         length_min, length_max = 15, 50
 
     prompt = (
-        "你是一个专业的网络小说架构师与畅销书策划编辑。\n"
-        f"用户选择的题材/风格标签：{styles_text}\n"
+        "你是一个顶级的网络小说架构师与畅销书策划编辑，擅长构思极具吸引力的书名和宏大且逻辑严密的设定。\n"
+        f"用户提供的题材/风格标签：{styles_text}\n"
         f"篇幅要求：{length_hint}。\n"
-        f"目标总章节数必须落在 {length_min}-{length_max} 章之间。\n"
-        f"用户补充备注：{notes_text or '（无）'}\n"
-        "现在请只做一件事：输出一个严格合法、可直接 json.loads() 的 JSON 对象。\n"
-        "禁止输出任何解释、前言、后记、Markdown 代码块、项目符号、注释或多余文字。\n"
-        "必须且只能包含以下五个键：title, intro, background, style, target_chapters。\n"
-        "字段规则：\n"
-        f'- title: 字符串，书名，长度 4-30 字。\n'
-        f'- intro: 字符串，简介，1-3 段。\n'
-        f'- background: 字符串，背景设定与世界观。\n'
-        f'- style: 字符串，文风和创作风格关键词，用顿号或逗号连接。\n'
-        f'- target_chapters: 整数，必须在 {length_min} 到 {length_max} 之间。\n'
-        "如果某个字段拿不准，也必须给出合理默认值，不允许省略键，不允许返回 null。\n"
-        "输出示例（请严格模仿这个 JSON 结构，只替换内容，不要照抄）：\n"
+        f"目标总章节数要求在 {length_min}-{length_max} 章之间。\n"
+        f"用户创作初衷/补充备注：{notes_text or '（无）'}\n\n"
+        "任务：请基于上述输入，头脑风暴并输出一部原创小说的核心构思。\n"
+        "【关键：书名必须具有商业吸引力，不要直接照抄用户的备注。】\n\n"
+        "请只输出一个严格合法、可直接 json.loads() 的 JSON 对象，禁止输出任何其他文字或 Markdown 格式。\n"
+        "JSON 必须且只能包含以下五个键：\n"
+        f'- title: 字符串，书名（4-20 字），要新颖且贴合题材。\n'
+        f'- intro: 字符串，1-3 段吸引读者的简介，描述核心冲突和看点。\n'
+        f'- background: 字符串，详细的背景设定、力量体系或世界观细节。\n'
+        f'- style: 字符串，描述文风的关键词，如“快节奏、反转多、细腻描写”。\n'
+        f'- target_chapters: 整数，必须在 {length_min} 到 {length_max} 之间。\n\n'
+        "输出示例：\n"
         "{\n"
-        '  "title": "《雾海修途》",\n'
-        '  "intro": "少年误入雾海禁区，得到残缺古卷，从此踏上一条以小博大的修行路。...",\n'
-        '  "background": "天下宗门林立，海雾之下埋藏远古遗迹，修行资源被门阀垄断。主角所在的边陲小城表面平静，实则暗潮涌动。...",\n'
-        '  "style": "热血、升级流、悬念推进、群像伏笔",\n'
-        f'  "target_chapters": {max(length_min, min(length_max, 120))}\n'
+        '  "title": "万古剑尊",\n'
+        '  "intro": "这是一个关于背叛与复仇的故事...",\n'
+        '  "background": "在这个名为九州的大陆上，修行者以剑入道...",\n'
+        '  "style": "热血、快节奏、升级、爽文",\n'
+        f'  "target_chapters": {max(length_min, min(length_max, 150))}\n'
         "}\n"
-        "再次强调：最终回答必须是纯 JSON 对象本体，首字符是 { ，末字符是 } 。"
     )
 
     def _run_chat(

@@ -427,12 +427,22 @@ def list_novels(
             "intro": n.intro,
             "status": n.status,
             "framework_confirmed": n.framework_confirmed,
+            "target_chapters": n.target_chapters,
+            "length_tag": _get_length_tag(n.target_chapters),
             "daily_auto_chapters": n.daily_auto_chapters,
             "daily_auto_time": n.daily_auto_time,
             "updated_at": n.updated_at.isoformat() if n.updated_at else None,
         }
         for n in rows
     ]
+
+
+def _get_length_tag(target_chapters: int) -> str:
+    if target_chapters <= 50:
+        return "短篇"
+    if target_chapters <= 250:
+        return "中篇"
+    return "长篇"
 
 
 @router.post("/ai-create-and-start")
@@ -552,6 +562,7 @@ def get_novel(
         "background": n.background,
         "style": n.style,
         "target_chapters": n.target_chapters,
+        "length_tag": _get_length_tag(n.target_chapters),
         "daily_auto_chapters": n.daily_auto_chapters,
         "daily_auto_time": n.daily_auto_time,
         "reference_filename": n.reference_filename,
@@ -878,6 +889,44 @@ def list_chapters(
     ]
 
 
+@router.get("/{novel_id}/export")
+def export_chapters(
+    novel_id: str,
+    start_no: int = 1,
+    end_no: int = 9999,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    require_novel_access(db, novel_id, user)
+    # 获取范围内章节，逻辑同 list_chapters
+    rows = (
+        db.query(Chapter)
+        .filter(Chapter.novel_id == novel_id)
+        .filter(Chapter.chapter_no >= start_no)
+        .filter(Chapter.chapter_no <= end_no)
+        .order_by(Chapter.chapter_no.asc(), Chapter.updated_at.desc())
+        .all()
+    )
+
+    chosen: dict[int, Chapter] = {}
+    for c in rows:
+        old = chosen.get(c.chapter_no)
+        if old is None:
+            chosen[c.chapter_no] = c
+            continue
+        if old.status != "approved" and c.status == "approved":
+            chosen[c.chapter_no] = c
+
+    uniq_rows = [chosen[k] for k in sorted(chosen.keys())]
+
+    full_text = ""
+    for c in uniq_rows:
+        # 正文已自带章节标题，直接导出正文内容
+        full_text += f"{c.content}\n\n"
+
+    return {"full_text": full_text.strip()}
+
+
 @router.post("/{novel_id}/chapters/generate")
 async def generate_chapters(
     novel_id: str,
@@ -894,6 +943,11 @@ async def generate_chapters(
             409,
             "当前已有章节生成任务进行中，请在「生成日志」中查看进度后再试",
         )
+        
+    if n.status == "failed":
+        n.status = "active"
+        db.commit()
+
     chapter_nos, requested_cap = _resolve_chapter_nos_for_generate(db, novel_id, body)
     batch_id = f"gen-{int(time.time())}-{novel_id[:8]}"
     
@@ -990,6 +1044,10 @@ def consistency_fix_chapter(
             409,
             "当前章节一致性修订任务进行中，请在「生成日志」中查看进度后再试",
         )
+        
+    if n.status == "failed":
+        n.status = "active"
+
     batch_id = f"consist-{chapter_id}-{int(time.time())}"
     try:
         task = novel_chapter_consistency_fix.delay(
@@ -1042,6 +1100,9 @@ async def start_auto_pipeline(
     ):
         raise HTTPException(409, "当前已有章节生成任务进行中，请稍后再试")
         
+    if n.status == "failed":
+        n.status = "active"
+
     batch_id = f"auto-{int(time.time())}-{novel_id[:8]}"
     _append_generation_log(
         db,
@@ -1349,6 +1410,10 @@ def revise_chapter(
             409,
             "当前章节改稿任务进行中，请在「生成日志」中查看进度后再试",
         )
+        
+    if n.status == "failed":
+        n.status = "active"
+
     batch_id = f"revise-{chapter_id}-{int(time.time())}"
     try:
         task = novel_chapter_revise.delay(

@@ -1,8 +1,6 @@
 """注册 / 登录 / 当前用户。"""
 
-from __future__ import annotations
-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Body
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -41,8 +39,12 @@ class UserOut(BaseModel):
 
 @router.post("/register", response_model=TokenOut)
 @limiter.limit("10/minute")
-def register(request: Request, body: RegisterBody, db: Session = Depends(get_db)) -> TokenOut:
-    uname = body.username.strip()
+def register(
+    request: Request,
+    db: Session = Depends(get_db),
+    data: RegisterBody = Body(...),
+) -> TokenOut:
+    uname = data.username.strip()
     if not uname:
         raise HTTPException(400, "用户名不能为空")
     exists = db.query(User).filter(User.username == uname).first()
@@ -56,7 +58,7 @@ def register(request: Request, body: RegisterBody, db: Session = Depends(get_db)
     points = max(0, int(settings.register_initial_points))
     user = User(
         username=uname,
-        hashed_password=hash_password(body.password),
+        hashed_password=hash_password(data.password),
         points_balance=points,
         is_admin=is_admin,
     )
@@ -70,10 +72,14 @@ def register(request: Request, body: RegisterBody, db: Session = Depends(get_db)
 
 @router.post("/login", response_model=TokenOut)
 @limiter.limit("10/minute")
-def login(request: Request, body: LoginBody, db: Session = Depends(get_db)) -> TokenOut:
-    uname = (body.username or "").strip()
+def login(
+    request: Request,
+    db: Session = Depends(get_db),
+    data: LoginBody = Body(...),
+) -> TokenOut:
+    uname = (data.username or "").strip()
     user = db.query(User).filter(User.username == uname).first()
-    if not user or not verify_password(body.password, user.hashed_password):
+    if not user or not verify_password(data.password, user.hashed_password):
         raise HTTPException(401, "用户名或密码错误")
     token = create_access_token({"sub": user.id})
     return TokenOut(access_token=token)

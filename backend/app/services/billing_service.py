@@ -14,28 +14,30 @@ from app.models.user import ModelPrice, PointsTransaction, TokenUsage, User
 logger = logging.getLogger(__name__)
 
 
-def _price_cny_for_model(db: Session, model_id: str) -> float:
+def tokens_to_points(db: Session, model_id: str, prompt_tokens: int, completion_tokens: int) -> int:
+    """
+    扣费积分 = (输入 token / 1e6 * 输入单价 + 输出 token / 1e6 * 输出单价) * points_per_cny
+    向上取整到整数积分。
+    """
+    if prompt_tokens <= 0 and completion_tokens <= 0:
+        return 0
+
     row = (
         db.query(ModelPrice)
         .filter(ModelPrice.model_id == model_id, ModelPrice.enabled.is_(True))
         .first()
     )
     if row:
-        return float(row.price_cny_per_million_tokens or 0)
-    # 未配置时按 1 元/百万 token 计
-    return 1.0
+        p_price = float(row.prompt_price_cny_per_million_tokens or row.price_cny_per_million_tokens or 0)
+        c_price = float(row.completion_price_cny_per_million_tokens or row.price_cny_per_million_tokens or 0)
+    else:
+        # 未配置时按 1 元/百万 token 计
+        p_price = 1.0
+        c_price = 1.0
 
-
-def tokens_to_points(db: Session, model_id: str, total_tokens: int) -> int:
-    """
-    扣费积分 = (总 token / 1e6) * 单价(元/百万) * points_per_cny
-    向上取整到整数积分。
-    """
-    if total_tokens <= 0:
-        return 0
-    cny_per_m = _price_cny_for_model(db, model_id)
-    raw = (total_tokens / 1_000_000.0) * cny_per_m * settings.points_per_cny
-    return max(1, int(math.ceil(raw))) if raw > 0 else 0
+    cost_cny = (prompt_tokens / 1_000_000.0) * p_price + (completion_tokens / 1_000_000.0) * c_price
+    raw_points = cost_cny * settings.points_per_cny
+    return max(1, int(math.ceil(raw_points))) if raw_points > 0 else 0
 
 
 def extract_usage_from_response(data: Any) -> dict[str, int] | None:
@@ -70,7 +72,9 @@ def consume_points_for_llm(
     if total <= 0:
         return 0
 
-    cost = tokens_to_points(db, model_id, total)
+    pt = int(usage.get("prompt_tokens") or 0)
+    ct = int(usage.get("completion_tokens") or 0)
+    cost = tokens_to_points(db, model_id, pt, ct)
     if cost <= 0:
         return 0
 

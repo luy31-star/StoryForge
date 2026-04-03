@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { X } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
 import { Button } from "@/components/ui/button";
 import {
@@ -25,6 +26,7 @@ import {
   confirmFramework,
   deleteChapter,
   discardChapterRevision,
+  exportChapters,
   generateChapters,
   autoGenerateChapters,
   generateFramework,
@@ -58,6 +60,7 @@ import {
   waitForMemoryRefreshBatch,
   waitForVolumePlanBatch,
 } from "@/services/novelApi";
+import { ensureLlmReady } from "@/services/llmReady";
 
 const STRUCTURED_LIST_PAGE = 8;
 /** 剧情承接与微调区：每类行列表分页，避免单屏过长 */
@@ -339,6 +342,25 @@ export function NovelWorkspace() {
     daily_auto_time: "14:30",
   });
   const [novelSettingsBusy, setNovelSettingsBusy] = useState(false);
+
+  const [exportOpen, setExportOpen] = useState(false);
+  const [exportStartNo, setExportStartNo] = useState(1);
+  const [exportEndNo, setExportEndNo] = useState(9999);
+  const [exportContent, setExportContent] = useState("");
+  const [exportBusy, setExportBusy] = useState(false);
+
+  async function handleExport() {
+    if (!id) return;
+    setExportBusy(true);
+    try {
+      const res = await exportChapters(id, exportStartNo, exportEndNo);
+      setExportContent(res.full_text);
+    } catch (e: any) {
+      setErr(e.message || "导出失败");
+    } finally {
+      setExportBusy(false);
+    }
+  }
 
 
   function openNovelSettings() {
@@ -925,10 +947,12 @@ export function NovelWorkspace() {
     }
   }
 
-  function openLlmConfirm(
+  async function openLlmConfirm(
     config: LlmConfirmState,
     action: () => Promise<void>
   ) {
+    const ok = await ensureLlmReady();
+    if (!ok) return;
     llmConfirmActionRef.current = action;
     setLlmConfirm(config);
   }
@@ -990,6 +1014,7 @@ export function NovelWorkspace() {
         return;
       }
       setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
         setLogBatchId(resp.batch_id);
       }
@@ -1175,39 +1200,41 @@ export function NovelWorkspace() {
     setErr(null);
     setNotice(null);
     setBusy(true);
-    setGenerateTrace(
-      `正在发起生成请求：POST /api/novels/${id}/chapters/generate（${generateCount}章）`
-    );
-    try {
-      const resp = await generateChapters(id, generateCount, "", {
-        use_cold_recall: useColdRecall,
-        cold_recall_items: coldRecallItems,
-        auto_consistency_check: false,
-        source: "batch_auto",
-      });
-      if (resp.status !== "queued" || !resp.batch_id) {
-        setGenerateTrace("生成请求未返回 batch_id");
-        await reloadGenerationLogs();
-        await reload();
-        return;
-      }
-      const nos = resp.chapter_nos ?? [];
-      const nosHint =
-        nos.length > 0 ? `，章号 ${nos.join("、")}` : "";
       setGenerateTrace(
-        `已入队：batch_id=${resp.batch_id}，task_id=${resp.task_id ?? "-"}，后台将按章计划串行生成${nosHint}…`
+        `正在发起生成请求...（${generateCount}章）`
       );
-      setRefreshBatchId(resp.batch_id);
-      if (logViewMode === "batch") {
-        setLogBatchId(resp.batch_id);
-        await reloadGenerationLogs(resp.batch_id);
-      } else {
-        await reloadGenerationLogs();
-      }
-      const outcome = await waitForChapterGenerationBatch(id, resp.batch_id);
-      setGenerateTrace(
-        `章节生成已结束：${outcome === "done" ? "成功" : "失败"}（batch_id=${resp.batch_id}）`
-      );
+      try {
+        const resp = await generateChapters(id, generateCount, "", {
+          use_cold_recall: useColdRecall,
+          cold_recall_items: coldRecallItems,
+          auto_consistency_check: false,
+          source: "batch_auto",
+        });
+        if (resp.status !== "queued" || !resp.batch_id) {
+          setGenerateTrace("生成请求未成功启动");
+          await reloadGenerationLogs();
+          await reload();
+          return;
+        }
+        const nos = resp.chapter_nos ?? [];
+        const nosHint =
+          nos.length > 0 ? `，章号 ${nos.join("、")}` : "";
+        setGenerateTrace(
+          `已入队，后台将按计划串行生成${nosHint}…`
+        );
+        setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
+        await reload(); // 清除失败横幅
+        if (logViewMode === "batch") {
+          setLogBatchId(resp.batch_id);
+          await reloadGenerationLogs(resp.batch_id);
+        } else {
+          await reloadGenerationLogs();
+        }
+        const outcome = await waitForChapterGenerationBatch(id, resp.batch_id);
+        setGenerateTrace(
+          `章节生成已结束：${outcome === "done" ? "成功" : "失败"}`
+        );
       if (outcome === "failed") {
         setErr("章节生成失败，请查看生成日志");
       } else {
@@ -1237,25 +1264,28 @@ export function NovelWorkspace() {
 
   async function runAutoGenerate() {
     if (!id) return;
+    const ready = await ensureLlmReady();
+    if (!ready) return;
     setErr(null);
     setNotice(null);
     setBusy(true);
     setAutoGenerateDialogOpen(false);
     setGenerateTrace(
-      `正在发起 AI 一键续写请求：POST /api/novels/${id}/auto-generate（目标：${autoGenerateCount}章）`
+      `正在发起 AI 一键续写请求...（目标：${autoGenerateCount}章）`
     );
     try {
       const resp = await autoGenerateChapters(id, autoGenerateCount);
       if (resp.status !== "queued" || !resp.batch_id) {
-        setGenerateTrace("生成请求未返回 batch_id");
+        setGenerateTrace("生成请求未成功启动");
         await reloadGenerationLogs();
         await reload();
         return;
       }
       setGenerateTrace(
-        `已入队：batch_id=${resp.batch_id}，后台将先消费已有章计划，再按每次 5 章补齐章计划并串行生成正文...`
+        `已入队，后台将先消费已有章计划，再按批次补齐章计划并串行生成正文...`
       );
       setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
         setLogBatchId(resp.batch_id);
         await reloadGenerationLogs(resp.batch_id);
@@ -1263,6 +1293,7 @@ export function NovelWorkspace() {
         await reloadGenerationLogs();
       }
       setNotice(`已开启 AI 一键续写（${autoGenerateCount}章），请在生成日志中查看进度。`);
+      await reload(); // 获取最新小说状态，消除失败横幅
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "全自动生成失败");
       setGenerateTrace(
@@ -1325,6 +1356,7 @@ export function NovelWorkspace() {
         return;
       }
       setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
         setLogBatchId(resp.batch_id);
       }
@@ -1411,6 +1443,7 @@ export function NovelWorkspace() {
       });
       if (resp.status === "queued" && resp.batch_id) {
         setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
         const outcome = await waitForChapterGenerationBatch(id, resp.batch_id);
         setNotice(
           outcome === "done"
@@ -1460,7 +1493,7 @@ export function NovelWorkspace() {
         "当前未从规范大纲加载到硬约束列表；若你仍有多条全局禁止设定，请先在「结构化记忆」中核对 outline。"
       );
     }
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认审定通过？",
         description:
@@ -1539,6 +1572,7 @@ export function NovelWorkspace() {
     try {
       const resp = await retryChapterMemory(chapterId);
       setRefreshBatchId(resp.batch_id);
+      await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
         setLogBatchId(resp.batch_id);
       }
@@ -1626,6 +1660,8 @@ export function NovelWorkspace() {
 
   async function runChapterChatPrompt(userText: string) {
     if (!id || !userText.trim() || chapterChatBusy) return;
+    const ready = await ensureLlmReady();
+    if (!ready) return;
     const nextTurns = [...chapterChatTurns, { role: "user" as const, content: userText.trim() }];
     setChapterChatTurns([...nextTurns, { role: "assistant", content: "" }]);
     setChapterChatInput("");
@@ -1686,7 +1722,7 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateFramework() {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认生成小说框架？",
         description: "这会调用大模型，根据当前作品信息重写一版框架草案。",
@@ -1703,7 +1739,7 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateVolumes() {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认生成卷列表？",
         description: "这会调用大模型，根据已确认框架拆出整本书的卷结构。",
@@ -1720,7 +1756,7 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateVolumePlan(force = false) {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: force ? "确认强制重生成本卷计划？" : "确认生成本卷下一批章计划？",
         description: force
@@ -1744,7 +1780,7 @@ export function NovelWorkspace() {
   function confirmRegenerateChapterPlan(chapterNo: number) {
     const instruction = window.prompt("请输入重生成指令（可选，如：'让冲突更激烈些'）：", "");
     if (instruction === null) return;
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: `确认重生成第${chapterNo}章计划？`,
         description: "这会调用大模型重做当前章的节奏和剧情规划。",
@@ -1763,7 +1799,7 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateChapterFromPlan(chapterNo: number) {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: `确认生成第${chapterNo}章正文？`,
         description:
@@ -1784,7 +1820,7 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateChapters() {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: `确认自动续写 ${generateCount} 章？`,
         description:
@@ -1807,41 +1843,15 @@ export function NovelWorkspace() {
 
   function confirmSendChapterChat() {
     if (!chapterChatInput.trim() || chapterChatBusy) return;
-    openLlmConfirm(
-      {
-        title: "确认发送给章节助手？",
-        description: "这会调用大模型，并把当前章节助手会话、框架和相关记忆一并带上。",
-        confirmLabel: "确认发送",
-        details: [
-          "更适合问“下一章怎么写”“哪里有冲突”这类需要上下文的问题。",
-          "如果问题涉及剧透或未来走向，请尽量写清楚你想保留的限制条件。",
-        ],
-      },
-      async () => {
-        await sendChapterChat();
-      }
-    );
+    void sendChapterChat();
   }
 
-  function confirmSendChapterQuickPrompt(prompt: string, label: string) {
-    openLlmConfirm(
-      {
-        title: `确认执行“${label}”？`,
-        description: "这会调用大模型，并自动带入预设提问模板与当前创作上下文。",
-        confirmLabel: "确认提问",
-        details: [
-          `将发送的提示词：${prompt}`,
-          "快捷提问适合快速诊断；如果你想限制回答范围，建议改用手动输入。",
-        ],
-      },
-      async () => {
-        await sendChapterQuickPrompt(prompt);
-      }
-    );
+  function confirmSendChapterQuickPrompt(prompt: string) {
+    void sendChapterQuickPrompt(prompt);
   }
 
   function confirmConsistencyFix(chapterId: string) {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认生成一致性修订稿？",
         description: "这会调用大模型检查当前章节与框架、已审定章节和记忆的衔接问题，并产出修订稿。",
@@ -1869,7 +1879,7 @@ export function NovelWorkspace() {
   function confirmReviseChapter(chapterId: string, prompt: string) {
     const instruction = prompt.trim();
     if (!instruction) return;
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认按指令生成修订稿？",
         description: "这会调用大模型，按你的修改要求重写当前章节的一版修订稿。",
@@ -1896,7 +1906,7 @@ export function NovelWorkspace() {
   }
 
   function confirmRefreshMemory() {
-    openLlmConfirm(
+    void openLlmConfirm(
       {
         title: "确认根据已审定章节刷新记忆？",
         description: "这会调用大模型重新整理当前小说记忆，并与现有版本做校验比较。",
@@ -1965,13 +1975,16 @@ export function NovelWorkspace() {
             <div className="flex flex-wrap items-start justify-between gap-4">
               <div className="max-w-3xl space-y-3">
                 <div className="flex flex-wrap items-center gap-2">
-                  <span className="glass-chip">
+                  <span className="glass-chip font-bold text-foreground/80">
                     <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
                     {workspaceStageLabel}
                   </span>
-                  <span className="glass-chip">
+                  <span className="glass-chip text-foreground/80 font-medium">
                     预期篇幅
-                    <span className="font-medium text-foreground">
+                    <span className="ml-1 font-bold text-primary">
+                      {novel?.length_tag ? `【${novel.length_tag}】` : ""}
+                    </span>
+                    <span className="ml-1 font-bold text-foreground">
                       已设置目标 {Number(novel?.target_chapters || 300)} 章
                     </span>
                   </span>
@@ -1980,11 +1993,11 @@ export function NovelWorkspace() {
                   <input
                     value={titleDraft}
                     onChange={(e) => setTitleDraft(e.target.value)}
-                    className="h-12 w-full max-w-2xl rounded-2xl border border-border/70 bg-background/70 px-4 text-2xl font-semibold tracking-tight shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-xl transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+                    className="h-12 w-full max-w-2xl rounded-2xl border border-border/70 bg-background/70 px-4 text-2xl font-bold tracking-tight text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-xl transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 placeholder:text-foreground/30"
                     placeholder="请输入书名"
                     disabled={busy || titleBusy}
                   />
-                  <p className="max-w-2xl text-sm leading-6 text-muted-foreground">
+                  <p className="max-w-2xl text-sm leading-6 text-foreground/70 dark:text-muted-foreground font-medium">
                     以框架、章节、记忆三条主线来推进一本书。把高频操作留在首屏，把详细日志和原始数据收进分区，减少创作中断。
                   </p>
                 </div>
@@ -1992,23 +2005,25 @@ export function NovelWorkspace() {
                   <Button
                     type="button"
                     variant="glass"
+                    className="font-bold"
                     disabled={busy || titleBusy || !titleDraft.trim()}
                     onClick={() => void runSaveTitle()}
                   >
                     保存书名
                   </Button>
-                  <Button variant="outline" asChild>
+                  <Button variant="outline" asChild className="font-semibold">
                     <Link to="/novels">返回书架</Link>
                   </Button>
-                  <Button variant="outline" asChild>
+                  <Button variant="outline" asChild className="font-semibold">
                     <Link to={`/novels/${id}/metrics`}>查看指标</Link>
                   </Button>
-                  <Button variant="outline" onClick={openNovelSettings}>
+                  <Button variant="outline" onClick={openNovelSettings} className="font-semibold">
                     小说设置
                   </Button>
                   <Button
                     type="button"
                     variant="outline"
+                    className="font-semibold"
                     onClick={() => {
                       setLogDialogOpen(true);
                       void reloadGenerationLogs(logBatchId || undefined);
@@ -2019,6 +2034,7 @@ export function NovelWorkspace() {
                   <Button
                     type="button"
                     variant="secondary"
+                    className="font-bold"
                     disabled={busy || !frameworkConfirmed}
                     onClick={() => setAutoGenerateDialogOpen(true)}
                   >
@@ -2037,11 +2053,11 @@ export function NovelWorkspace() {
                 ["活跃待收束线", `${activeMemoryLines}`, activeMemoryLines ? "需要持续关注" : "记忆区尚未积累"],
               ].map(([label, value, hint]) => (
                 <div key={label} className="glass-panel-subtle p-4">
-                  <p className="text-xs text-muted-foreground">{label}</p>
-                  <p className="mt-2 text-2xl font-semibold tracking-tight text-foreground">
+                  <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">{label}</p>
+                  <p className="mt-2 text-2xl font-bold tracking-tight text-foreground">
                     {value}
                   </p>
-                  <p className="mt-1 text-xs text-muted-foreground">{hint}</p>
+                  <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">{hint}</p>
                 </div>
               ))}
             </div>
@@ -2072,6 +2088,61 @@ export function NovelWorkspace() {
           onConfirm={runConfirmedLlmAction}
         />
 
+        {novel?.status === "failed" && (
+          <div className="glass-panel-subtle relative flex flex-col gap-4 border-destructive/30 bg-destructive/5 p-6 text-sm text-destructive">
+            <button
+              type="button"
+              onClick={() => {
+                // 本地临时隐藏，或者通过 patchNovel 重置状态
+                if (novel?.id) {
+                  void patchNovel(novel.id as string, { status: "active" }).then(() => reload());
+                }
+              }}
+              className="absolute right-4 top-4 rounded-full p-1 text-destructive/40 hover:bg-destructive/10 hover:text-destructive transition-colors"
+              title="忽略此错误"
+            >
+              <X className="size-5" />
+            </button>
+            <div className="flex items-center gap-3">
+              <div className="flex size-10 shrink-0 items-center justify-center rounded-2xl bg-destructive/10 text-destructive">
+                <div className="h-2 w-2 rounded-full bg-destructive animate-ping" />
+              </div>
+              <div className="space-y-1">
+                <p className="text-base font-bold">
+                  {novel.framework_confirmed ? "AI 续写或记忆同步执行失败" : "AI 全自动建书执行失败"}
+                </p>
+                <p className="text-foreground/70 dark:text-muted-foreground font-medium leading-relaxed">
+                  {novel.framework_confirmed 
+                    ? "小说大纲已构思完成，但在生成后续正文或同步背景设定记忆时遇到了问题。这通常是由于模型解析冲突或响应超时引起的。" 
+                    : "在构思小说设定、大纲或初始章节时遇到了问题。这通常是由于模型接口响应超时或解析失败引起的。"}
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-wrap items-center gap-3 pl-13">
+              <Button
+                variant="destructive"
+                className="font-bold shadow-lg shadow-destructive/20"
+                onClick={() => {
+                  setLogDialogOpen(true);
+                  void reloadGenerationLogs();
+                }}
+              >
+                查看错误详情
+              </Button>
+              <Button
+                variant="outline"
+                className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
+                asChild
+              >
+                <Link to="/novels">回到书架</Link>
+              </Button>
+              <p className="text-[11px] text-foreground/50 dark:text-muted-foreground italic font-medium ml-2">
+                建议查看错误日志，如有必要可删除当前失败的作品重新尝试。
+              </p>
+            </div>
+          </div>
+        )}
+
         <Tabs defaultValue="framework" className="w-full">
           <TabsList className="w-full flex-wrap justify-start">
             <TabsTrigger value="framework">设定与框架</TabsTrigger>
@@ -2083,8 +2154,8 @@ export function NovelWorkspace() {
           <TabsContent value="framework" className="glass-panel space-y-4 p-5 md:p-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading">小说概览与创作基线</p>
-                <p className="text-sm text-muted-foreground">
+                <p className="section-heading text-foreground font-bold">小说概览与创作基线</p>
+                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                   先沉淀世界观、主线和写作约束，再进入卷规划与续写。框架确认后，后续章节和记忆都会以这里为准。
                 </p>
               </div>
@@ -2092,6 +2163,7 @@ export function NovelWorkspace() {
                 <Button
                   type="button"
                   size="sm"
+                  className="font-bold"
                   disabled={busy}
                   onClick={() => confirmGenerateFramework()}
                 >
@@ -2101,6 +2173,7 @@ export function NovelWorkspace() {
                   type="button"
                   size="sm"
                   variant="secondary"
+                  className="font-bold"
                   disabled={busy}
                   onClick={() =>
                     run(() => confirmFramework(id, fwMd, fwJson))
@@ -2112,38 +2185,38 @@ export function NovelWorkspace() {
             </div>
             <div className="grid gap-3 md:grid-cols-3">
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">框架状态</p>
-                <p className="mt-2 text-base font-semibold text-foreground">
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">框架状态</p>
+                <p className="mt-2 text-base font-bold text-foreground">
                   {frameworkConfirmed ? "已确认" : "待确认"}
                 </p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">当前章节</p>
-                <p className="mt-2 text-base font-semibold text-foreground">
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前章节</p>
+                <p className="mt-2 text-base font-bold text-foreground">
                   {latestChapterNo ? `第 ${latestChapterNo} 章` : "未开始"}
                 </p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">建议下一步</p>
-                <p className="mt-2 text-sm font-medium text-foreground">
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议下一步</p>
+                <p className="mt-2 text-sm font-bold text-foreground">
                   {frameworkConfirmed ? "去卷与计划区推进章节" : "先确认框架，避免后续反复改动"}
                 </p>
               </div>
             </div>
             <div>
-              <Label>框架 Markdown（可编辑后再确认）</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定大纲文本（可编辑后再确认）</Label>
               <textarea
                 value={fwMd}
                 onChange={(e) => setFwMd(e.target.value)}
-                className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
               />
             </div>
             <div>
-              <Label>框架 JSON</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定结构化配置</Label>
               <textarea
                 value={fwJson}
                 onChange={(e) => setFwJson(e.target.value)}
-                className="mt-2 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                className="mt-2 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
               />
             </div>
           </TabsContent>
@@ -2151,28 +2224,29 @@ export function NovelWorkspace() {
           <TabsContent value="volumes" className="glass-panel space-y-4 p-5 md:p-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading">卷与计划区</p>
-                <p className="text-sm text-muted-foreground">
+                <p className="section-heading text-foreground font-bold">卷与计划区</p>
+                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                   推荐流程：先生成卷列表，再给当前卷分批生成章计划，最后从计划直接进入正文生成。
                 </p>
               </div>
-              <div className="glass-chip">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
+              <div className="glass-chip font-bold text-foreground/80">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
             </div>
             <div className="glass-panel-subtle flex flex-wrap gap-2 p-3">
               <Button
                 type="button"
                 size="sm"
+                className="font-bold"
                 disabled={busy || volumeBusy}
                 onClick={() => confirmGenerateVolumes()}
               >
                 生成卷列表（每卷约50章）
               </Button>
               <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-background/60 px-3 py-1.5 text-xs">
-                <span className="text-muted-foreground">每次生成</span>
+                <span className="text-foreground/60 dark:text-muted-foreground font-bold">每次生成</span>
                 <select
                   value={volumePlanBatchSize}
                   onChange={(e) => setVolumePlanBatchSize(Number(e.target.value))}
-                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-xs"
+                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-xs text-foreground font-bold"
                   disabled={busy || volumeBusy}
                 >
                   {[4, 5, 6, 7, 8, 9, 10].map((n) => (
@@ -2186,6 +2260,7 @@ export function NovelWorkspace() {
                 type="button"
                 size="sm"
                 variant="secondary"
+                className="font-bold"
                 disabled={busy || volumeBusy || !selectedVolumeId}
                 onClick={() => confirmGenerateVolumePlan(false)}
               >
@@ -2195,6 +2270,7 @@ export function NovelWorkspace() {
                 type="button"
                 size="sm"
                 variant="outline"
+                className="font-semibold"
                 disabled={busy || volumeBusy || !selectedVolumeId}
                 onClick={() => confirmGenerateVolumePlan(true)}
               >
@@ -2204,6 +2280,7 @@ export function NovelWorkspace() {
                 type="button"
                 size="sm"
                 variant="destructive"
+                className="font-bold"
                 disabled={busy || volumeBusy || !selectedVolumeId}
                 onClick={() => void runClearVolumePlans()}
               >
@@ -2212,7 +2289,7 @@ export function NovelWorkspace() {
             </div>
             <div className="grid gap-4 lg:grid-cols-12">
               <aside className="glass-panel-subtle soft-scroll lg:col-span-4 p-4">
-                <p className="mb-2 text-xs font-medium text-muted-foreground">卷列表</p>
+                <p className="mb-2 text-xs font-bold text-foreground/60 dark:text-muted-foreground">卷列表</p>
                 <div className="max-h-[70vh] space-y-2 overflow-auto pr-1">
                   {volumes.map((v) => (
                     <button
@@ -2225,44 +2302,44 @@ export function NovelWorkspace() {
                           : "border-border bg-background/40 hover:bg-muted/30"
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-2 font-medium">
+                      <div className="flex items-center justify-between gap-2 font-bold text-foreground">
                         <span>
                           第{v.volume_no}卷 {v.title}
                         </span>
-                        <span className="text-[11px] text-muted-foreground">
+                        <span className="text-[11px] text-foreground/60 dark:text-muted-foreground">
                           计划{v.chapter_plan_count}
                         </span>
                       </div>
-                      <div className="mt-1 text-muted-foreground">
+                      <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium">
                         第{v.from_chapter}—{v.to_chapter}章 · {v.status}
                       </div>
                       {v.summary ? (
-                        <div className="mt-1 line-clamp-2 text-muted-foreground">
+                        <div className="mt-1 line-clamp-2 text-foreground/70 dark:text-muted-foreground font-medium">
                           {v.summary}
                         </div>
                       ) : null}
                     </button>
                   ))}
                   {volumes.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">暂无卷。点击上方按钮生成。</p>
+                    <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">暂无卷。点击上方按钮生成。</p>
                   ) : null}
                 </div>
               </aside>
               <section className="glass-panel-subtle lg:col-span-8 p-5">
                 {!selectedVolumeId ? (
-                  <p className="text-sm text-muted-foreground">请选择左侧卷。</p>
+                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧卷。</p>
                 ) : (
                   <div className="space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-medium">本卷章计划</p>
-                      <p className="text-xs text-muted-foreground">
+                      <p className="text-sm font-bold text-foreground">本卷章计划</p>
+                      <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">
                         {volumeBusy
                           ? "加载中…"
                           : `共 ${volumePlan.length} 章 · 当前展示 ${volumePlanView.visible.length} 章`}
                       </p>
                     </div>
                     {volumePlan.length > 0 ? (
-                      <label className="flex cursor-pointer flex-wrap items-center gap-2 text-xs text-muted-foreground">
+                      <label className="flex cursor-pointer flex-wrap items-center gap-2 text-xs text-foreground/70 dark:text-muted-foreground font-bold">
                         <input
                           type="checkbox"
                           className="rounded border-input"
@@ -2275,7 +2352,7 @@ export function NovelWorkspace() {
                           显示已含正文的章节（默认关闭：已生成正文的章会隐藏，便于往下写）
                           {!showVolumePlanWithBody &&
                           volumePlanView.withBodyCount > 0 ? (
-                            <span className="ml-1 text-amber-600/90">
+                            <span className="ml-1 text-amber-600 font-bold">
                               · 已隐藏 {volumePlanView.withBodyCount} 章
                             </span>
                           ) : null}
@@ -2289,12 +2366,12 @@ export function NovelWorkspace() {
                       const done = volumePlan.length >= total;
                       const last = volumePlanLastRun;
                       return (
-                        <div className="glass-panel-subtle p-3 text-xs text-muted-foreground">
+                        <div className="glass-panel-subtle p-3 text-xs text-foreground/70 dark:text-muted-foreground font-medium">
                           <div className="flex flex-wrap items-center justify-between gap-2">
                             <span>
                               进度：已生成 {volumePlan.length}/{total} 章（第{v.from_chapter}—{v.to_chapter}章）
                             </span>
-                            <span>{done ? "已完成" : "未完成"}</span>
+                            <span className="font-bold">{done ? "已完成" : "未完成"}</span>
                           </div>
                           {last?.batch ? (
                             <div className="mt-1">
@@ -2309,11 +2386,11 @@ export function NovelWorkspace() {
                     })()}
                     <div className="soft-scroll max-h-[70vh] overflow-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-2.5">
                       {volumePlan.length === 0 ? (
-                        <p className="p-2 text-xs text-muted-foreground">
+                        <p className="p-2 text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
                           暂无章计划。点击“生成本卷章计划（下一批）”开始生成。
                         </p>
                       ) : volumePlanView.visible.length === 0 ? (
-                        <p className="p-2 text-xs text-muted-foreground">
+                        <p className="p-2 text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
                           当前视图下没有待写章节（本卷计划均已含正文）。
                           请勾选上方「显示已含正文的章节」以查看与操作已生成章节。
                         </p>
@@ -2326,10 +2403,10 @@ export function NovelWorkspace() {
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div className="space-y-1">
-                                  <div className="font-medium text-foreground">
+                                  <div className="font-bold text-foreground">
                                     第{p.chapter_no}章 · {p.chapter_title}
                                   </div>
-                                  <div className="text-[11px] text-muted-foreground">
+                                  <div className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                                     {p.status === "locked" ? "当前计划已锁定" : "可继续调整或直接生成正文"}
                                   </div>
                                 </div>
@@ -2338,6 +2415,7 @@ export function NovelWorkspace() {
                                     type="button"
                                     size="sm"
                                     variant="outline"
+                                    className="font-semibold"
                                     disabled={busy || p.status === "locked"}
                                     onClick={() => confirmRegenerateChapterPlan(p.chapter_no)}
                                   >
@@ -2346,6 +2424,7 @@ export function NovelWorkspace() {
                                   <Button
                                     type="button"
                                     size="sm"
+                                    className="font-bold"
                                     disabled={busy}
                                     onClick={() => confirmGenerateChapterFromPlan(p.chapter_no)}
                                   >
@@ -2353,7 +2432,7 @@ export function NovelWorkspace() {
                                   </Button>
                                 </div>
                               </div>
-                              <div className="mt-3 rounded-2xl border border-border/60 bg-background/50 px-3 py-2.5 whitespace-pre-wrap text-muted-foreground">
+                              <div className="mt-3 rounded-2xl border border-border/60 bg-background/50 px-3 py-2.5 whitespace-pre-wrap text-foreground/80 dark:text-muted-foreground font-medium">
                                 {formatVolumePlanBeatsText(p.beats)}
                               </div>
                             </div>
@@ -2370,40 +2449,40 @@ export function NovelWorkspace() {
           <TabsContent value="chapters" className="glass-panel space-y-4 p-5 md:p-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading">创作区</p>
-                <p className="text-sm text-muted-foreground">
+                <p className="section-heading text-foreground font-bold">创作区</p>
+                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
                   这里集中处理续写、审定、日志和章节助手，把最常用的动作放在页面最上方，减少反复滚动寻找按钮。
                 </p>
               </div>
-              <div className="glass-chip">
+              <div className="glass-chip font-bold text-foreground/80">
                 {frameworkConfirmed ? "框架已确认，可直接进入批量续写" : "请先确认框架，再开始续写"}
               </div>
             </div>
             <div className="grid gap-3 md:grid-cols-3">
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">章节总数</p>
-                <p className="mt-2 text-xl font-semibold text-foreground">{chapters.length}</p>
-                <p className="mt-1 text-xs text-muted-foreground">包含草稿与已审定章节</p>
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">章节总数</p>
+                <p className="mt-2 text-xl font-bold text-foreground">{chapters.length}</p>
+                <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">包含草稿与已审定章节</p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">已审定</p>
-                <p className="mt-2 text-xl font-semibold text-foreground">{approvedChapterCount}</p>
-                <p className="mt-1 text-xs text-muted-foreground">可参与记忆和后续衔接</p>
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">已审定</p>
+                <p className="mt-2 text-xl font-bold text-foreground">{approvedChapterCount}</p>
+                <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">可参与记忆和后续衔接</p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">当前建议</p>
-                <p className="mt-2 text-sm font-medium text-foreground">
+                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前建议</p>
+                <p className="mt-2 text-sm font-bold text-foreground">
                   {draftChapterCount ? "优先审定草稿，避免记忆滞后" : "可继续续写或做一致性修订"}
                 </p>
               </div>
             </div>
             <div className="glass-panel-subtle space-y-3 p-4">
               <div className="flex flex-wrap items-center gap-2">
-                <Label>一次生成</Label>
+                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">一次生成</Label>
                 <select
                   value={generateCount}
                   onChange={(e) => setGenerateCount(Number(e.target.value))}
-                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-sm"
+                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-sm text-foreground font-bold"
                 >
                   {[1, 2, 3, 4, 5].map((n) => (
                     <option key={n} value={n}>
@@ -2414,6 +2493,7 @@ export function NovelWorkspace() {
                 <Button
                   type="button"
                   size="sm"
+                  className="font-bold"
                   disabled={busy || !frameworkConfirmed}
                   onClick={() => confirmGenerateChapters()}
                 >
@@ -2423,6 +2503,7 @@ export function NovelWorkspace() {
                   type="button"
                   size="sm"
                   variant="secondary"
+                  className="font-bold"
                   disabled={busy || !frameworkConfirmed}
                   onClick={() => setAutoGenerateDialogOpen(true)}
                 >
@@ -2432,16 +2513,17 @@ export function NovelWorkspace() {
                   type="button"
                   size="sm"
                   variant="secondary"
+                  className="font-bold"
                   onClick={() => setChapterChatOpen(true)}
                 >
                   章节助手对话
                 </Button>
               </div>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-muted-foreground">
+              <div className="flex flex-wrap items-center gap-3 text-xs text-foreground/70 dark:text-muted-foreground font-bold">
                 {generateDisabledReason ? (
-                  <span className="font-medium text-amber-500">{generateDisabledReason}</span>
+                  <span className="font-bold text-amber-600">{generateDisabledReason}</span>
                 ) : null}
-                <label className="inline-flex items-center gap-2">
+                <label className="inline-flex items-center gap-2 cursor-pointer">
                   <input
                     type="checkbox"
                     checked={useColdRecall}
@@ -2455,7 +2537,7 @@ export function NovelWorkspace() {
                     <select
                       value={coldRecallItems}
                       onChange={(e) => setColdRecallItems(Number(e.target.value))}
-                      className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-sm"
+                      className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-xs text-foreground font-bold"
                     >
                       {[3, 5, 8, 10, 12].map((n) => (
                         <option key={n} value={n}>
@@ -2468,9 +2550,70 @@ export function NovelWorkspace() {
               </div>
             </div>
             {generateTrace ? (
-              <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-muted-foreground">{generateTrace}</p>
+              <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">{generateTrace}</p>
             ) : null}
             
+            <Dialog open={exportOpen} onOpenChange={setExportOpen}>
+              <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden flex flex-col">
+                <DialogHeader>
+                  <DialogTitle>全文本导出</DialogTitle>
+                  <DialogDescription>
+                    选择章节范围，一键拼接所有已审定或草稿正文，方便发布或备份。
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>起始章号</Label>
+                    <Input
+                      type="number"
+                      value={exportStartNo}
+                      onChange={(e) => setExportStartNo(Number(e.target.value))}
+                    />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>截止章号</Label>
+                    <Input
+                      type="number"
+                      value={exportEndNo}
+                      onChange={(e) => setExportEndNo(Number(e.target.value))}
+                    />
+                  </div>
+                </div>
+                <div className="flex-1 overflow-hidden flex flex-col mt-4 gap-3">
+                  <div className="flex items-center justify-between">
+                    <Label>导出内容预览</Label>
+                    {exportContent && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        className="h-7 text-xs"
+                        onClick={() => {
+                          void navigator.clipboard.writeText(exportContent);
+                          alert("已复制到剪贴板");
+                        }}
+                      >
+                        复制全文本
+                      </Button>
+                    )}
+                  </div>
+                  <textarea
+                    value={exportContent}
+                    readOnly
+                    placeholder="点击“开始导出”后在此显示内容..."
+                    className="field-shell-textarea flex-1 font-sans text-sm leading-relaxed"
+                  />
+                </div>
+                <DialogFooter className="mt-4">
+                  <Button variant="outline" onClick={() => setExportOpen(false)}>
+                    关闭
+                  </Button>
+                  <Button onClick={handleExport} disabled={exportBusy}>
+                    {exportBusy ? "正在导出..." : "开始导出"}
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+
             <Dialog open={chapterChatOpen} onOpenChange={setChapterChatOpen}>
               <DialogContent className="max-h-[88vh] max-w-3xl overflow-hidden">
                 <DialogHeader>
@@ -2511,7 +2654,7 @@ export function NovelWorkspace() {
                         size="sm"
                         variant="outline"
                         disabled={chapterChatBusy}
-                        onClick={() => confirmSendChapterQuickPrompt(p.prompt, p.label)}
+                        onClick={() => confirmSendChapterQuickPrompt(p.prompt)}
                         className="text-xs"
                         title={p.prompt}
                       >
@@ -2605,7 +2748,7 @@ export function NovelWorkspace() {
             <div className="grid gap-4 lg:grid-cols-12">
               <aside className="glass-panel-subtle lg:col-span-4 p-4 flex flex-col overflow-hidden max-h-[85vh]">
                 <div className="mb-4 shrink-0 space-y-2">
-                  <p className="text-xs font-medium text-muted-foreground">按卷浏览</p>
+                  <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">按卷浏览</p>
                   {volumes.length > 0 ? (
                     <div className="flex flex-wrap gap-1.5">
                       {volumes.map((v, i) => (
@@ -2613,10 +2756,10 @@ export function NovelWorkspace() {
                           key={v.id}
                           type="button"
                           onClick={() => setChapterVolumeId(v.id)}
-                          className={`rounded-full px-3 py-1 text-[10px] transition-all border ${
+                          className={`rounded-full px-3 py-1 text-[10px] transition-all border font-bold ${
                             (chapterVolumeId || volumes[0].id) === v.id
                               ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                              : "bg-background/40 text-muted-foreground border-border/50 hover:bg-muted/30"
+                              : "bg-background/40 text-foreground/60 dark:text-muted-foreground border-border/50 hover:bg-muted/30"
                           }`}
                           title={v.title || `第${i + 1}卷`}
                         >
@@ -2625,11 +2768,24 @@ export function NovelWorkspace() {
                       ))}
                     </div>
                   ) : (
-                    <p className="text-[10px] text-muted-foreground">尚无分卷</p>
+                    <p className="text-[10px] text-foreground/50 dark:text-muted-foreground italic font-medium">尚无分卷</p>
                   )}
                 </div>
                 
-                <p className="mb-2 shrink-0 text-xs font-medium text-muted-foreground">章节目录</p>
+                <div className="mb-2 flex items-center justify-between shrink-0">
+                  <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">章节目录</p>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 text-[10px] text-primary hover:text-primary hover:bg-primary/10 font-bold"
+                    onClick={() => {
+                      setExportContent("");
+                      setExportOpen(true);
+                    }}
+                  >
+                    一键导出正文
+                  </Button>
+                </div>
                 <div className="soft-scroll space-y-2 overflow-auto pr-1 flex-1">
                   {filteredChapters.map((ch) => (
                     <button
@@ -2642,27 +2798,27 @@ export function NovelWorkspace() {
                           : "border-border bg-background/40 hover:bg-muted/30"
                       }`}
                     >
-                      <div className="flex items-center gap-2 font-medium">
+                      <div className="flex items-center gap-2 font-bold text-foreground">
                         <span>
                           第{ch.chapter_no}章 {ch.title}
                         </span>
                         {ch.pending_content ? (
-                          <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-300">
+                          <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 font-bold">
                             <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
                             待确认修订
                           </span>
                         ) : null}
                       </div>
-                      <div className="mt-1 text-muted-foreground">
+                      <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium italic">
                         {ch.status} · {ch.source}
                       </div>
                       <div className="mt-2">
                         <span
                           role="button"
                           tabIndex={0}
-                          className={`inline-block rounded-full px-2.5 py-1 text-[11px] transition-colors ${
+                          className={`inline-block rounded-full px-2.5 py-1 text-[11px] transition-colors font-bold ${
                             busy
-                              ? "cursor-not-allowed text-muted-foreground"
+                              ? "cursor-not-allowed text-foreground/40 dark:text-muted-foreground"
                               : "cursor-pointer text-destructive hover:bg-destructive/10"
                           }`}
                           onClick={(e) => {
@@ -2684,83 +2840,84 @@ export function NovelWorkspace() {
                     </button>
                   ))}
                   {filteredChapters.length === 0 ? (
-                    <p className="text-xs text-muted-foreground py-8 text-center">当前卷暂无章节</p>
+                    <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium py-8 text-center">当前卷暂无章节</p>
                   ) : null}
                 </div>
               </aside>
 
               <section className="glass-panel-subtle lg:col-span-8 p-5">
                 {!selectedChapter ? (
-                  <p className="text-sm text-muted-foreground">请选择左侧章节。</p>
+                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧章节。</p>
                 ) : (
                   <div className="space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-medium text-foreground">
+                        <span className="font-bold text-foreground">
                           第{selectedChapter.chapter_no}章
                         </span>
-                        <span className="status-badge">
+                        <span className="status-badge font-bold">
                           {selectedChapter.status}
                         </span>
-                        <span className="status-badge">
+                        <span className="status-badge font-bold">
                           来源：{selectedChapter.source}
                         </span>
                       </div>
-                      <div className="glass-chip">
+                      <div className="glass-chip font-bold text-foreground/80">
                         正文约 {selectedChapterWordCount} 字
                       </div>
                     </div>
                     <div className="grid gap-3 sm:grid-cols-3">
                       <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-muted-foreground">当前状态</p>
-                        <p className="mt-2 text-sm font-semibold text-foreground">
+                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前状态</p>
+                        <p className="mt-2 text-sm font-bold text-foreground">
                           {selectedChapter.status}
                         </p>
-                        <p className="mt-1 text-xs text-muted-foreground">
+                        <p className="mt-1 text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
                           {selectedChapter.pending_content ? "存在待确认修订稿" : "正在编辑正式稿"}
                         </p>
                       </div>
                       <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-muted-foreground">来源</p>
-                        <p className="mt-2 text-sm font-semibold text-foreground">
+                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">来源</p>
+                        <p className="mt-2 text-sm font-bold text-foreground">
                           {selectedChapter.source}
                         </p>
-                        <p className="mt-1 text-xs text-muted-foreground">
+                        <p className="mt-1 text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
                           用于区分自动生成、人工编辑或修订稿来源
                         </p>
                       </div>
                       <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-muted-foreground">建议操作</p>
-                        <p className="mt-2 text-sm font-semibold text-foreground">
+                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议操作</p>
+                        <p className="mt-2 text-sm font-bold text-foreground">
                           {selectedChapter.pending_content ? "先确认或放弃修订稿" : "保存后做审定或一致性修订"}
                         </p>
                       </div>
                     </div>
                     <div className="glass-panel-subtle space-y-4 p-4">
                       <div className="space-y-2">
-                        <Label>章节标题</Label>
+                        <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">章节标题</Label>
                         <input
                           value={editTitle}
                           onChange={(e) => setEditTitle(e.target.value)}
-                          className="field-shell w-full"
+                          className="field-shell w-full text-foreground font-bold"
                         />
                       </div>
                       <div className="space-y-2">
                         <div className="flex flex-wrap items-center justify-between gap-2">
-                          <Label>正式稿（可直接编辑）</Label>
-                          <span className="text-xs text-muted-foreground">
+                          <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">正式稿（可直接编辑）</Label>
+                          <span className="text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
                             适合直接精修正文、补对话和调整节奏
                           </span>
                         </div>
                         <textarea
                           value={editContent}
                           onChange={(e) => setEditContent(e.target.value)}
-                          className="field-shell-textarea min-h-[300px]"
+                          className="field-shell-textarea min-h-[300px] text-foreground text-sm font-medium leading-relaxed"
                         />
                         <div className="flex flex-wrap gap-2">
                           <Button
                             type="button"
                             size="sm"
+                            className="font-bold"
                             disabled={busy || !editContent.trim()}
                             onClick={() =>
                               run(() =>
@@ -2777,7 +2934,7 @@ export function NovelWorkspace() {
                             type="button"
                             size="sm"
                             variant="outline"
-                            className="text-destructive hover:border-destructive/40 hover:bg-destructive/10"
+                            className="text-destructive font-bold hover:border-destructive/40 hover:bg-destructive/10"
                             disabled={busy}
                             onClick={() =>
                               void runDeleteChapter({
@@ -2798,25 +2955,26 @@ export function NovelWorkspace() {
                       <div className="glass-panel-subtle space-y-3 p-4">
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div>
-                            <p className="text-sm font-medium text-foreground">修订与审定</p>
-                            <p className="mt-1 text-xs text-muted-foreground">
+                            <p className="text-sm font-bold text-foreground">修订与审定</p>
+                            <p className="mt-1 text-xs text-foreground/70 dark:text-muted-foreground font-medium italic">
                               把一致性修订、反馈记录和最终审定收拢在一起，减少来回找按钮。
                             </p>
                           </div>
-                          <span className="status-badge">高频操作区</span>
+                          <span className="status-badge font-bold">高频操作区</span>
                         </div>
                         {selectedChapter.pending_content ? (
                           <div className="rounded-[1.4rem] border border-amber-500/40 bg-amber-500/5 p-4">
-                            <p className="mb-1 text-xs font-medium text-amber-800 dark:text-amber-200">
+                            <p className="mb-1 text-xs font-bold text-amber-800 dark:text-amber-200">
                               待确认修订稿
                             </p>
-                            <pre className="mb-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-2xl border border-amber-500/20 bg-background/50 p-3 text-xs">
+                            <pre className="mb-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-2xl border border-amber-500/20 bg-background/50 p-3 text-xs text-foreground font-medium leading-relaxed">
                               {selectedChapter.pending_content}
                             </pre>
                             <div className="flex flex-wrap gap-2">
                               <Button
                                 type="button"
                                 size="sm"
+                                className="font-bold"
                                 disabled={busy}
                                 onClick={() => run(() => applyChapterRevision(selectedChapter.id))}
                               >
@@ -2826,6 +2984,7 @@ export function NovelWorkspace() {
                                 type="button"
                                 size="sm"
                                 variant="outline"
+                                className="font-bold"
                                 disabled={busy}
                                 onClick={() => run(() => discardChapterRevision(selectedChapter.id))}
                               >
@@ -2836,19 +2995,20 @@ export function NovelWorkspace() {
                         ) : null}
 
                         <div className="space-y-2">
-                          <Label>改进意见（可多条，会并入改稿模型）</Label>
+                          <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">改进意见（可多条，会并入改稿模型）</Label>
                           <textarea
                             value={fbDraft[selectedChapter.id] ?? ""}
                             onChange={(e) =>
                               setFbDraft((d) => ({ ...d, [selectedChapter.id]: e.target.value }))
                             }
-                            className="field-shell-textarea min-h-[104px]"
+                            className="field-shell-textarea min-h-[104px] text-sm text-foreground font-medium"
                           />
                           <div className="flex flex-wrap gap-2">
                             <Button
                               type="button"
                               size="sm"
                               variant="secondary"
+                              className="font-bold text-foreground/80"
                               disabled={busy || !selectedChapter.content?.trim()}
                               onClick={() => confirmConsistencyFix(selectedChapter.id)}
                             >
@@ -2858,6 +3018,7 @@ export function NovelWorkspace() {
                               type="button"
                               size="sm"
                               variant="secondary"
+                              className="font-bold text-foreground/80"
                               disabled={busy || !(fbDraft[selectedChapter.id]?.trim())}
                               onClick={() =>
                                 run(async () => {
@@ -2874,6 +3035,7 @@ export function NovelWorkspace() {
                             <Button
                               type="button"
                               size="sm"
+                              className="font-bold"
                               disabled={busy}
                               onClick={() => confirmApproveChapter(selectedChapter.id)}
                             >
@@ -2883,6 +3045,7 @@ export function NovelWorkspace() {
                               type="button"
                               size="sm"
                               variant="outline"
+                              className="font-semibold"
                               disabled={busy || !selectedChapter.content?.trim()}
                               onClick={() => void runRetryChapterMemory(selectedChapter.id)}
                               title="即使已审定，也重新提取本章增量记忆并写入记忆账本"
@@ -2895,8 +3058,8 @@ export function NovelWorkspace() {
 
                       <div className="glass-panel-subtle space-y-3 p-4">
                         <div>
-                          <p className="text-sm font-medium text-foreground">按指令改稿</p>
-                          <p className="mt-1 text-xs text-muted-foreground">
+                          <p className="text-sm font-bold text-foreground">按指令改稿</p>
+                          <p className="mt-1 text-xs text-foreground/70 dark:text-muted-foreground font-medium italic">
                             给模型明确修改方向，适合做局部风格强化、节奏压缩或结尾重写。
                           </p>
                         </div>
@@ -2908,13 +3071,14 @@ export function NovelWorkspace() {
                               [selectedChapter.id]: e.target.value,
                             }))
                           }
-                          className="field-shell-textarea min-h-[180px]"
+                          className="field-shell-textarea min-h-[180px] text-sm text-foreground font-medium"
                           placeholder="例如：加强对话张力、压缩环境描写、按第三条反馈改结尾……"
                         />
                         <Button
                           type="button"
                           size="sm"
                           variant="secondary"
+                          className="font-bold text-foreground/80"
                           disabled={busy || !(revisePrompt[selectedChapter.id]?.trim())}
                           onClick={() =>
                             confirmReviseChapter(
@@ -3542,11 +3706,11 @@ export function NovelWorkspace() {
             {memoryNorm?.outline?.forbidden_constraints &&
             memoryNorm.outline.forbidden_constraints.length > 0 ? (
               <div className="glass-panel-subtle space-y-2 p-4">
-                <p className="text-sm font-medium text-foreground">硬约束 forbidden_constraints</p>
-                <p className="text-[11px] text-muted-foreground">
+                <p className="text-sm font-bold text-foreground">硬约束 forbidden_constraints</p>
+                <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
                   全局禁止触碰的设定底线；续写与审定时请对照。
                 </p>
-                <ul className="max-h-[min(40vh,320px)] space-y-1.5 overflow-y-auto soft-scroll rounded-xl border border-border/60 bg-muted/20 p-3 text-xs text-muted-foreground">
+                <ul className="max-h-[min(40vh,320px)] space-y-1.5 overflow-y-auto soft-scroll rounded-xl border border-border/60 bg-muted/20 p-3 text-xs text-foreground/70 dark:text-muted-foreground font-medium leading-relaxed">
                   {slicePage(
                     memoryNorm.outline.forbidden_constraints,
                     structuredPages.forbidden_fc ?? 0,
@@ -3559,7 +3723,7 @@ export function NovelWorkspace() {
                 </ul>
                 {memoryNorm.outline.forbidden_constraints.length > STRUCTURED_LIST_PAGE ? (
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-[11px] text-muted-foreground">
+                    <span className="text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">
                       共 {memoryNorm.outline.forbidden_constraints.length} 条
                     </span>
                     <div className="flex items-center gap-2">
@@ -3567,7 +3731,7 @@ export function NovelWorkspace() {
                         type="button"
                         size="sm"
                         variant="ghost"
-                        className="h-7 text-xs"
+                        className="h-7 text-xs font-bold"
                         disabled={(structuredPages.forbidden_fc ?? 0) <= 0}
                         onClick={() =>
                           setStructuredPages((s) => ({
@@ -3578,7 +3742,7 @@ export function NovelWorkspace() {
                       >
                         上一页
                       </Button>
-                      <span className="text-[11px] tabular-nums">
+                      <span className="text-[11px] tabular-nums font-bold">
                         {(structuredPages.forbidden_fc ?? 0) + 1} /{" "}
                         {Math.ceil(
                           memoryNorm.outline.forbidden_constraints.length /
@@ -3589,7 +3753,7 @@ export function NovelWorkspace() {
                         type="button"
                         size="sm"
                         variant="ghost"
-                        className="h-7 text-xs"
+                        className="h-7 text-xs font-bold"
                         disabled={
                           (structuredPages.forbidden_fc ?? 0) >=
                           Math.ceil(
@@ -3819,16 +3983,16 @@ export function NovelWorkspace() {
                 <DialogHeader>
                   <div className="flex items-center justify-between gap-4 mr-8">
                     <div className="min-w-0 flex-1">
-                      <DialogTitle>章节生成日志</DialogTitle>
-                      <DialogDescription>
-                        支持按 batch_id 过滤，避免页面被日志持续撑长。
+                      <DialogTitle className="text-xl font-bold">章节生成日志</DialogTitle>
+                      <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
+                        支持按任务批次过滤，避免页面被日志持续撑长。
                       </DialogDescription>
                     </div>
                     <Button
                       variant="outline"
                       size="sm"
                       onClick={runClearGenerationLogs}
-                      className="text-destructive hover:bg-destructive/10 hover:text-destructive shrink-0"
+                      className="text-destructive font-bold hover:bg-destructive/10 hover:text-destructive shrink-0"
                     >
                       清空日志
                     </Button>
@@ -3839,8 +4003,8 @@ export function NovelWorkspace() {
                     <div className="inline-flex overflow-hidden rounded-2xl border border-border/70 bg-background/60 p-1">
                       <button
                         type="button"
-                        className={`rounded-xl px-3 py-1.5 text-xs transition-all ${
-                          logViewMode === "all" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-muted-foreground"
+                        className={`rounded-xl px-3 py-1.5 text-xs transition-all font-bold ${
+                          logViewMode === "all" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-foreground/60 dark:text-muted-foreground"
                         }`}
                         onClick={() => setLogViewMode("all")}
                       >
@@ -3848,8 +4012,8 @@ export function NovelWorkspace() {
                       </button>
                       <button
                         type="button"
-                        className={`rounded-xl px-3 py-1.5 text-xs transition-all ${
-                          logViewMode === "batch" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-muted-foreground"
+                        className={`rounded-xl px-3 py-1.5 text-xs transition-all font-bold ${
+                          logViewMode === "batch" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-foreground/60 dark:text-muted-foreground"
                         }`}
                         onClick={() => {
                           setLogViewMode("batch");
@@ -3864,11 +4028,11 @@ export function NovelWorkspace() {
                     <input
                       value={logBatchId}
                       onChange={(e) => setLogBatchId(e.target.value)}
-                      placeholder="可填 batch_id 手动过滤"
-                      className="field-shell h-10 w-full md:w-80"
+                      placeholder="可填批次编号手动过滤"
+                      className="field-shell h-10 w-full md:w-80 text-foreground font-bold placeholder:text-foreground/30"
                       disabled={logViewMode !== "batch"}
                     />
-                    <label className="inline-flex items-center gap-2 text-xs text-muted-foreground">
+                    <label className="inline-flex items-center gap-2 text-xs text-foreground/70 dark:text-muted-foreground font-bold cursor-pointer">
                       <input
                         type="checkbox"
                         checked={logOnlyError}
@@ -3880,6 +4044,7 @@ export function NovelWorkspace() {
                       type="button"
                       size="sm"
                       variant="outline"
+                      className="font-bold"
                       disabled={logBusy}
                       onClick={() =>
                         void reloadGenerationLogs(
@@ -3891,7 +4056,7 @@ export function NovelWorkspace() {
                     </Button>
                   </div>
                   <div className="glass-panel-subtle p-3">
-                    <div className="mb-1 flex items-center justify-between text-xs">
+                    <div className="mb-1 flex items-center justify-between text-xs font-bold text-foreground/80">
                       <span>
                         记忆刷新进度：{refreshStatus === "queued"
                           ? "已入队"
@@ -3913,21 +4078,21 @@ export function NovelWorkspace() {
                         style={{ width: `${Math.max(0, Math.min(100, refreshProgress))}%` }}
                       />
                     </div>
-                    <p className="mt-1 text-[11px] text-muted-foreground">
-                      批次：{refreshBatchId || "-"} · 开始：{formatUtc8(refreshStartedAt)} · 更新时间：
+                    <p className="mt-1 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                      任务批次：{refreshBatchId || "-"} · 开始：{formatUtc8(refreshStartedAt)} · 更新时间：
                       {formatUtc8(refreshUpdatedAt)}
                     </p>
-                    <p className="text-[11px] text-muted-foreground">
+                    <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                       已运行时长：{formatDuration(refreshElapsedSeconds)} · 最近成功版本：
                       {latestRefreshVersion == null ? "-" : `v${latestRefreshVersion}`}
                     </p>
                     {refreshLastMessage ? (
-                      <p className="text-[11px] text-muted-foreground">{refreshLastMessage}</p>
+                      <p className="text-[11px] text-foreground/70 dark:text-muted-foreground font-bold italic">{refreshLastMessage}</p>
                     ) : null}
                   </div>
                   <div className="soft-scroll max-h-[55vh] overflow-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-3 font-mono text-xs">
                     {genLogs.length === 0 ? (
-                      <p className="text-muted-foreground">
+                      <p className="text-foreground/50 dark:text-muted-foreground italic">
                         暂无日志。点击“自动续写”或“审定通过”后可在此查看过程细节。
                       </p>
                     ) : (
@@ -3938,16 +4103,16 @@ export function NovelWorkspace() {
                             key={l.id}
                             className="border-b border-border/50 py-3 last:border-b-0"
                           >
-                            <div>
-                              <span className="text-muted-foreground">
-                                [{formatUtc8(l.created_at)}] [{l.level}] [{l.batch_id}]
+                            <div className="font-medium">
+                              <span className="text-foreground/50 dark:text-muted-foreground">
+                                [{formatUtc8(l.created_at)}] [{l.level === 'error' ? '错误' : l.level === 'warning' ? '警告' : '信息'}]
                               </span>{" "}
-                              <span>
-                                {l.chapter_no ? `第${l.chapter_no}章` : "-"} · {l.event} · {l.message}
+                              <span className="text-foreground/90 dark:text-inherit">
+                                {l.chapter_no ? `第${l.chapter_no}章` : "-"} · {l.message}
                               </span>
                             </div>
                             {metaView.summary.length ? (
-                              <div className="mt-2 rounded-2xl border border-border/60 bg-background/60 px-3 py-2 text-[11px] text-foreground/90">
+                              <div className="mt-2 rounded-2xl border border-border/60 bg-background/60 px-3 py-2 text-[11px] text-foreground/90 font-medium">
                                 {metaView.summary.map((item, idx) => (
                                   <p key={`${l.id}-summary-${idx}`}>{item}</p>
                                 ))}
@@ -3955,10 +4120,10 @@ export function NovelWorkspace() {
                             ) : null}
                             {metaView.detail ? (
                               <details className="mt-2 rounded-2xl border border-border/60 bg-background/40 px-3 py-2">
-                                <summary className="cursor-pointer text-[11px] text-muted-foreground">
-                                  查看 meta 详情
+                                <summary className="cursor-pointer text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">
+                                  查看技术详情
                                 </summary>
-                                <pre className="mt-2 whitespace-pre-wrap text-[11px] text-muted-foreground">
+                                <pre className="mt-2 whitespace-pre-wrap text-[11px] text-foreground/70 dark:text-muted-foreground">
                                   {metaView.detail}
                                 </pre>
                               </details>
@@ -3976,14 +4141,14 @@ export function NovelWorkspace() {
       <Dialog open={novelSettingsOpen} onOpenChange={setNovelSettingsOpen}>
         <DialogContent className="max-w-md">
           <DialogHeader>
-            <DialogTitle>小说设置</DialogTitle>
-            <DialogDescription>
+            <DialogTitle className="text-xl font-bold">小说设置</DialogTitle>
+            <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
               配置当前小说的总章节数和每日自动撰写计划。
             </DialogDescription>
           </DialogHeader>
           <div className="space-y-4 py-4">
             <div className="space-y-2">
-              <Label htmlFor="target_chapters">目标总章节数</Label>
+              <Label htmlFor="target_chapters" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">目标总章节数</Label>
               <Input
                 id="target_chapters"
                 type="number"
@@ -3991,12 +4156,12 @@ export function NovelWorkspace() {
                 max={20000}
                 value={novelSettingsDraft.target_chapters}
                 onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, target_chapters: Number(e.target.value) })}
-                className="field-shell"
+                className="field-shell text-foreground font-bold"
               />
-              <p className="text-[11px] text-muted-foreground">该小说的预计总章节数。</p>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">该小说的预计总章节数。</p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="daily_auto_chapters">每日自动撰写章数</Label>
+              <Label htmlFor="daily_auto_chapters" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写章数</Label>
               <Input
                 id="daily_auto_chapters"
                 type="number"
@@ -4004,27 +4169,27 @@ export function NovelWorkspace() {
                 max={50}
                 value={novelSettingsDraft.daily_auto_chapters}
                 onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, daily_auto_chapters: Number(e.target.value) })}
-                className="field-shell"
+                className="field-shell text-foreground font-bold"
               />
-              <p className="text-[11px] text-muted-foreground">设定为 0 表示不开启每日自动撰写。如果不为 0，系统将在指定时间自动在后台为你续写小说。</p>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">设定为 0 表示不开启每日自动撰写。如果不为 0，系统将在指定时间自动在后台为你续写小说。</p>
             </div>
             <div className="space-y-2">
-              <Label htmlFor="daily_auto_time">每日自动撰写时间（北京时间）</Label>
+              <Label htmlFor="daily_auto_time" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写时间（北京时间）</Label>
               <Input
                 id="daily_auto_time"
                 type="time"
                 value={novelSettingsDraft.daily_auto_time}
                 onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, daily_auto_time: e.target.value })}
-                className="field-shell"
+                className="field-shell text-foreground font-bold"
               />
-              <p className="text-[11px] text-muted-foreground">每天的这个时间（北京时间 / UTC+8）触发后台自动生成任务。</p>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">由后台系统自动执行。</p>
             </div>
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setNovelSettingsOpen(false)} disabled={novelSettingsBusy}>
+            <Button variant="outline" className="font-semibold" onClick={() => setNovelSettingsOpen(false)} disabled={novelSettingsBusy}>
               取消
             </Button>
-            <Button onClick={handleSaveNovelSettings} disabled={novelSettingsBusy}>
+            <Button className="font-bold" onClick={handleSaveNovelSettings} disabled={novelSettingsBusy}>
               {novelSettingsBusy ? "保存中..." : "保存设置"}
             </Button>
           </DialogFooter>

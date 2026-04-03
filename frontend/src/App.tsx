@@ -1,7 +1,8 @@
-import { Navigate, Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes, Outlet } from "react-router-dom";
 import { AppLayout } from "@/components/AppLayout";
 import { AdminRoute, ProtectedRoute } from "@/components/ProtectedRoute";
 import { UserBootstrap } from "@/components/UserBootstrap";
+import { useAuthStore } from "@/stores/authStore";
 import { Admin } from "@/pages/Admin";
 import { Dashboard } from "@/pages/Dashboard";
 import { Landing } from "@/pages/Landing";
@@ -11,17 +12,20 @@ import { NovelShelf } from "@/pages/NovelShelf";
 import { NovelWorkspace } from "@/pages/NovelWorkspace";
 import { NovelMetricsPage } from "@/pages/NovelMetrics";
 import { ProjectManagement } from "@/pages/ProjectManagement";
-import { SettingsPage } from "@/pages/Settings";
 import { WorkflowEditor } from "@/pages/WorkflowEditor";
 import { Register } from "@/pages/Register";
 import { Recharge } from "@/pages/Recharge";
 
 export default function App() {
+  const user = useAuthStore((s) => s.user);
+
   return (
     <>
       <UserBootstrap />
       <Routes>
-        <Route path="/" element={<Landing />} />
+        <Route element={user ? <AppLayout /> : <Outlet />}>
+          <Route path="/" element={<Landing />} />
+        </Route>
         <Route path="/legacy-home" element={<Dashboard />} />
         <Route path="/login" element={<Login />} />
         <Route path="/register" element={<Register />} />
@@ -51,14 +55,6 @@ export default function App() {
             element={
               <AdminRoute>
                 <ProjectManagement />
-              </AdminRoute>
-            }
-          />
-          <Route
-            path="/settings"
-            element={
-              <AdminRoute>
-                <SettingsPage />
               </AdminRoute>
             }
           />

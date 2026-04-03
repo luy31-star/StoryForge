@@ -24,7 +24,7 @@ services:
     ports:
       - "8000:8000"
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
       - CORS_ORIGINS=http://localhost:3000
     env_file:
@@ -32,53 +32,71 @@ services:
     volumes:
       - ../backend/uploads/novels:/app/backend/uploads/novels
     depends_on:
-      - postgres
-      - redis
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   celery-worker:
     image: vocalflow-studio-backend-dev
     working_dir: /app/backend
     command: celery -A app.tasks.celery_app worker -l info -Q vocalflow
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
     env_file:
       - ../.env
     volumes:
       - ../backend/uploads/novels:/app/backend/uploads/novels
     depends_on:
-      - postgres
-      - redis
-      - backend
+      mysql:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
 
   celery-beat:
     image: vocalflow-studio-backend-dev
     working_dir: /app/backend
     command: celery -A app.tasks.celery_app beat -l info
     environment:
-      - DATABASE_URL=postgresql://user:password@postgres:5432/vocalflow
+      - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
     env_file:
       - ../.env
     depends_on:
-      - redis
-      - backend
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_started
 
-  postgres:
-    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/postgres:14
+  mysql:
+    image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/mysql:8
     environment:
-      POSTGRES_DB: vocalflow
-      POSTGRES_USER: user
-      POSTGRES_PASSWORD: password
+      MYSQL_DATABASE: vocalflow
+      MYSQL_USER: user
+      MYSQL_PASSWORD: password
+      MYSQL_ROOT_PASSWORD: rootpassword
     ports:
-      - "5432:5432"
+      - "3306:3306"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - mysqldata:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "user", "-ppassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
   redis:
     image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/redis:alpine
     ports:
       - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
 
 volumes:
-  pgdata:
+  mysqldata:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,13 +11,15 @@ from app.core.database import Base, engine
 from app.core.db_migrate import (
     ensure_app_config_columns,
     ensure_app_config_row,
+    ensure_model_price_split_columns,
     ensure_novel_memory_norm_extended_columns,
     ensure_novel_target_chapters,
+    ensure_user_config_columns,
     ensure_user_isolation_columns,
     relax_novel_memory_norm_columns,
 )
 from app.core.database import SessionLocal
-from app.core.seed_data import ensure_default_model_prices
+from app.services.runtime_llm_config import ensure_app_config_llm_model_filled
 import app.models.app_config  # noqa: F401 — ensure metadata registers
 import app.models.user  # noqa: F401 — users / billing 表
 import app.models.novel  # noqa: F401 — 确保 metadata 建表
@@ -68,18 +71,36 @@ app.include_router(websocket.router)
 
 @app.on_event("startup")
 def on_startup() -> None:
-    Base.metadata.create_all(bind=engine)
+    # 数据库连接重试逻辑
+    max_retries = 5
+    retry_interval = 5
+    last_exc = None
+    for i in range(max_retries):
+        try:
+            Base.metadata.create_all(bind=engine)
+            break
+        except Exception as e:
+            last_exc = e
+            logger.warning(f"Database connection failed (attempt {i+1}/{max_retries}), retrying in {retry_interval}s... err={e}")
+            time.sleep(retry_interval)
+    else:
+        logger.error("Failed to connect to database after several attempts.")
+        if last_exc:
+            raise last_exc
+
     ensure_user_isolation_columns(engine)
+    ensure_user_config_columns(engine)
     ensure_novel_target_chapters(engine)
     ensure_novel_memory_norm_extended_columns(engine)
     relax_novel_memory_norm_columns(engine)
+    ensure_model_price_split_columns(engine)
     ensure_app_config_columns(engine)
     ensure_app_config_row(engine)
     db = SessionLocal()
     try:
-        ensure_default_model_prices(db)
+        ensure_app_config_llm_model_filled(db)
     except Exception:
-        logger.exception("ensure_default_model_prices failed")
+        logger.exception("ensure_app_config_llm_model_filled failed")
     finally:
         db.close()
     if settings.oss_region and settings.oss_bucket:

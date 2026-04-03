@@ -78,12 +78,16 @@ export function Admin() {
     }
   }
 
-  async function savePrice(row: ModelPriceRow, value: string) {
+  async function savePrice(row: ModelPriceRow, field: "prompt" | "completion", value: string) {
     const n = parseFloat(value);
     if (Number.isNaN(n) || n < 0) return;
     setErr(null);
     try {
-      await adminPatchModelPrice(row.id, { price_cny_per_million_tokens: n });
+      if (field === "prompt") {
+        await adminPatchModelPrice(row.id, { prompt_price_cny_per_million_tokens: n });
+      } else {
+        await adminPatchModelPrice(row.id, { completion_price_cny_per_million_tokens: n });
+      }
       await reloadPrices();
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "保存失败");
@@ -284,7 +288,7 @@ export function Admin() {
               </CardHeader>
               <CardContent className="space-y-4">
                 {rows.length === 0 && !busy && activeTab === "models" ? (
-                  <p className="text-sm text-muted-foreground">暂无记录（启动后端后会种子默认模型）。</p>
+                  <p className="text-sm text-muted-foreground">暂无记录；请在此添加模型 ID 与单价。</p>
                 ) : null}
                 {rows.map((r) => (
                   <div
@@ -297,12 +301,21 @@ export function Admin() {
                     </div>
                     <div className="flex flex-wrap items-end gap-3">
                       <div className="space-y-1">
-                        <Label className="text-xs">元/百万 token</Label>
+                        <Label className="text-[10px] text-muted-foreground uppercase">输入(元/M)</Label>
                         <input
-                          key={r.id + "-price"}
-                          defaultValue={String(r.price_cny_per_million_tokens)}
-                          className="h-9 w-28 rounded-md border border-input bg-background px-2 text-sm"
-                          onBlur={(e) => void savePrice(r, e.target.value)}
+                          key={r.id + "-prompt"}
+                          defaultValue={String(r.prompt_price_cny_per_million_tokens)}
+                          className="h-9 w-20 rounded-md border border-input bg-background px-2 text-sm"
+                          onBlur={(e) => void savePrice(r, "prompt", e.target.value)}
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <Label className="text-[10px] text-muted-foreground uppercase">输出(元/M)</Label>
+                        <input
+                          key={r.id + "-completion"}
+                          defaultValue={String(r.completion_price_cny_per_million_tokens)}
+                          className="h-9 w-20 rounded-md border border-input bg-background px-2 text-sm"
+                          onBlur={(e) => void savePrice(r, "completion", e.target.value)}
                         />
                       </div>
                       <Button

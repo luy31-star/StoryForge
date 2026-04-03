@@ -851,6 +851,11 @@ def novel_generate_chapters_for_novel(
         )
         try:
             db.rollback()
+            # 更新小说状态为 failed
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -895,6 +900,11 @@ def novel_volume_plan_batch_for_volume(
         )
         try:
             db.rollback()
+            # 更新小说状态为 failed
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -968,6 +978,11 @@ def novel_chapter_consistency_fix(
             db.rollback()
             c2 = db.get(Chapter, chapter_id)
             if c2:
+                # 更新小说状态为 failed
+                n = db.get(Novel, c2.novel_id)
+                if n:
+                    n.status = "failed"
+                
                 append_generation_log(
                     db,
                     novel_id=c2.novel_id,
@@ -1043,6 +1058,11 @@ def novel_chapter_revise(
             db.rollback()
             c2 = db.get(Chapter, chapter_id)
             if c2:
+                # 更新小说状态为 failed
+                n = db.get(Novel, c2.novel_id)
+                if n:
+                    n.status = "failed"
+                
                 append_generation_log(
                     db,
                     novel_id=c2.novel_id,
@@ -1175,6 +1195,12 @@ def novel_ai_create_and_start_task(
         logger.exception("novel_ai_create_and_start_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
             db.rollback()
+            # 更新小说状态为 failed 标识失败
+            from app.models.novel import Novel
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -1268,7 +1294,7 @@ def novel_auto_pipeline_task(
             batch_id=batch_id,
             use_cold_recall=False,
             cold_recall_items=5,
-            auto_consistency_check=bool(settings.novel_consistency_check_chapter),
+            auto_consistency_check=False,
         )
         append_generation_log(
             db,
@@ -1291,6 +1317,11 @@ def novel_auto_pipeline_task(
         logger.exception("novel_auto_pipeline_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
             db.rollback()
+            # 更新小说状态为 failed
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            
             append_generation_log(
                 db,
                 novel_id=novel_id,

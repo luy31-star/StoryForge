@@ -22,6 +22,8 @@ export async function listNovels() {
       intro: string;
       status: string;
       framework_confirmed: boolean;
+      target_chapters: number;
+      length_tag: string;
       daily_auto_chapters: number;
       updated_at: string | null;
     }[]
@@ -45,6 +47,7 @@ export async function getLlmConfig() {
   return r.json() as Promise<{
     provider: string;
     model: string;
+    has_explicit_model: boolean;
     novel_web_search: boolean;
     novel_generate_web_search: boolean;
     novel_volume_plan_web_search: boolean;
@@ -70,6 +73,7 @@ export async function setLlmConfig(payload: {
   return r.json() as Promise<{
     provider: string;
     model: string;
+    has_explicit_model: boolean;
     novel_web_search: boolean;
     novel_generate_web_search: boolean;
     novel_volume_plan_web_search: boolean;
@@ -346,7 +350,26 @@ export async function aiCreateAndStartNovel(body: {
 export async function getNovel(id: string) {
   const r = await apiFetch(`${BASE}/${id}`);
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<Record<string, unknown>>;
+  return r.json() as Promise<{
+    id: string;
+    title: string;
+    intro: string;
+    background: string;
+    style: string;
+    target_chapters: number;
+    length_tag: string;
+    daily_auto_chapters: number;
+    daily_auto_time: string;
+    framework_confirmed: boolean;
+    status: string;
+    [key: string]: any;
+  }>;
+}
+
+export async function exportChapters(novelId: string, startNo: number, endNo: number) {
+  const r = await apiFetch(`${BASE}/${novelId}/export?start_no=${startNo}&end_no=${endNo}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ full_text: string }>;
 }
 
 export async function patchNovel(id: string, body: Record<string, unknown>) {

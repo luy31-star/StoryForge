@@ -255,6 +255,10 @@ def generate_volume_chapter_plan(
             409,
             "当前已有卷章计划生成任务进行中，请在「生成日志」中查看进度后再试",
         )
+        
+    if n.status == "failed":
+        n.status = "active"
+
     logger.info(
         "volume.chapter_plan.generate enqueue | op=%s novel_id=%s volume_id=%s force_regen=%s",
         op,

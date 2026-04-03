@@ -32,6 +32,14 @@ class User(Base):
 
     novels = relationship("Novel", back_populates="owner")
 
+    # 用户个性化 LLM 配置
+    llm_model: Mapped[str] = mapped_column(String(255), default="")
+    novel_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
+    novel_generate_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
+    novel_volume_plan_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
+    novel_memory_refresh_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
+    novel_inspiration_web_search: Mapped[bool] = mapped_column(Boolean, default=True)
+
 
 class ModelPrice(Base):
     """每百万 token 的人民币单价（用户侧按积分扣：见 billing_service）。"""
@@ -42,7 +50,12 @@ class ModelPrice(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     model_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    # 兼容性字段：如果 prompt/completion 未设置，则使用此字段
     price_cny_per_million_tokens: Mapped[float] = mapped_column(Float, default=1.0)
+    # 输入单价
+    prompt_price_cny_per_million_tokens: Mapped[float] = mapped_column(Float, default=1.0)
+    # 输出单价
+    completion_price_cny_per_million_tokens: Mapped[float] = mapped_column(Float, default=1.0)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     display_name: Mapped[str] = mapped_column(String(256), default="")
     updated_at: Mapped[datetime] = mapped_column(
