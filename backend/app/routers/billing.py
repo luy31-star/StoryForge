@@ -164,3 +164,17 @@ def admin_patch_model_price(
         enabled=bool(row.enabled),
         display_name=row.display_name or row.model_id,
     )
+
+
+@admin_router.delete("/model-prices/{price_id}")
+def admin_delete_model_price(
+    price_id: str,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+):
+    row = db.get(ModelPrice, price_id)
+    if not row:
+        raise HTTPException(404, "记录不存在")
+    db.delete(row)
+    db.commit()
+    return {"success": True}

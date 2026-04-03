@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import logging
 import time
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import redis
 from redis.exceptions import RedisError
@@ -26,12 +28,36 @@ from app.services.memory_readable import memory_payload_to_readable_zh
 from app.services.novel_chapter_generate_batch import run_generate_chapters_batch_sync
 from app.services.novel_generation_common import (
     append_generation_log,
+    has_pending_auto_pipeline_batch,
+    has_pending_chapter_generation_batch,
     memory_refresh_confirmation_token,
 )
 from app.services.novel_volume_plan_batch import run_volume_chapter_plan_batch_sync
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
+
+_AUTO_PIPELINE_TASK_NAMES = {
+    "novel.auto_pipeline_task",
+    "novel.ai_create_and_start_task",
+}
+_AUTO_PIPELINE_NONTERMINAL_EVENTS = {
+    "auto_pipeline_queued",
+    "auto_pipeline_start",
+    "auto_pipeline_plan_batch",
+    "auto_pipeline_chapters",
+    "ai_create_queued",
+    "ai_create_brainstorming",
+}
+_AUTO_PIPELINE_TERMINAL_EVENTS = {
+    "auto_pipeline_done",
+    "auto_pipeline_failed",
+    "auto_pipeline_skipped",
+    "auto_pipeline_enqueue_failed",
+    "ai_create_done",
+    "ai_create_failed",
+}
+_AUTO_PIPELINE_STALE_GRACE_SECONDS = 120
 
 
 def _novel_mem_delta_zkey(novel_id: str) -> str:
@@ -40,6 +66,10 @@ def _novel_mem_delta_zkey(novel_id: str) -> str:
 
 def _novel_mem_delta_lock_key(novel_id: str) -> str:
     return f"vocalflow:lock:novel_mem_delta:{novel_id}"
+
+
+def _novel_auto_pipeline_lock_key(novel_id: str) -> str:
+    return f"vocalflow:lock:novel_auto_pipeline:{novel_id}"
 
 
 def _redis_for_novel_queue() -> redis.Redis | None:
@@ -60,6 +90,143 @@ def _novel_llm_for_novel(novel: Novel) -> NovelLLMService:
             novel.id,
         )
     return NovelLLMService(billing_user_id=uid)
+
+
+def _has_active_auto_pipeline_task(
+    novel_id: str,
+    *,
+    exclude_task_ids: set[str] | None = None,
+) -> bool:
+    try:
+        inspect = celery_app.control.inspect(timeout=1.0)
+        active = inspect.active() or {}
+    except Exception:
+        logger.exception("inspect active auto pipeline failed | novel_id=%s", novel_id)
+        return False
+
+    ignored = exclude_task_ids or set()
+    for tasks in active.values():
+        if not isinstance(tasks, list):
+            continue
+        for task in tasks:
+            if not isinstance(task, dict):
+                continue
+            if str(task.get("id") or "") in ignored:
+                continue
+            if str(task.get("name") or "") not in _AUTO_PIPELINE_TASK_NAMES:
+                continue
+            args = task.get("args") or []
+            current_novel_id = None
+            if isinstance(args, (list, tuple)) and args:
+                current_novel_id = args[0]
+            elif isinstance(args, str) and args:
+                current_novel_id = args.split(",")[0].strip(" []'\"")
+            if str(current_novel_id or "") == novel_id:
+                return True
+    return False
+
+
+def recover_stale_auto_pipeline_state(
+    db,
+    novel_id: str,
+    *,
+    exclude_batch_id: str | None = None,
+    exclude_task_ids: set[str] | None = None,
+) -> dict[str, Any]:
+    now = datetime.utcnow()
+    active = _has_active_auto_pipeline_task(
+        novel_id, exclude_task_ids=exclude_task_ids
+    )
+    r = _redis_for_novel_queue()
+    lock_key = _novel_auto_pipeline_lock_key(novel_id)
+    lock_exists = bool(r.exists(lock_key)) if r is not None else False
+
+    rows = (
+        db.query(NovelGenerationLog.batch_id, NovelGenerationLog.event, NovelGenerationLog.created_at)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.event.in_(
+                list(_AUTO_PIPELINE_NONTERMINAL_EVENTS | _AUTO_PIPELINE_TERMINAL_EVENTS)
+            ),
+        )
+        .order_by(NovelGenerationLog.created_at.asc())
+        .all()
+    )
+
+    batches: dict[str, dict[str, Any]] = {}
+    for batch_id, event, created_at in rows:
+        if not batch_id or batch_id == exclude_batch_id:
+            continue
+        info = batches.setdefault(
+            batch_id,
+            {
+                "events": set(),
+                "last_at": created_at,
+            },
+        )
+        info["events"].add(str(event or ""))
+        if created_at and (
+            info["last_at"] is None or created_at > info["last_at"]
+        ):
+            info["last_at"] = created_at
+
+    stale_batches: list[str] = []
+    grace = timedelta(seconds=_AUTO_PIPELINE_STALE_GRACE_SECONDS)
+    for batch_id, info in batches.items():
+        events = info["events"]
+        if events & _AUTO_PIPELINE_TERMINAL_EVENTS:
+            continue
+        if not (events & _AUTO_PIPELINE_NONTERMINAL_EVENTS):
+            continue
+        last_at = info.get("last_at")
+        if last_at and (now - last_at) < grace:
+            continue
+        if active:
+            continue
+        stale_batches.append(batch_id)
+
+    recovered_lock = False
+    if lock_exists and not active:
+        if stale_batches or not batches:
+            try:
+                if r is not None:
+                    r.delete(lock_key)
+                    recovered_lock = True
+            except Exception:
+                logger.exception(
+                    "delete stale auto pipeline lock failed | novel_id=%s",
+                    novel_id,
+                )
+
+    recovered_batches: list[str] = []
+    for batch_id in stale_batches:
+        level = "warning"
+        if batch_id.startswith("aicreate-"):
+            event = "ai_create_failed"
+            message = "AI 建书任务疑似因进程重启或异常退出中断，系统已自动回收僵尸批次"
+        else:
+            event = "auto_pipeline_failed"
+            message = "全自动生成任务疑似因进程重启或异常退出中断，系统已自动回收僵尸批次"
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event=event,
+            level=level,
+            message=message,
+            meta={"reason": "stale_recovered"},
+        )
+        recovered_batches.append(batch_id)
+
+    if recovered_batches:
+        db.commit()
+
+    return {
+        "active": active,
+        "lock_exists": lock_exists,
+        "recovered_lock": recovered_lock,
+        "recovered_batches": recovered_batches,
+    }
 
 
 def _append_refresh_log(
@@ -89,15 +256,14 @@ def _append_refresh_log(
 def novel_daily_chapters() -> dict[str, int]:
     """
     每分钟定时：检查当前时间 (HH:MM)，查找设定在这个时间自动生成的小说，并触发全自动 Pipeline。
-    加入了 last_auto_date 防重防漏机制。
+    仅在没有同书进行中的自动 Pipeline 时入队；last_auto_date 由真正执行任务的 worker 写入。
     """
     db = SessionLocal()
     processed = 0
     
-    # 获取当前东八区时间 HH:MM 和日期 YYYY-MM-DD
+    # 获取北京时间 HH:MM 和日期 YYYY-MM-DD
     from datetime import datetime
-    import pytz
-    tz = pytz.timezone("Asia/Shanghai")
+    tz = ZoneInfo("Asia/Shanghai")
     now = datetime.now(tz)
     now_hh_mm = now.strftime("%H:%M")
     today_str = now.strftime("%Y-%m-%d")
@@ -115,23 +281,32 @@ def novel_daily_chapters() -> dict[str, int]:
         for n in novels:
             # 判断是否到了或过了设定的时间，且今天还没执行过
             if n.daily_auto_time <= now_hh_mm and (n.last_auto_date or "") < today_str:
+                if has_pending_auto_pipeline_batch(db, n.id) or has_pending_chapter_generation_batch(
+                    db, n.id
+                ):
+                    logger.info(
+                        "daily_chapters skipped enqueue due to pending batch | novel_id=%s",
+                        n.id,
+                    )
+                    continue
                 batch_id = f"auto-{int(time.time())}-{n.id[:8]}"
                 try:
-                    # 触发后台全自动 Pipeline 任务
                     novel_auto_pipeline_task.delay(
                         n.id,
                         getattr(n, "user_id", None),
                         batch_id,
-                        n.daily_auto_chapters
+                        n.daily_auto_chapters,
+                        "schedule",
+                        today_str,
                     )
                     processed += 1
-                    logger.info("daily_chapters triggered pipeline | novel_id=%s time=%s today=%s", n.id, now_hh_mm, today_str)
-                    
-                    # 更新最后执行日期
-                    n.last_auto_date = today_str
-                    db.commit()
+                    logger.info(
+                        "daily_chapters queued pipeline | novel_id=%s time=%s today=%s",
+                        n.id,
+                        now_hh_mm,
+                        today_str,
+                    )
                 except Exception:
-                    db.rollback()
                     logger.exception("daily_chapters trigger failed | novel_id=%s", n.id)
     finally:
         db.close()
@@ -937,22 +1112,65 @@ def novel_ai_create_and_start_task(
     novel_id: str,
     user_id: str | None,
     batch_id: str,
-    style: str,
+    styles: list[str],
+    notes: str,
     length_type: str,
     target_generate_chapters: int,
 ) -> dict[str, Any]:
     db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
     try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_ai_create_and_start_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="ai_create_failed",
+                    level="error",
+                    message="AI 一键建书跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked"},
+                )
+                db.commit()
+                return {"status": "skipped", "reason": "locked"}
+
         from app.services.novel_auto_pipeline import run_ai_create_and_start_sync
-        return run_ai_create_and_start_sync(
+        result = run_ai_create_and_start_sync(
             db=db,
             novel_id=novel_id,
-            style=style,
+            styles=styles,
+            notes=notes,
             length_type=length_type,
             target_generate_chapters=target_generate_chapters,
             billing_user_id=user_id,
             batch_id=batch_id,
         )
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="ai_create_done",
+            message=f"AI 一键建书完成，本次生成 {result.get('chapters_generated', 0)} 章",
+            meta={"chapters_generated": result.get("chapters_generated", 0)},
+        )
+        db.commit()
+        return result
     except Exception as e:
         logger.exception("novel_ai_create_and_start_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
@@ -971,6 +1189,15 @@ def novel_ai_create_and_start_task(
             db.rollback()
         raise
     finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "ai_create lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
         db.close()
 
 
@@ -980,11 +1207,60 @@ def novel_auto_pipeline_task(
     user_id: str | None,
     batch_id: str,
     target_count: int,
+    trigger_source: str = "manual",
+    scheduled_date: str | None = None,
 ) -> dict[str, Any]:
     db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
     try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_auto_pipeline_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="auto_pipeline_skipped",
+                    level="warning",
+                    message="全自动生成已跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked", "trigger_source": trigger_source},
+                )
+                db.commit()
+                return {"status": "skipped", "reason": "locked"}
+
+        if has_pending_auto_pipeline_batch(db, novel_id, exclude_batch_id=batch_id) or (
+            has_pending_chapter_generation_batch(db, novel_id)
+        ):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_skipped",
+                level="warning",
+                message="全自动生成已跳过：检测到同书已有进行中的生成批次",
+                meta={"reason": "pending_batch", "trigger_source": trigger_source},
+            )
+            db.commit()
+            return {"status": "skipped", "reason": "pending_batch"}
+
         from app.services.novel_auto_pipeline import run_full_auto_generation_sync
-        return run_full_auto_generation_sync(
+
+        result = run_full_auto_generation_sync(
             db=db,
             novel_id=novel_id,
             target_count=target_count,
@@ -992,8 +1268,25 @@ def novel_auto_pipeline_task(
             batch_id=batch_id,
             use_cold_recall=False,
             cold_recall_items=5,
-            auto_consistency_check=bool(settings.novel_consistency_check_chapter)
+            auto_consistency_check=bool(settings.novel_consistency_check_chapter),
         )
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_done",
+            message=f"全自动生成完成，本次生成 {result.get('chapters_generated', 0)} 章",
+            meta={
+                "trigger_source": trigger_source,
+                "chapters_generated": result.get("chapters_generated", 0),
+            },
+        )
+        if trigger_source == "schedule" and scheduled_date:
+            n = db.get(Novel, novel_id)
+            if n and (n.last_auto_date or "") < scheduled_date:
+                n.last_auto_date = scheduled_date
+        db.commit()
+        return result
     except Exception as e:
         logger.exception("novel_auto_pipeline_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
@@ -1012,4 +1305,13 @@ def novel_auto_pipeline_task(
             db.rollback()
         raise
     finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "auto_pipeline lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
         db.close()

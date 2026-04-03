@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -12,6 +12,7 @@ from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.security import create_access_token, hash_password, verify_password
 from app.models.user import User
+from app.core.rate_limit import limiter
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
@@ -39,7 +40,8 @@ class UserOut(BaseModel):
 
 
 @router.post("/register", response_model=TokenOut)
-def register(body: RegisterBody, db: Session = Depends(get_db)) -> TokenOut:
+@limiter.limit("10/minute")
+def register(request: Request, body: RegisterBody, db: Session = Depends(get_db)) -> TokenOut:
     uname = body.username.strip()
     if not uname:
         raise HTTPException(400, "用户名不能为空")
@@ -67,7 +69,8 @@ def register(body: RegisterBody, db: Session = Depends(get_db)) -> TokenOut:
 
 
 @router.post("/login", response_model=TokenOut)
-def login(body: LoginBody, db: Session = Depends(get_db)) -> TokenOut:
+@limiter.limit("10/minute")
+def login(request: Request, body: LoginBody, db: Session = Depends(get_db)) -> TokenOut:
     uname = (body.username or "").strip()
     user = db.query(User).filter(User.username == uname).first()
     if not user or not verify_password(body.password, user.hashed_password):

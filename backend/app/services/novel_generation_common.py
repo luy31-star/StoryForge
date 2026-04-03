@@ -253,6 +253,100 @@ def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
     return False
 
 
+def has_pending_auto_pipeline_batch(
+    db: Session, novel_id: str, *, exclude_batch_id: str | None = None
+) -> bool:
+    """
+    是否存在未结束的全自动 Pipeline 批次。
+    包含 queued/start/plan/chapters 阶段；done/failed/skipped 视为终态。
+    """
+    rows = (
+        db.query(NovelGenerationLog.batch_id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.event.in_(
+                [
+                    "auto_pipeline_queued",
+                    "auto_pipeline_start",
+                    "auto_pipeline_plan_batch",
+                    "auto_pipeline_chapters",
+                ]
+            ),
+        )
+        .distinct()
+        .all()
+    )
+    for (bid,) in rows:
+        if not bid or bid == exclude_batch_id:
+            continue
+        terminal = (
+            db.query(NovelGenerationLog.id)
+            .filter(
+                NovelGenerationLog.batch_id == bid,
+                NovelGenerationLog.event.in_(
+                    [
+                        "auto_pipeline_done",
+                        "auto_pipeline_failed",
+                        "auto_pipeline_skipped",
+                        "auto_pipeline_enqueue_failed",
+                        "ai_create_done",
+                        "ai_create_failed",
+                    ]
+                ),
+            )
+            .first()
+        )
+        if not terminal:
+            return True
+    return False
+
+def get_active_auto_pipeline_count(db: Session) -> int:
+    """
+    获取全局当前正在排队或执行的全自动生成/建书批次数量。
+    用于限流和排队提示。
+    """
+    rows = (
+        db.query(NovelGenerationLog.batch_id)
+        .filter(
+            NovelGenerationLog.event.in_(
+                [
+                    "auto_pipeline_queued",
+                    "auto_pipeline_start",
+                    "ai_create_queued",
+                    "ai_create_brainstorming",
+                ]
+            )
+        )
+        .distinct()
+        .all()
+    )
+    
+    count = 0
+    for (bid,) in rows:
+        if not bid:
+            continue
+        terminal = (
+            db.query(NovelGenerationLog.id)
+            .filter(
+                NovelGenerationLog.batch_id == bid,
+                NovelGenerationLog.event.in_(
+                    [
+                        "auto_pipeline_done",
+                        "auto_pipeline_failed",
+                        "auto_pipeline_skipped",
+                        "auto_pipeline_enqueue_failed",
+                        "ai_create_done",
+                        "ai_create_failed",
+                    ]
+                ),
+            )
+            .first()
+        )
+        if not terminal:
+            count += 1
+    return count
+
+
 def has_pending_volume_plan_batch(db: Session, novel_id: str) -> bool:
     """是否存在未结束的卷章计划生成批次。"""
     rows = (

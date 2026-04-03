@@ -2,8 +2,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, File, HTTPException, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
+
+from app.core.database import get_db
+from app.core.deps import get_current_user
+from app.models.user import User
 
 from app.services.gemini_service import GeminiService
 from app.services.seedance_service import SeeDanceService
@@ -38,7 +43,10 @@ class GeminiChatBody(BaseModel):
 
 
 @router.post("/voice-synthesis")
-async def synthesize_voice(body: VoiceSynthesisBody) -> dict[str, Any]:
+async def synthesize_voice(
+    body: VoiceSynthesisBody,
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     voice_service = VoiceService()
     settings = body.settings.model_dump() if body.settings else {}
     result = await voice_service.synthesize(
@@ -50,7 +58,10 @@ async def synthesize_voice(body: VoiceSynthesisBody) -> dict[str, Any]:
 
 
 @router.post("/voice-blend")
-async def blend_voices(body: VoiceBlendBody) -> dict[str, str]:
+async def blend_voices(
+    body: VoiceBlendBody,
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
     voice_service = VoiceService()
     result = await voice_service.blend_voices(
         references=body.reference_voices,
@@ -64,6 +75,7 @@ async def blend_voices(body: VoiceBlendBody) -> dict[str, str]:
 async def generate_seedance_video(
     audio_file: UploadFile = File(...),
     character_image: UploadFile = File(...),
+    user: User = Depends(get_current_user),
 ) -> dict[str, str]:
     seedance_service = SeeDanceService()
     task_id = await seedance_service.generate_video_async(
@@ -74,7 +86,10 @@ async def generate_seedance_video(
 
 
 @router.get("/seedance-status/{task_id}")
-async def seedance_status(task_id: str) -> dict[str, Any]:
+async def seedance_status(
+    task_id: str,
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
     svc = SeeDanceService()
     task = svc.get_task(task_id)
     if not task:
@@ -83,11 +98,17 @@ async def seedance_status(task_id: str) -> dict[str, Any]:
 
 
 @router.post("/gemini-chat")
-async def gemini_chat(body: GeminiChatBody) -> dict[str, str]:
+async def gemini_chat(
+    body: GeminiChatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
     gemini = GeminiService()
     text = await gemini.generate_text(
         system_prompt=body.systemPrompt,
         messages=body.messages,
         model=body.model or "gemini-2.0-flash",
+        billing_db=db,
+        billing_user_id=user.id,
     )
     return {"text": text}

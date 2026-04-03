@@ -69,6 +69,10 @@ class Settings(BaseSettings):
     novel_beat_minute: int = 0
     # 单章生成：传给 OpenAI 兼容接口的 max_tokens（豆包等未显式传时网关默认可能偏小，导致篇幅不足）
     novel_chapter_max_tokens: int = 8192
+    # 单章正文生成超时（秒）
+    novel_chapter_timeout: float = 900.0
+    # 一致性修订超时（秒）
+    novel_consistency_check_timeout: float = 600.0
     # 审定章节摘要写入记忆时每章截取字数（越大越耗 token）
     novel_chapter_summary_chars: int = 3500
     # 内部：偏连续性时优先用章节结尾截取（默认 tail）
@@ -99,9 +103,13 @@ class Settings(BaseSettings):
     # 记忆刷新分批：每批摘要最大字符数（0表示不分批）
     novel_memory_refresh_batch_chars: int = 15000
     # 记忆刷新单批超时（秒）
-    novel_memory_refresh_batch_timeout: float = 420.0
+    novel_memory_refresh_batch_timeout: float = 600.0
     # 记忆增量抽取：单批返回 JSON 的 max_tokens
     novel_memory_delta_max_tokens: int = 4096
+    # LLM 请求遇到 Timeout 时的额外重试次数
+    novel_llm_timeout_retries: int = 1
+    # LLM Timeout 重试前的基础退避秒数
+    novel_llm_timeout_retry_backoff_seconds: float = 2.0
     # 写章时默认携带最近完整正文的章节数
     novel_recent_full_context_chapters: int = 2
     # 写章 prompt 的软预算（按字符近似）；超出后会优先裁剪最近正文与低优先级记忆块

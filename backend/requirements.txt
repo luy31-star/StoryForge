@@ -14,3 +14,4 @@ python-jose[cryptography]==3.3.0
 bcrypt==4.2.1
 json-repair>=0.30.0
 alibabacloud-oss-v2>=1.0.0
+slowapi>=0.1.9

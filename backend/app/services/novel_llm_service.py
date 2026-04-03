@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
 import re
 
+import httpx
 from json_repair import loads as json_repair_loads
 import time
 from collections.abc import AsyncIterator
@@ -514,6 +516,75 @@ class NovelLLMService:
         self._billing_user_id = billing_user_id
 
     @staticmethod
+    def _timeout_retry_attempts() -> int:
+        return max(1, int(settings.novel_llm_timeout_retries) + 1)
+
+    @staticmethod
+    def _timeout_retry_backoff(attempt: int) -> float:
+        base = max(0.0, float(settings.novel_llm_timeout_retry_backoff_seconds))
+        return base * max(1, attempt)
+
+    async def _chat_text_with_timeout_retry(
+        self,
+        *,
+        router: LLMRouter,
+        operation: str,
+        novel_id: str,
+        chapter_no: int | None = None,
+        timeout: float,
+        **kwargs: Any,
+    ) -> str:
+        attempts = self._timeout_retry_attempts()
+        for attempt in range(1, attempts + 1):
+            try:
+                return await router.chat_text(timeout=timeout, **kwargs)
+            except httpx.TimeoutException:
+                logger.warning(
+                    "llm timeout(async) | op=%s novel_id=%s chapter_no=%s attempt=%s/%s timeout=%.1fs provider=%s model=%s",
+                    operation,
+                    novel_id,
+                    chapter_no,
+                    attempt,
+                    attempts,
+                    timeout,
+                    router.provider,
+                    router.model or settings.ai302_novel_model,
+                )
+                if attempt >= attempts:
+                    raise
+                await asyncio.sleep(self._timeout_retry_backoff(attempt))
+
+    def _chat_text_sync_with_timeout_retry(
+        self,
+        *,
+        router: LLMRouter,
+        operation: str,
+        novel_id: str,
+        chapter_no: int | None = None,
+        timeout: float,
+        **kwargs: Any,
+    ) -> str:
+        attempts = self._timeout_retry_attempts()
+        for attempt in range(1, attempts + 1):
+            try:
+                return router.chat_text_sync(timeout=timeout, **kwargs)
+            except httpx.TimeoutException:
+                logger.warning(
+                    "llm timeout(sync) | op=%s novel_id=%s chapter_no=%s attempt=%s/%s timeout=%.1fs provider=%s model=%s",
+                    operation,
+                    novel_id,
+                    chapter_no,
+                    attempt,
+                    attempts,
+                    timeout,
+                    router.provider,
+                    router.model or settings.ai302_novel_model,
+                )
+                if attempt >= attempts:
+                    raise
+                time.sleep(self._timeout_retry_backoff(attempt))
+
+    @staticmethod
     def _bill_kw(db: Any, billing_user_id: str | None) -> dict[str, Any]:
         if billing_user_id and db is not None:
             return {"billing_user_id": billing_user_id, "billing_db": db}
@@ -663,6 +734,7 @@ class NovelLLMService:
             temperature=0.75,
             web_search=self._novel_web_search(db, flow="inspiration"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         ):
             yield evt
 
@@ -785,6 +857,7 @@ class NovelLLMService:
             temperature=0.45,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
         ):
             yield evt
 
@@ -1488,7 +1561,7 @@ class NovelLLMService:
         messages = self._budget_chapter_messages(messages)
         model = llm_model or settings.llm_model or settings.ai302_novel_model
         web_search = self._novel_web_search(db, flow="generate")
-        timeout = 600.0
+        timeout = settings.novel_chapter_timeout
         start = time.perf_counter()
         logger.info(
             "generate_chapter start | novel_id=%s chapter_no=%s model=%s web_search=%s cold_recall=%s cold_items=%s msg_chars=%s mem_chars=%s continuity_chars=%s",
@@ -1503,7 +1576,11 @@ class NovelLLMService:
             len(continuity_excerpt or ""),
         )
         try:
-            out = await router.chat_text(
+            out = await self._chat_text_with_timeout_retry(
+                router=router,
+                operation="generate_chapter",
+                novel_id=novel.id,
+                chapter_no=chapter_no,
                 messages=messages,
                 temperature=0.75,
                 web_search=web_search,
@@ -1551,7 +1628,7 @@ class NovelLLMService:
         messages = self._budget_chapter_messages(messages)
         model = router.model or settings.ai302_novel_model
         web_search = self._novel_web_search(db, flow="generate")
-        timeout = 600.0
+        timeout = settings.novel_chapter_timeout
         start = time.perf_counter()
         logger.info(
             "generate_chapter_sync start | novel_id=%s chapter_no=%s model=%s web_search=%s cold_recall=%s cold_items=%s msg_chars=%s",
@@ -1564,7 +1641,11 @@ class NovelLLMService:
             self._messages_chars(messages),
         )
         try:
-            return router.chat_text_sync(
+            return self._chat_text_sync_with_timeout_retry(
+                router=router,
+                operation="generate_chapter",
+                novel_id=novel.id,
+                chapter_no=chapter_no,
                 messages=messages,
                 temperature=0.75,
                 timeout=timeout,
@@ -1610,11 +1691,15 @@ class NovelLLMService:
             len(chapter_text or ""),
         )
         try:
-            return await router.chat_text(
+            return await self._chat_text_with_timeout_retry(
+                router=router,
+                operation="check_and_fix_chapter",
+                novel_id=novel.id,
+                chapter_no=chapter_no,
                 messages=messages,
                 temperature=settings.novel_consistency_check_temperature,
                 web_search=False,
-                timeout=600.0,
+                timeout=settings.novel_consistency_check_timeout,
                 **self._bill_kw(db, self._billing_user_id),
             )
         finally:
@@ -1637,7 +1722,11 @@ class NovelLLMService:
         db: Any = None,
     ) -> str:
         router = self._router(db=db)
-        return router.chat_text_sync(
+        return self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="check_and_fix_chapter",
+            novel_id=novel.id,
+            chapter_no=chapter_no,
             messages=self._budget_chapter_messages(
                 _check_and_fix_chapter_messages(
                     novel,
@@ -1650,23 +1739,270 @@ class NovelLLMService:
             ),
             temperature=settings.novel_consistency_check_temperature,
             web_search=False,
-            timeout=600.0,
+            timeout=settings.novel_consistency_check_timeout,
             **self._bill_kw(db, self._billing_user_id),
         )
 
     def _parse_refresh_memory_response(self, raw: str) -> dict[str, Any]:
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            m = re.search(r"\{[\s\S]*\}", raw)
-            if not m:
-                return {}
+        candidates: list[str] = []
+        text = (raw or "").strip()
+        if text:
+            candidates.append(text)
+        m = re.search(r"\{[\s\S]*\}", raw or "")
+        if m:
+            extracted = m.group(0).strip()
+            if extracted and extracted not in candidates:
+                candidates.append(extracted)
+
+        for blob in candidates:
             try:
-                parsed = json.loads(m.group(0))
+                parsed = json.loads(blob)
+                if isinstance(parsed, dict):
+                    return self._normalize_refresh_memory_response(parsed)
             except json.JSONDecodeError:
-                return {}
-            return parsed if isinstance(parsed, dict) else {}
+                pass
+
+        for blob in candidates:
+            try:
+                parsed = json_repair_loads(blob)
+                if isinstance(parsed, dict):
+                    return self._normalize_refresh_memory_response(parsed)
+            except Exception:
+                pass
+        return {}
+
+    @staticmethod
+    def _empty_refresh_memory_delta() -> dict[str, Any]:
+        return {
+            "facts_added": [],
+            "facts_updated": [],
+            "open_plots_added": [],
+            "open_plots_resolved": [],
+            "canonical_entries": [],
+            "characters_updated": [],
+            "relations_changed": [],
+            "inventory_changed": {"added": [], "removed": []},
+            "skills_changed": {"added": [], "updated": []},
+            "pets_changed": {"added": [], "updated": []},
+            "conflicts_detected": [],
+            "forbidden_constraints_added": [],
+            "ids_to_remove": [],
+            "entity_influence_updates": [],
+        }
+
+    @classmethod
+    def _normalize_refresh_memory_response(cls, parsed: dict[str, Any]) -> dict[str, Any]:
+        normalized = cls._empty_refresh_memory_delta()
+        for key, value in parsed.items():
+            normalized[key] = value
+
+        inventory_changed = normalized.get("inventory_changed")
+        if not isinstance(inventory_changed, dict):
+            inventory_changed = {}
+        normalized["inventory_changed"] = {
+            "added": inventory_changed.get("added") if isinstance(inventory_changed.get("added"), list) else [],
+            "removed": inventory_changed.get("removed") if isinstance(inventory_changed.get("removed"), list) else [],
+        }
+
+        skills_changed = normalized.get("skills_changed")
+        if not isinstance(skills_changed, dict):
+            skills_changed = {}
+        normalized["skills_changed"] = {
+            "added": skills_changed.get("added") if isinstance(skills_changed.get("added"), list) else [],
+            "updated": skills_changed.get("updated") if isinstance(skills_changed.get("updated"), list) else [],
+        }
+
+        pets_changed = normalized.get("pets_changed")
+        if not isinstance(pets_changed, dict):
+            pets_changed = {}
+        normalized["pets_changed"] = {
+            "added": pets_changed.get("added") if isinstance(pets_changed.get("added"), list) else [],
+            "updated": pets_changed.get("updated") if isinstance(pets_changed.get("updated"), list) else [],
+        }
+        return normalized
+
+    @staticmethod
+    def _extract_chapter_blobs(chapters_summary: str) -> list[dict[str, Any]]:
+        text = (chapters_summary or "").strip()
+        if not text:
+            return []
+
+        pattern = re.compile(r"(?m)^第\s*(\d+)\s*章(?:《([^》\n]*)》|[ \t]+([^\n]+))?\n")
+        matches = list(pattern.finditer(text))
+        if not matches:
+            return []
+
+        out: list[dict[str, Any]] = []
+        for idx, match in enumerate(matches):
+            chapter_no = int(match.group(1))
+            title = str(match.group(2) or match.group(3) or "").strip()
+            body_start = match.end()
+            body_end = matches[idx + 1].start() if idx + 1 < len(matches) else len(text)
+            chapter_text = text[body_start:body_end].strip()
+            out.append(
+                {
+                    "chapter_no": chapter_no,
+                    "chapter_title": title,
+                    "chapter_text": chapter_text,
+                }
+            )
+        return out
+
+    @staticmethod
+    def _fallback_list_from_text(text: str, *, limit: int, item_max_chars: int = 120) -> list[str]:
+        cleaned = re.sub(r"\s+", " ", text or "").strip()
+        if not cleaned:
+            return []
+        chunks = [
+            seg.strip(" -\t")
+            for seg in re.split(r"(?:\n{2,}|[。！？!?]\s*)", cleaned)
+            if seg and seg.strip(" -\t")
+        ]
+        out: list[str] = []
+        for seg in chunks:
+            short = seg[:item_max_chars].strip()
+            if short and short not in out:
+                out.append(short)
+            if len(out) >= limit:
+                break
+        if not out:
+            return [cleaned[:item_max_chars]]
+        return out
+
+    @classmethod
+    def _build_fallback_canonical_entry(
+        cls,
+        *,
+        chapter_no: int,
+        chapter_title: str,
+        chapter_text: str,
+    ) -> dict[str, Any]:
+        key_facts = cls._fallback_list_from_text(chapter_text, limit=3, item_max_chars=120)
+        tail_candidates = cls._fallback_list_from_text(chapter_text[-500:], limit=2, item_max_chars=120)
+        causal_results = tail_candidates[:1] if tail_candidates else []
+        unresolved_hooks = [
+            item
+            for item in tail_candidates[1:]
+            if any(token in item for token in ("?", "？", "将", "未", "待", "是否"))
+        ][:2]
+        return {
+            "chapter_no": chapter_no,
+            "chapter_title": (chapter_title or f"第{chapter_no}章").strip(),
+            "key_facts": key_facts,
+            "causal_results": causal_results,
+            "open_plots_added": [],
+            "open_plots_resolved": [],
+            "emotional_state": "",
+            "unresolved_hooks": unresolved_hooks,
+        }
+
+    @classmethod
+    def _supplement_missing_canonical_entries(
+        cls,
+        delta: dict[str, Any],
+        chapters_summary: str,
+    ) -> tuple[dict[str, Any], list[int]]:
+        blobs = cls._extract_chapter_blobs(chapters_summary)
+        if not blobs:
+            return delta, []
+
+        existing_entries = delta.get("canonical_entries")
+        if not isinstance(existing_entries, list):
+            existing_entries = []
+
+        existing_nos: set[int] = set()
+        for item in existing_entries:
+            normalized = cls._normalize_delta_entry(item)
+            if normalized is not None:
+                existing_nos.add(normalized["chapter_no"])
+
+        missing_entries: list[dict[str, Any]] = []
+        missing_nos: list[int] = []
+        for blob in blobs:
+            chapter_no = int(blob["chapter_no"])
+            if chapter_no in existing_nos:
+                continue
+            missing_nos.append(chapter_no)
+            missing_entries.append(
+                cls._build_fallback_canonical_entry(
+                    chapter_no=chapter_no,
+                    chapter_title=str(blob.get("chapter_title") or ""),
+                    chapter_text=str(blob.get("chapter_text") or ""),
+                )
+            )
+
+        if not missing_entries:
+            return delta, []
+
+        patched = dict(delta)
+        patched["canonical_entries"] = [*existing_entries, *missing_entries]
+        return patched, missing_nos
+
+    @classmethod
+    def _refresh_memory_repair_messages(cls, raw: str) -> list[dict[str, str]]:
+        example = json.dumps(cls._empty_refresh_memory_delta(), ensure_ascii=False)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你是记忆增量 JSON 修复器。"
+                    "你只能输出一个可被 json.loads() 直接解析的 JSON 对象。"
+                    "不要输出解释、Markdown、代码块或多余文字。"
+                    "如果原文缺少字段，必须补齐为空数组或空对象。"
+                    "输出结构示例："
+                    f"{example}"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "请把下面这段模型原始输出修复为合法 JSON 对象，只保留记忆增量本体：\n"
+                    f"{raw or ''}"
+                ),
+            },
+        ]
+
+    async def _repair_refresh_memory_response(
+        self,
+        *,
+        router: LLMRouter,
+        raw: str,
+        db: Any = None,
+    ) -> dict[str, Any]:
+        try:
+            repaired_raw = await router.chat_text(
+                messages=self._refresh_memory_repair_messages(raw),
+                temperature=0.0,
+                timeout=min(120.0, settings.novel_memory_refresh_batch_timeout),
+                max_tokens=min(settings.novel_memory_delta_max_tokens, 4096),
+                response_format={"type": "json_object"},
+                **self._bill_kw(db, self._billing_user_id),
+            )
+        except Exception:
+            logger.exception("memory delta json repair failed(async)")
+            return {}
+        return self._parse_refresh_memory_response(repaired_raw)
+
+    def _repair_refresh_memory_response_sync(
+        self,
+        *,
+        router: LLMRouter,
+        raw: str,
+        db: Any = None,
+    ) -> dict[str, Any]:
+        try:
+            repaired_raw = router.chat_text_sync(
+                messages=self._refresh_memory_repair_messages(raw),
+                temperature=0.0,
+                timeout=min(120.0, settings.novel_memory_refresh_batch_timeout),
+                max_tokens=min(settings.novel_memory_delta_max_tokens, 4096),
+                response_format={"type": "json_object"},
+                **self._bill_kw(db, self._billing_user_id),
+            )
+        except Exception:
+            logger.exception("memory delta json repair failed(sync)")
+            return {}
+        return self._parse_refresh_memory_response(repaired_raw)
 
     def _memory_delta_messages(
         self, novel: Novel, chapters_summary: str, prev_memory: str
@@ -1684,6 +2020,7 @@ class NovelLLMService:
             "你不能重写整份记忆，只能根据新章节内容输出“本批新增/变更了什么”。"
             "必须输出严格 JSON 对象，不要 Markdown，不要解释。"
             "若某字段没有变化，必须输出空数组或空对象。"
+            "若本批输入里包含 1 章或多章内容，则 canonical_entries 必须为本批每一章各输出一条条目，不允许漏章。"
             "输出字段固定为："
             "facts_added[], facts_updated[], open_plots_added[], open_plots_resolved[],"
             "canonical_entries[], characters_updated[], relations_changed[],"
@@ -1710,6 +2047,7 @@ class NovelLLMService:
             "只允许填写真正影响剧情推进、人物关系、核心矛盾、卷目标或后续章节承接的关键收束线；"
             "日常动作、一次性细节、气氛描写、小误会、无后续影响的临时事件，即使结束了也不要写入 open_plots_resolved。"
             "推荐优先使用 ids_to_remove 进行删除。"
+            f"合法输出示例：{json.dumps(self._empty_refresh_memory_delta(), ensure_ascii=False)}"
         )
         user = (
             f"【框架 JSON（硬约束）】\n{fj}\n\n"
@@ -3089,23 +3427,50 @@ class NovelLLMService:
         db: Any = None,
     ) -> dict[str, Any]:
         router = self._router(db=db)
-        raw = await router.chat_text(
+        raw = await self._chat_text_with_timeout_retry(
+            router=router,
+            operation="memory_refresh",
+            novel_id=novel.id,
             messages=self._memory_delta_messages(novel, chapters_summary, prev_memory),
             temperature=0.2,
             web_search=self._novel_web_search(db, flow="memory_refresh"),
             timeout=settings.novel_memory_refresh_batch_timeout,
             max_tokens=settings.novel_memory_delta_max_tokens,
+            response_format={"type": "json_object"},
             **self._bill_kw(db, self._billing_user_id),
         )
         delta = self._parse_refresh_memory_response(raw)
+        if not delta:
+            logger.warning(
+                "memory delta invalid json(async) | novel_id=%s provider=%s model=%s raw_preview=%r",
+                novel.id,
+                router.provider,
+                router.model or settings.ai302_novel_model,
+                (raw or "")[:800],
+            )
+            delta = await self._repair_refresh_memory_response(
+                router=router,
+                raw=raw,
+                db=db,
+            )
+        if delta:
+            delta, supplemented_nos = self._supplement_missing_canonical_entries(
+                delta, chapters_summary
+            )
+            if supplemented_nos:
+                logger.warning(
+                    "memory delta canonical supplemented(async) | novel_id=%s chapters=%s",
+                    novel.id,
+                    supplemented_nos,
+                )
         if not delta:
             return {
                 "ok": False,
                 "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": "{}",
-                "errors": ["LLM 未返回合法的记忆增量 JSON"],
-                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "errors": ["LLM 未返回合法的记忆增量 JSON（已尝试二次修复）"],
+                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON（已尝试二次修复）"],
                 "warnings": [],
                 "auto_pass_notes": [],
                 "stats": {},
@@ -3216,23 +3581,50 @@ class NovelLLMService:
         db: Any = None,
     ) -> dict[str, Any]:
         router = self._router(db=db)
-        raw = router.chat_text_sync(
+        raw = self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="memory_refresh",
+            novel_id=novel.id,
             messages=self._memory_delta_messages(novel, chapters_summary, prev_memory),
             temperature=0.2,
             timeout=settings.novel_memory_refresh_batch_timeout,
             web_search=self._novel_web_search(db, flow="memory_refresh"),
             max_tokens=settings.novel_memory_delta_max_tokens,
+            response_format={"type": "json_object"},
             **self._bill_kw(db, self._billing_user_id),
         )
         delta = self._parse_refresh_memory_response(raw)
+        if not delta:
+            logger.warning(
+                "memory delta invalid json(sync) | novel_id=%s provider=%s model=%s raw_preview=%r",
+                novel.id,
+                router.provider,
+                router.model or settings.ai302_novel_model,
+                (raw or "")[:800],
+            )
+            delta = self._repair_refresh_memory_response_sync(
+                router=router,
+                raw=raw,
+                db=db,
+            )
+        if delta:
+            delta, supplemented_nos = self._supplement_missing_canonical_entries(
+                delta, chapters_summary
+            )
+            if supplemented_nos:
+                logger.warning(
+                    "memory delta canonical supplemented(sync) | novel_id=%s chapters=%s",
+                    novel.id,
+                    supplemented_nos,
+                )
         if not delta:
             return {
                 "ok": False,
                 "status": "blocked",
                 "payload_json": prev_memory,
                 "candidate_json": "{}",
-                "errors": ["LLM 未返回合法的记忆增量 JSON"],
-                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON"],
+                "errors": ["LLM 未返回合法的记忆增量 JSON（已尝试二次修复）"],
+                "blocking_errors": ["LLM 未返回合法的记忆增量 JSON（已尝试二次修复）"],
                 "warnings": [],
                 "auto_pass_notes": [],
                 "stats": {},

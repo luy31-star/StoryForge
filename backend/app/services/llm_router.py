@@ -142,6 +142,7 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
         billing_user_id: str | None = None,
         billing_db: Session | None = None,
     ) -> str:
@@ -162,6 +163,8 @@ class LLMRouter:
             }
             if max_tokens is not None:
                 body["max_tokens"] = max_tokens
+            if response_format is not None:
+                body["response_format"] = response_format
             try:
                 async with httpx.AsyncClient(timeout=timeout) as client:
                     r = await client.post(url, headers=self._custom_headers(), json=body)
@@ -179,6 +182,11 @@ class LLMRouter:
         # provider == ai302
         model = self._resolve_model(fallback=settings.ai302_novel_model)
         if model.lower().startswith("kimi-"):
+            if response_format is not None:
+                logger.warning(
+                    "response_format ignored for kimi messages API | model=%s",
+                    model,
+                )
             # Kimi messages API (302)
             url = _ai302_kimi_messages_url(settings.ai302_base_url)
             body = {
@@ -226,6 +234,8 @@ class LLMRouter:
             body2["max_tokens"] = max_tokens
         if web_search:
             body2["web-search"] = True
+        if response_format is not None:
+            body2["response_format"] = response_format
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
                 r = await client.post(url, headers=self._ai302_headers(), json=body2)
@@ -251,6 +261,8 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        billing_user_id: str | None = None,
+        billing_db: Session | None = None,
     ) -> AsyncIterator[dict[str, str]]:
         """
         流式输出兼容你现有前端 SSE 协议：
@@ -269,6 +281,8 @@ class LLMRouter:
                 timeout=timeout,
                 web_search=web_search,
                 max_tokens=max_tokens,
+                billing_user_id=billing_user_id,
+                billing_db=billing_db,
             )
             yield {"type": "text", "delta": txt}
             return
@@ -281,9 +295,15 @@ class LLMRouter:
                 timeout=timeout,
                 web_search=web_search,
                 max_tokens=max_tokens,
+                billing_user_id=billing_user_id,
+                billing_db=billing_db,
             )
             yield {"type": "text", "delta": txt}
             return
+
+        if billing_db and billing_user_id:
+            from app.services.billing_service import assert_sufficient_balance
+            assert_sufficient_balance(billing_db, billing_user_id, min_points=1)
 
         url = _join_url(settings.ai302_base_url, "/chat/completions")
         body: dict[str, Any] = {
@@ -291,11 +311,14 @@ class LLMRouter:
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if max_tokens is not None:
             body["max_tokens"] = max_tokens
         if web_search:
             body["web-search"] = True
+
+        collected_usage: dict[str, Any] | None = None
 
         async with httpx.AsyncClient(timeout=timeout) as client:
             async with client.stream("POST", url, headers=self._ai302_headers(), json=body) as resp:
@@ -311,6 +334,8 @@ class LLMRouter:
                     evt = _safe_json_loads(payload)
                     if not isinstance(evt, dict):
                         continue
+                    if "usage" in evt and evt["usage"]:
+                        collected_usage = evt["usage"]
                     delta = (evt.get("choices") or [{}])[0].get("delta") or {}
                     if not isinstance(delta, dict):
                         continue
@@ -321,6 +346,9 @@ class LLMRouter:
                     if isinstance(txt, str) and txt:
                         yield {"type": "text", "delta": txt}
 
+        if collected_usage is not None:
+            _apply_llm_billing(billing_db, billing_user_id, model, {"usage": collected_usage})
+
     def chat_text_sync(
         self,
         *,
@@ -329,6 +357,7 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        response_format: dict[str, Any] | None = None,
         billing_user_id: str | None = None,
         billing_db: Session | None = None,
     ) -> str:
@@ -349,6 +378,8 @@ class LLMRouter:
             }
             if max_tokens is not None:
                 body["max_tokens"] = max_tokens
+            if response_format is not None:
+                body["response_format"] = response_format
             try:
                 with httpx.Client(timeout=timeout) as client:
                     r = client.post(url, headers=self._custom_headers(), json=body)
@@ -365,6 +396,11 @@ class LLMRouter:
 
         model = self._resolve_model(fallback=settings.ai302_novel_model)
         if model.lower().startswith("kimi-"):
+            if response_format is not None:
+                logger.warning(
+                    "response_format ignored for kimi messages API(sync) | model=%s",
+                    model,
+                )
             url = _ai302_kimi_messages_url(settings.ai302_base_url)
             body = {
                 "model": model,
@@ -407,6 +443,8 @@ class LLMRouter:
             body2["max_tokens"] = max_tokens
         if web_search:
             body2["web-search"] = True
+        if response_format is not None:
+            body2["response_format"] = response_format
         try:
             with httpx.Client(timeout=timeout) as client:
                 r = client.post(url, headers=self._ai302_headers(), json=body2)

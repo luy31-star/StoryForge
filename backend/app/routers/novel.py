@@ -57,6 +57,8 @@ from app.services.novel_generation_common import (
     append_generation_log as _append_generation_log,
     build_chapter_plan_hint as _build_chapter_plan_hint,
     ensure_chapter_heading as _ensure_chapter_heading,
+    has_pending_auto_pipeline_batch,
+    get_active_auto_pipeline_count,
     has_pending_chapter_consistency_batch,
     has_pending_chapter_generation_batch,
     has_pending_chapter_revise_batch,
@@ -70,6 +72,7 @@ from app.tasks.novel_tasks import (
     novel_consolidate_memory,
     novel_generate_chapters_for_novel,
     novel_refresh_memory_for_novel,
+    recover_stale_auto_pipeline_state,
     novel_sync_json_snapshot,
 )
 
@@ -92,7 +95,8 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 
 
 class AiCreateAndStartBody(BaseModel):
-    style: str
+    styles: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    notes: str = ""
     length_type: str
     target_generate_chapters: int = Field(default=10, ge=0, le=50)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
@@ -437,8 +441,17 @@ def ai_create_and_start(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
+    active_count = get_active_auto_pipeline_count(db)
+    if active_count >= 5:
+        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 人），请稍后再试")
+
+    styles = [str(x).strip() for x in body.styles if str(x).strip()]
+    if not styles:
+        raise HTTPException(400, "请至少选择一个小说题材或风格")
+
+    styles_text = "、".join(styles[:6])
     n = Novel(
-        title=f"[AI构思中] {body.style}",
+        title=f"[AI构思中] {styles[0]}",
         intro="",
         background="",
         style="",
@@ -459,8 +472,13 @@ def ai_create_and_start(
         novel_id=n.id,
         batch_id=batch_id,
         event="ai_create_queued",
-        message=f"已入队全自动建书任务，题材：{body.style}，篇幅：{body.length_type}",
-        meta={"style": body.style, "length_type": body.length_type, "target_generate_chapters": body.target_generate_chapters},
+        message=f"已入队全自动建书任务，题材/风格：{styles_text}，篇幅：{body.length_type}",
+        meta={
+            "styles": styles,
+            "notes": body.notes,
+            "length_type": body.length_type,
+            "target_generate_chapters": body.target_generate_chapters,
+        },
     )
     db.commit()
 
@@ -470,13 +488,23 @@ def ai_create_and_start(
             n.id, 
             str(user.id), 
             batch_id, 
-            body.style, 
+            styles,
+            body.notes,
             body.length_type, 
             body.target_generate_chapters
         )
         task_id = getattr(task, "id", None)
     except Exception as e:
         logger.exception("ai_create_and_start enqueue failed")
+        _append_generation_log(
+            db,
+            novel_id=n.id,
+            batch_id=batch_id,
+            event="auto_pipeline_enqueue_failed",
+            level="error",
+            message=f"AI 建书后台任务入队失败：{e}",
+        )
+        db.commit()
         raise HTTPException(503, f"后台任务入队失败：{e}") from e
 
     return {
@@ -1003,8 +1031,15 @@ async def start_auto_pipeline(
     n = require_novel_access(db, novel_id, user)
     if not n.framework_confirmed:
         raise HTTPException(400, "请先确认小说框架")
-    
-    if has_pending_chapter_generation_batch(db, novel_id):
+
+    active_count = get_active_auto_pipeline_count(db)
+    if active_count >= 5:
+        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 人），请稍后再试")
+
+    recover_stale_auto_pipeline_state(db, novel_id)
+    if has_pending_auto_pipeline_batch(db, novel_id) or has_pending_chapter_generation_batch(
+        db, novel_id
+    ):
         raise HTTPException(409, "当前已有章节生成任务进行中，请稍后再试")
         
     batch_id = f"auto-{int(time.time())}-{novel_id[:8]}"
@@ -1021,11 +1056,20 @@ async def start_auto_pipeline(
     try:
         from app.tasks.novel_tasks import novel_auto_pipeline_task
         task = novel_auto_pipeline_task.delay(
-            novel_id, str(user.id), batch_id, body.target_count
+            novel_id, str(user.id), batch_id, body.target_count, "manual", None
         )
         task_id = getattr(task, "id", None)
     except Exception as e:
         logger.exception("start_auto_pipeline enqueue failed | novel_id=%s", novel_id)
+        _append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_enqueue_failed",
+            level="error",
+            message=f"全自动生成后台任务入队失败：{e}",
+        )
+        db.commit()
         raise HTTPException(503, f"后台任务入队失败：{e}") from e
         
     return {

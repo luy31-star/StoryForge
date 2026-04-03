@@ -198,9 +198,9 @@ def run_generate_chapters_batch_sync(
 
         # 仅 batch_auto 或非 manual 来源才自动更新工作记忆并审定
         auto_approve = source != "manual"
-
-        if auto_approve:
-            try:
+        try:
+            memory_delta_result: dict[str, Any] | None = None
+            if auto_approve:
                 memory_delta_result = llm.propose_memory_update_from_chapter_sync(
                     n,
                     chapter_no=no,
@@ -209,88 +209,87 @@ def run_generate_chapters_batch_sync(
                     prev_memory=mem,
                     db=db,
                 )
-                if memory_delta_result.get("ok"):
-                    mem = str(memory_delta_result.get("payload_json") or mem)
-                    append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_memory_delta_applied",
-                        chapter_no=no,
-                        message=f"第 {no} 章工作记忆已更新",
-                        meta=memory_delta_result.get("stats") or {},
-                    )
-                else:
-                    append_generation_log(
-                        db,
-                        novel_id=novel_id,
-                        batch_id=batch_id,
-                        event="chapter_memory_delta_failed",
-                        chapter_no=no,
-                        level="error",
-                        message=f"第 {no} 章工作记忆更新失败，已保留旧记忆",
-                        meta={"errors": memory_delta_result.get("errors") or []},
-                    )
-                db.commit()
-            except Exception:
-                logger.exception(
-                    "generate_chapters memory delta failed | novel_id=%s chapter_no=%s",
-                    novel_id,
-                    no,
+                if not memory_delta_result.get("ok"):
+                    err_text = "；".join(memory_delta_result.get("errors") or []) or "未知错误"
+                    raise RuntimeError(f"第 {no} 章工作记忆更新失败：{err_text}")
+                mem = str(memory_delta_result.get("payload_json") or mem)
+
+            saved_metrics = chapter_content_metrics(content)
+            ch = (
+                db.query(Chapter)
+                .filter(Chapter.novel_id == novel_id, Chapter.chapter_no == no)
+                .order_by(Chapter.updated_at.desc())
+                .first()
+            )
+            target_status = "approved" if auto_approve else "pending_review"
+            if ch:
+                ch.title = normalized_title
+                ch.content = content
+                ch.pending_content = ""
+                ch.pending_revision_prompt = ""
+                ch.status = target_status
+                ch.source = source
+            else:
+                ch = Chapter(
+                    novel_id=novel_id,
+                    chapter_no=no,
+                    title=normalized_title,
+                    content=content,
+                    status=target_status,
+                    source=source,
                 )
+                db.add(ch)
+                db.flush()
+
+            if auto_approve and memory_delta_result is not None:
                 append_generation_log(
                     db,
                     novel_id=novel_id,
                     batch_id=batch_id,
-                    event="chapter_memory_delta_failed",
+                    event="chapter_memory_delta_applied",
                     chapter_no=no,
-                    level="error",
-                    message=f"第 {no} 章工作记忆更新异常，已保留旧记忆",
+                    message=f"第 {no} 章工作记忆已更新",
+                    meta=memory_delta_result.get("stats") or {},
                 )
-                db.commit()
 
-        saved_metrics = chapter_content_metrics(content)
-        ch = (
-            db.query(Chapter)
-            .filter(Chapter.novel_id == novel_id, Chapter.chapter_no == no)
-            .order_by(Chapter.updated_at.desc())
-            .first()
-        )
-        target_status = "approved" if auto_approve else "pending_review"
-        if ch:
-            ch.title = normalized_title
-            ch.content = content
-            ch.pending_content = ""
-            ch.pending_revision_prompt = ""
-            ch.status = target_status
-            ch.source = source
-        else:
-            ch = Chapter(
+            created.append(ch.id)
+            status_label = "已审定" if auto_approve else "待审定"
+            append_generation_log(
+                db,
                 novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_saved",
                 chapter_no=no,
-                title=normalized_title,
-                content=content,
-                status=target_status,
-                source=source,
+                message=f"第 {no} 章已保存（{status_label}，正文约 {saved_metrics['body_chars']} 字）",
+                meta={
+                    "chapter_id": ch.id,
+                    **saved_metrics,
+                    "elapsed_seconds": round(time.perf_counter() - step_start, 2),
+                },
             )
-            db.add(ch)
-            db.flush()
-        created.append(ch.id)
-        status_label = "已审定" if auto_approve else "待审定"
-        append_generation_log(
-            db,
-            novel_id=novel_id,
-            batch_id=batch_id,
-            event="chapter_saved",
-            chapter_no=no,
-            message=f"第 {no} 章已保存（{status_label}，正文约 {saved_metrics['body_chars']} 字）",
-            meta={
-                "chapter_id": ch.id,
-                **saved_metrics,
-                "elapsed_seconds": round(time.perf_counter() - step_start, 2),
-            },
-        )
-        db.commit()
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.exception(
+                "generate_chapters step failed | novel_id=%s chapter_no=%s",
+                novel_id,
+                no,
+            )
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_memory_delta_failed" if auto_approve else "chapter_failed",
+                chapter_no=no,
+                level="error",
+                message=(
+                    f"第 {no} 章工作记忆更新失败，已停止后续生成：{e}"
+                    if auto_approve
+                    else f"第 {no} 章保存失败：{e}"
+                ),
+            )
+            db.commit()
+            raise
 
     append_generation_log(
         db,

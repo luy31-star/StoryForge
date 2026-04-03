@@ -456,7 +456,7 @@ export function NovelNew() {
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="dailyTime">每日自动撰写时间</Label>
+                  <Label htmlFor="dailyTime">每日自动撰写时间（北京时间）</Label>
                   <Input
                     id="dailyTime"
                     type="time"
@@ -464,6 +464,9 @@ export function NovelNew() {
                     onChange={(e) => setDailyTime(e.target.value)}
                     className="field-shell mt-1 h-11"
                   />
+                  <p className="text-[11px] text-muted-foreground">
+                    后台定时任务按北京时间（UTC+8 / Asia/Shanghai）执行。
+                  </p>
                 </div>
               </div>
               <p className="text-xs text-muted-foreground">

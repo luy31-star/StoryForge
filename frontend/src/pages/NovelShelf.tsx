@@ -30,7 +30,8 @@ export function NovelShelf() {
 
   const [aiCreateOpen, setAiCreateOpen] = useState(false);
   const [aiCreateBusy, setAiCreateBusy] = useState(false);
-  const [aiCreateStyle, setAiCreateStyle] = useState("都市修仙");
+  const [aiCreateStyles, setAiCreateStyles] = useState<string[]>(["都市修仙"]);
+  const [aiCreateNotes, setAiCreateNotes] = useState("");
   const [aiCreateLength, setAiCreateLength] = useState("long");
   const [aiCreateInitChapters, setAiCreateInitChapters] = useState(10);
   const [aiCreateDailyChapters, setAiCreateDailyChapters] = useState(0);
@@ -69,7 +70,8 @@ export function NovelShelf() {
     setAiCreateBusy(true);
     try {
       await aiCreateAndStartNovel({
-        style: aiCreateStyle,
+        styles: aiCreateStyles,
+        notes: aiCreateNotes.trim(),
         length_type: aiCreateLength,
         target_generate_chapters: aiCreateInitChapters,
         daily_auto_chapters: aiCreateDailyChapters,
@@ -90,6 +92,14 @@ export function NovelShelf() {
     "恐怖惊悚", "悬疑推理", "灵异奇谈", "历史架空", "军事争霸", "宫廷权谋", 
     "古言宅斗", "现言种田", "青春校园", "娱乐明星"
   ];
+
+  function toggleAiStyle(tag: string) {
+    setAiCreateStyles((current) =>
+      current.includes(tag)
+        ? current.filter((item) => item !== tag)
+        : [...current, tag]
+    );
+  }
 
   return (
     <div className="novel-shell">
@@ -266,15 +276,15 @@ export function NovelShelf() {
 
           <div className="space-y-6 py-4">
             <div className="space-y-3">
-              <Label>小说题材 / 风格</Label>
+              <Label>小说题材 / 风格（可多选）</Label>
               <div className="flex flex-wrap gap-2">
                 {presets.map((p) => (
                   <button
                     key={p}
                     type="button"
-                    onClick={() => setAiCreateStyle(p)}
+                    onClick={() => toggleAiStyle(p)}
                     className={`rounded-full px-3 py-1 text-xs border transition-colors ${
-                      aiCreateStyle === p
+                      aiCreateStyles.includes(p)
                         ? "border-primary bg-primary/10 text-primary"
                         : "border-border/70 bg-background/50 text-muted-foreground hover:bg-muted/50"
                     }`}
@@ -283,11 +293,18 @@ export function NovelShelf() {
                   </button>
                 ))}
               </div>
-              <Input
-                value={aiCreateStyle}
-                onChange={(e) => setAiCreateStyle(e.target.value)}
-                placeholder="也可以手动输入你想写的任何题材..."
-                className="mt-2"
+              <p className="text-[11px] text-muted-foreground">
+                已选择：{aiCreateStyles.length ? aiCreateStyles.join("、") : "未选择"}
+              </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>补充备注</Label>
+              <textarea
+                value={aiCreateNotes}
+                onChange={(e) => setAiCreateNotes(e.target.value)}
+                placeholder="可补充你希望强调的设定、人物关系、禁忌元素、节奏要求或商业化方向，这些都会进入 LLM 提示词。"
+                className="field-shell-textarea min-h-[110px]"
               />
             </div>
 
@@ -298,9 +315,9 @@ export function NovelShelf() {
                 onChange={(e) => setAiCreateLength(e.target.value)}
                 className="flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
               >
-                <option value="short">短篇小说（10万字以内，约50-100章）</option>
+                <option value="short">短篇小说（约 15-50 章）</option>
                 <option value="medium">中篇小说（20-50万字，约100-250章）</option>
-                <option value="long">长篇小说（100万字以上，约500章以上）</option>
+                <option value="long">长篇小说（约100-150万字）</option>
               </select>
             </div>
 
@@ -331,12 +348,15 @@ export function NovelShelf() {
 
               {aiCreateDailyChapters > 0 && (
                 <div className="space-y-2 sm:col-span-2">
-                  <Label>每日定时任务时间</Label>
+                  <Label>每日定时任务时间（北京时间）</Label>
                   <Input
                     type="time"
                     value={aiCreateDailyTime}
                     onChange={(e) => setAiCreateDailyTime(e.target.value)}
                   />
+                  <p className="text-[11px] text-muted-foreground">
+                    后台定时任务按北京时间（UTC+8 / Asia/Shanghai）检查并触发。
+                  </p>
                 </div>
               )}
             </div>
@@ -346,7 +366,7 @@ export function NovelShelf() {
             <Button variant="outline" onClick={() => setAiCreateOpen(false)} disabled={aiCreateBusy}>
               取消
             </Button>
-            <Button onClick={handleAiCreate} disabled={aiCreateBusy || !aiCreateStyle.trim()}>
+            <Button onClick={handleAiCreate} disabled={aiCreateBusy || aiCreateStyles.length === 0}>
               {aiCreateBusy ? "正在后台执行..." : "确认开启全自动建书"}
             </Button>
           </DialogFooter>

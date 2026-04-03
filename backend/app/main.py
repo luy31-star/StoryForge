@@ -25,7 +25,9 @@ import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
 import app.models.project  # noqa: F401 — projects.user_id
 import app.models.workflow  # noqa: F401 — workflows.user_id
 from app.middleware.request_log import RequestLoggingMiddleware
-from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow
+from app.core.rate_limit import setup_rate_limiting
+from slowapi.middleware import SlowAPIMiddleware
+from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard
 
 logger = logging.getLogger(__name__)
 logging.getLogger("vocalflow.request").setLevel(logging.INFO)
@@ -47,10 +49,14 @@ app.add_middleware(
 )
 # 最后注册，作为最外层：记录含 CORS 在内的整段耗时
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(SlowAPIMiddleware)
+
+setup_rate_limiting(app)
 
 app.include_router(auth.router)
 app.include_router(billing.router)
 app.include_router(billing.admin_router)
+app.include_router(admin_dashboard.router)
 app.include_router(workflow.router)
 app.include_router(agents.router)
 app.include_router(llm.router)

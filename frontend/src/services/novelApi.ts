@@ -328,7 +328,8 @@ export async function createNovel(body: {
 }
 
 export async function aiCreateAndStartNovel(body: {
-  style: string;
+  styles: string[];
+  notes?: string;
   length_type: string;
   target_generate_chapters?: number;
   daily_auto_chapters?: number;
