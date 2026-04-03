@@ -246,7 +246,7 @@ def generate_volume_chapter_plan(
 ) -> dict[str, Any]:
     """入队后台生成本卷一批章计划；执行逻辑在 Celery worker 中。"""
     op = uuid.uuid4().hex[:12]
-    require_novel_access(db, novel_id, user)
+    n = require_novel_access(db, novel_id, user)
     v = db.get(NovelVolume, volume_id)
     if not v or v.novel_id != novel_id:
         raise HTTPException(404, "卷不存在")
@@ -255,9 +255,10 @@ def generate_volume_chapter_plan(
             409,
             "当前已有卷章计划生成任务进行中，请在「生成日志」中查看进度后再试",
         )
-        
+
     if n.status == "failed":
         n.status = "active"
+        db.commit()
 
     logger.info(
         "volume.chapter_plan.generate enqueue | op=%s novel_id=%s volume_id=%s force_regen=%s",
