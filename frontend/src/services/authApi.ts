@@ -19,10 +19,10 @@ export async function sendOtp(email: string) {
   return r.json() as Promise<{ status: string; message: string }>;
 }
 
-export async function register(email: string, otp: string, password: string) {
+export async function register(email: string, username: string, otp: string, password: string) {
   const r = await apiFetch("/api/auth/register", {
     method: "POST",
-    body: JSON.stringify({ email, otp, password }),
+    body: JSON.stringify({ email, username, otp, password }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{ access_token: string; token_type: string }>;

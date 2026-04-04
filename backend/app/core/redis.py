@@ -30,19 +30,20 @@ class OTPHelper:
         await redis_client.delete(key)
 
     @staticmethod
-    async def is_too_frequent(email: str) -> bool:
+    async def try_lock_send_limit(email: str, seconds: int = 60) -> bool:
         """
-        检查是否过于频繁（60秒限制）。
+        尝试获取发送锁（原子操作：检查并设置频率限制）。
+        如果 60 秒内已发送过，则返回 False。
         """
         limit_key = f"otp_limit:{email}"
-        if await redis_client.get(limit_key):
-            return True
-        return False
+        # SET NX: 仅在 key 不存在时设置成功
+        locked = await redis_client.set(limit_key, "1", ex=seconds, nx=True)
+        return bool(locked)
 
     @staticmethod
-    async def set_limit(email: str):
+    async def unlock_send_limit(email: str):
         """
-        设置发送频率限制。
+        手动解除发送限制（通常用于邮件发送彻底失败时）。
         """
         limit_key = f"otp_limit:{email}"
-        await redis_client.set(limit_key, "1", ex=60)
+        await redis_client.delete(limit_key)

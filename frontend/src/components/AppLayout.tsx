@@ -198,7 +198,7 @@ export function AppLayout() {
               <Settings className="h-5 w-5" />
               用户设置
             </DialogTitle>
-            <DialogDescription className="text-foreground/80 dark:text-muted-foreground leading-relaxed">
+            <DialogDescription className="text-foreground dark:text-muted-foreground leading-relaxed">
               配置界面风格；用户可在此调整个人偏好的模型与联网搜索设置。
             </DialogDescription>
             {settingsGateHint ? (
@@ -210,7 +210,7 @@ export function AppLayout() {
 
           <div className="space-y-6 py-4">
             <section className="space-y-3">
-              <Label className="text-sm font-bold uppercase tracking-wider text-foreground/90 dark:text-foreground/70">
+              <Label className="text-sm font-bold uppercase tracking-wider text-foreground dark:text-foreground/70">
                 界面风格
               </Label>
               <div className="grid grid-cols-3 gap-3">
@@ -225,7 +225,7 @@ export function AppLayout() {
                     className={`relative flex flex-col items-center justify-center gap-2 rounded-2xl border p-4 transition-all duration-300 ${
                       theme === item.id
                         ? "border-primary/35 bg-primary/8 text-primary shadow-[0_16px_36px_hsl(var(--primary)/0.12)]"
-                        : "border-border/70 bg-background/40 text-muted-foreground hover:border-muted-foreground/30 hover:bg-background/60"
+                        : "border-border/70 bg-background/40 text-foreground dark:text-muted-foreground hover:border-muted-foreground/30 hover:bg-background/60"
                     }`}
                   >
                     <item.icon className="h-5 w-5" />
@@ -241,10 +241,10 @@ export function AppLayout() {
             </section>
 
             <section id="settings-llm-section" className="space-y-4 pt-2 border-t border-border scroll-mt-4">
-              <Label className="text-sm font-bold uppercase tracking-wider text-foreground/90 dark:text-foreground/70">
+              <Label className="text-sm font-bold uppercase tracking-wider text-foreground dark:text-foreground/70">
                 大模型配置
               </Label>
-              <p className="text-xs text-foreground/80 dark:text-foreground/60 font-medium">
+              <p className="text-xs text-foreground dark:text-foreground/60 font-medium">
                 这里的配置仅对您当前账号生效。管理员在后台维护模型计价规则。
               </p>
 
@@ -256,7 +256,7 @@ export function AppLayout() {
                       <HelpCircle className="h-3.5 w-3.5 text-muted-foreground" />
                     </span>
                   </div>
-                  <p className="text-[11px] text-foreground/70 dark:text-foreground/50 font-medium">
+                  <p className="text-[11px] text-foreground dark:text-foreground/50 font-medium">
                     计价单位为人民币/百万 token（入/出分列），扣费按积分换算。
                   </p>
                   <ModelPriceSelect
@@ -272,7 +272,7 @@ export function AppLayout() {
 
               <div className="glass-panel-subtle space-y-3 p-4">
                 <div className="flex items-center gap-1.5">
-                  <Label className="text-xs font-bold text-foreground/90 dark:text-foreground/70 italic">联网搜索 (Web Search)</Label>
+                  <Label className="text-xs font-bold text-foreground dark:text-foreground/70 italic">联网搜索 (Web Search)</Label>
                   <span title="开启后，大模型在生成前会先搜索互联网实时信息（302.AI 提供）。" className="cursor-help">
                     <HelpCircle className="h-3.5 w-3.5 text-muted-foreground" />
                   </span>

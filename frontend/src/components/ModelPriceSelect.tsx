@@ -21,15 +21,15 @@ function PriceBadges({ p, c }: { p: number; c: number }) {
   return (
     <div className="flex shrink-0 flex-col items-end gap-0.5 text-right">
       <div className="flex items-center gap-1 group/price cursor-help" title="大模型的 Prompt (输入) 与 Completion (输出) 价格，单位为人民币/百万 Token">
-        <span className="text-[10px] tabular-nums text-foreground/70 dark:text-muted-foreground">
+        <span className="text-[10px] tabular-nums text-foreground/80 dark:text-muted-foreground">
           入 <span className="font-semibold text-foreground dark:font-medium dark:text-foreground/90 group-hover/price:text-primary transition-colors">¥{p.toFixed(2)}</span>
-          <span className="text-foreground/60 dark:text-muted-foreground/80"> /M</span>
+          <span className="text-foreground/70 dark:text-muted-foreground/80"> /M</span>
         </span>
-        <HelpCircle className="h-2.5 w-2.5 text-foreground/40 dark:text-muted-foreground/50 group-hover/price:text-primary/70 transition-colors" />
+        <HelpCircle className="h-2.5 w-2.5 text-foreground/50 dark:text-muted-foreground/50 group-hover/price:text-primary/70 transition-colors" />
       </div>
-      <span className="text-[10px] tabular-nums text-foreground/70 dark:text-muted-foreground">
+      <span className="text-[10px] tabular-nums text-foreground/80 dark:text-muted-foreground">
         出 <span className="font-semibold text-foreground dark:font-medium dark:text-foreground/90 group-hover/price:text-primary transition-colors">¥{c.toFixed(2)}</span>
-        <span className="text-foreground/60 dark:text-muted-foreground/80"> /M</span>
+        <span className="text-foreground/70 dark:text-muted-foreground/80"> /M</span>
       </span>
     </div>
   );

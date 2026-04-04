@@ -16,19 +16,20 @@ async def send_email_async(subject: str, to_email: str, content: str):
     message.set_content(content, subtype="html")
 
     try:
+        # aiosmtplib 的 use_tls=True 对应 SSL (通常 465 端口)
+        # start_tls=True 对应 STARTTLS (通常 587/25 端口)
         await aiosmtplib.send(
             message,
             hostname=settings.mail_server,
             port=settings.mail_port,
             username=settings.mail_username,
             password=settings.mail_password,
-            use_tls=settings.mail_use_tls,
-            start_tls=settings.mail_use_tls, # 某些配置可能需要 start_tls
+            use_tls=settings.mail_use_ssl, 
+            start_tls=settings.mail_use_tls,
         )
         logger.info(f"Email sent successfully to {to_email}")
     except Exception as e:
-        logger.error(f"Failed to send email to {to_email}: {str(e)}")
-        # 注意：在生产环境中，这里可以抛出异常或记录到失败重试队列
+        logger.exception(f"Failed to send email to {to_email}")
         raise e
 
 async def send_otp_email(email: str, otp: str):

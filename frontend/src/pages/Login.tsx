@@ -24,7 +24,20 @@ export function Login() {
       setAuth(access_token, me);
       nav(loc.state?.from || "/novels", { replace: true });
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "登录失败");
+      let msg = "登录失败，请检查账号密码";
+      if (e instanceof Error) {
+        try {
+          const detail = JSON.parse(e.message);
+          if (detail.detail) {
+            msg = typeof detail.detail === "string" ? detail.detail : detail.detail[0]?.msg || "登录信息有误";
+          } else {
+            msg = e.message;
+          }
+        } catch {
+          msg = e.message;
+        }
+      }
+      setErr(msg);
     } finally {
       setBusy(false);
     }

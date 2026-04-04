@@ -4,11 +4,13 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { fetchMe, register as registerApi, sendOtp } from "@/services/authApi";
 import { useAuthStore } from "@/stores/authStore";
+import { Loader2 } from "lucide-react"; // 引入加载图标
 
 export function Register() {
   const nav = useNavigate();
   const setAuth = useAuthStore((s) => s.setAuth);
   const [email, setEmail] = useState("");
+  const [username, setUsername] = useState("");
   const [otp, setOtp] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
@@ -17,10 +19,13 @@ export function Register() {
   const [countdown, setCountdown] = useState(0);
 
   useEffect(() => {
+    let timer: NodeJS.Timeout;
     if (countdown > 0) {
-      const timer = setTimeout(() => setCountdown(countdown - 1), 1000);
-      return () => clearTimeout(timer);
+      timer = setTimeout(() => setCountdown(countdown - 1), 1000);
     }
+    return () => {
+      if (timer) clearTimeout(timer);
+    };
   }, [countdown]);
 
   async function onSendOtp() {
@@ -34,7 +39,9 @@ export function Register() {
       await sendOtp(email.trim());
       setCountdown(60);
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "发送验证码失败");
+      const msg = e instanceof Error ? e.message : "发送验证码失败";
+      setErr(msg);
+      // 如果是频率限制，也可以从后端获取剩余时间，这里简单处理
     } finally {
       setOtpBusy(false);
     }
@@ -45,12 +52,36 @@ export function Register() {
     setErr(null);
     setBusy(true);
     try {
-      const { access_token } = await registerApi(email.trim(), otp.trim(), password);
+      const { access_token } = await registerApi(email.trim(), username.trim(), otp.trim(), password);
       const me = await fetchMe(access_token);
       setAuth(access_token, me);
       nav("/novels", { replace: true });
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "注册失败");
+      let msg = "注册失败，请稍后再试";
+      if (e instanceof Error) {
+        try {
+          // 尝试解析 Pydantic 的 JSON 错误格式
+          const detail = JSON.parse(e.message);
+          if (detail.detail && Array.isArray(detail.detail)) {
+            const firstErr = detail.detail[0];
+            if (firstErr.type === "string_too_short" && firstErr.loc.includes("otp")) {
+              msg = "验证码必须是 6 位数字哦";
+            } else if (firstErr.type === "string_too_short" && firstErr.loc.includes("password")) {
+              msg = "密码长度至少需要 6 位";
+            } else if (firstErr.type === "value_error" && firstErr.msg.includes("email")) {
+              msg = "邮箱格式不太对，检查一下吧";
+            } else {
+              msg = firstErr.msg;
+            }
+          } else {
+            msg = e.message;
+          }
+        } catch {
+          // 如果不是 JSON，直接显示原始错误或友好提示
+          msg = e.message;
+        }
+      }
+      setErr(msg);
     } finally {
       setBusy(false);
     }
@@ -68,10 +99,24 @@ export function Register() {
               <label className="text-sm font-medium">电子邮箱</label>
               <input
                 type="email"
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
                 autoComplete="email"
+                placeholder="example@163.com"
+                required
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">用户名</label>
+              <input
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                autoComplete="username"
+                placeholder="请设置您的唯一用户名"
+                minLength={2}
+                maxLength={64}
                 required
               />
             </div>
@@ -79,7 +124,7 @@ export function Register() {
               <label className="text-sm font-medium">验证码</label>
               <div className="flex gap-2">
                 <input
-                  className="h-10 flex-1 rounded-md border border-input bg-background px-3 text-sm"
+                  className="h-10 flex-1 rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
                   value={otp}
                   onChange={(e) => setOtp(e.target.value)}
                   placeholder="6 位数字"
@@ -89,11 +134,17 @@ export function Register() {
                 <Button
                   type="button"
                   variant="outline"
-                  className="w-32"
+                  className="w-32 transition-all"
                   onClick={onSendOtp}
                   disabled={otpBusy || countdown > 0}
                 >
-                  {countdown > 0 ? `${countdown}s` : "获取验证码"}
+                  {otpBusy ? (
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                  ) : countdown > 0 ? (
+                    `${countdown}s`
+                  ) : (
+                    "获取验证码"
+                  )}
                 </Button>
               </div>
             </div>
@@ -101,24 +152,34 @@ export function Register() {
               <label className="text-sm font-medium">设置密码（至少 6 位）</label>
               <input
                 type="password"
-                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
                 value={password}
                 onChange={(e) => setPassword(e.target.value)}
                 autoComplete="new-password"
                 minLength={6}
+                placeholder="请设置您的登录密码"
                 required
               />
             </div>
             {err ? (
-              <p className="text-sm text-destructive whitespace-pre-wrap">{err}</p>
+              <div className="bg-destructive/10 border border-destructive/20 text-destructive text-xs p-3 rounded-md animate-in fade-in zoom-in duration-200">
+                {err}
+              </div>
             ) : null}
-            <Button type="submit" className="w-full" disabled={busy}>
-              {busy ? "提交中…" : "注册并登录"}
+            <Button type="submit" className="w-full" disabled={busy || otpBusy}>
+              {busy ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  提交中…
+                </>
+              ) : (
+                "注册并登录"
+              )}
             </Button>
             <p className="text-center text-sm text-muted-foreground">
               已有账号？{" "}
-              <Link to="/login" className="text-primary underline">
-                登录
+              <Link to="/login" className="text-primary hover:underline font-medium">
+                立即登录
               </Link>
             </p>
           </form>

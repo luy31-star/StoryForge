@@ -15,12 +15,16 @@ from app.models.user import User
 from app.core.rate_limit import limiter
 from app.services.email_service import send_otp_email
 from app.core.redis import OTPHelper
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class RegisterBody(BaseModel):
     email: EmailStr
+    username: str = Field(..., min_length=2, max_length=64)
     otp: str = Field(..., min_length=6, max_length=6)
     password: str = Field(..., min_length=6, max_length=128)
 
@@ -55,21 +59,23 @@ async def send_otp(
     """
     email = email.strip().lower()
     
-    # 检查发送频率限制
-    if await OTPHelper.is_too_frequent(email):
-        raise HTTPException(429, "发送过于频繁，请稍后再试")
+    # 1. 尝试获取原子锁，防止并发刷邮件
+    if not await OTPHelper.try_lock_send_limit(email):
+        raise HTTPException(429, "发送过于频繁，请 60 秒后再试")
 
-    # 生成 6 位数字验证码
+    # 2. 生成验证码
     otp = "".join(random.choices(string.digits, k=6))
     
     try:
-        # 发送邮件
+        # 3. 发送邮件（耗时操作）
         await send_otp_email(email, otp)
-        # 存入 Redis 并设置限制
+        # 4. 存入 Redis
         await OTPHelper.set_otp(email, otp)
-        await OTPHelper.set_limit(email)
         return {"status": "ok", "message": "验证码已发送"}
     except Exception as e:
+        # 邮件发送彻底失败时，解除频率锁定，允许用户重试
+        await OTPHelper.unlock_send_limit(email)
+        logger.error(f"OTP send error for {email}: {str(e)}", exc_info=True)
         raise HTTPException(500, f"邮件发送失败: {str(e)}")
 
 
@@ -81,31 +87,27 @@ async def register(
     data: RegisterBody = Body(...),
 ) -> TokenOut:
     email = data.email.strip().lower()
+    username = data.username.strip()
     
     # 1. 验证 OTP
     saved_otp = await OTPHelper.get_otp(email)
     if not saved_otp or saved_otp != data.otp:
         raise HTTPException(400, "验证码错误或已过期")
 
-    # 2. 检查邮箱是否已存在
-    exists = db.query(User).filter(User.email == email).first()
-    if exists:
+    # 2. 检查邮箱和用户名是否已存在
+    if db.query(User).filter(User.email == email).first():
         raise HTTPException(400, "该邮箱已注册")
+    if db.query(User).filter(User.username == username).first():
+        raise HTTPException(400, "用户名已被占用，换一个吧")
 
     # 3. 创建用户
     n_users = db.query(func.count(User.id)).scalar() or 0
     is_admin = n_users == 0
     points = max(0, int(settings.register_initial_points))
     
-    # 默认用户名使用邮箱前缀
-    default_username = email.split("@")[0]
-    # 确保用户名唯一（若冲突则加随机后缀）
-    while db.query(User).filter(User.username == default_username).first():
-        default_username += "".join(random.choices(string.ascii_lowercase + string.digits, k=4))
-
     user = User(
         email=email,
-        username=default_username,
+        username=username,
         hashed_password=hash_password(data.password),
         points_balance=points,
         is_admin=is_admin,
