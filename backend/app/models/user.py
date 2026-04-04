@@ -22,6 +22,9 @@ class User(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     username: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    email: Mapped[str] = mapped_column(
+        String(255), unique=True, index=True, default="luyuhrbust@163.com"
+    )
     hashed_password: Mapped[str] = mapped_column(String(255))
     points_balance: Mapped[int] = mapped_column(Integer, default=0)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)

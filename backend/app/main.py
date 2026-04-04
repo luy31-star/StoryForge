@@ -15,6 +15,7 @@ from app.core.db_migrate import (
     ensure_novel_memory_norm_extended_columns,
     ensure_novel_target_chapters,
     ensure_user_config_columns,
+    ensure_user_email_column,
     ensure_user_isolation_columns,
     relax_novel_memory_norm_columns,
 )
@@ -90,6 +91,7 @@ def on_startup() -> None:
 
     ensure_user_isolation_columns(engine)
     ensure_user_config_columns(engine)
+    ensure_user_email_column(engine)
     ensure_novel_target_chapters(engine)
     ensure_novel_memory_norm_extended_columns(engine)
     relax_novel_memory_norm_columns(engine)

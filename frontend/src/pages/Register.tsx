@@ -1,24 +1,51 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { fetchMe, register as registerApi } from "@/services/authApi";
+import { fetchMe, register as registerApi, sendOtp } from "@/services/authApi";
 import { useAuthStore } from "@/stores/authStore";
 
 export function Register() {
   const nav = useNavigate();
   const setAuth = useAuthStore((s) => s.setAuth);
-  const [username, setUsername] = useState("");
+  const [email, setEmail] = useState("");
+  const [otp, setOtp] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [otpBusy, setOtpBusy] = useState(false);
+  const [countdown, setCountdown] = useState(0);
+
+  useEffect(() => {
+    if (countdown > 0) {
+      const timer = setTimeout(() => setCountdown(countdown - 1), 1000);
+      return () => clearTimeout(timer);
+    }
+  }, [countdown]);
+
+  async function onSendOtp() {
+    if (!email || !email.includes("@")) {
+      setErr("请输入有效的邮箱地址");
+      return;
+    }
+    setErr(null);
+    setOtpBusy(true);
+    try {
+      await sendOtp(email.trim());
+      setCountdown(60);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "发送验证码失败");
+    } finally {
+      setOtpBusy(false);
+    }
+  }
 
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
     setBusy(true);
     try {
-      const { access_token } = await registerApi(username.trim(), password);
+      const { access_token } = await registerApi(email.trim(), otp.trim(), password);
       const me = await fetchMe(access_token);
       setAuth(access_token, me);
       nav("/novels", { replace: true });
@@ -38,18 +65,40 @@ export function Register() {
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium">用户名</label>
+              <label className="text-sm font-medium">电子邮箱</label>
               <input
+                type="email"
                 className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoComplete="username"
-                minLength={2}
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                autoComplete="email"
                 required
               />
             </div>
             <div className="space-y-2">
-              <label className="text-sm font-medium">密码（至少 6 位）</label>
+              <label className="text-sm font-medium">验证码</label>
+              <div className="flex gap-2">
+                <input
+                  className="h-10 flex-1 rounded-md border border-input bg-background px-3 text-sm"
+                  value={otp}
+                  onChange={(e) => setOtp(e.target.value)}
+                  placeholder="6 位数字"
+                  maxLength={6}
+                  required
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="w-32"
+                  onClick={onSendOtp}
+                  disabled={otpBusy || countdown > 0}
+                >
+                  {countdown > 0 ? `${countdown}s` : "获取验证码"}
+                </Button>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">设置密码（至少 6 位）</label>
               <input
                 type="password"
                 className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"

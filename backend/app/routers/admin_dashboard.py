@@ -8,8 +8,9 @@ from sqlalchemy import func
 
 from app.core.database import get_db
 from app.core.deps import get_current_admin
-from app.models.user import User, TokenUsage
+from app.models.user import User, TokenUsage, PointsTransaction
 from app.models.novel import Novel, Chapter
+from app.models.app_config import AppConfig
 
 # 本模块路由均通过 Depends(get_current_admin) 校验管理员身份
 router = APIRouter(prefix="/api/admin", tags=["admin-dashboard"])
@@ -20,6 +21,11 @@ class DashboardStatsOut(BaseModel):
     total_chapters: int
     total_novels: int
     total_users: int
+
+
+class PointsAdjustBody(BaseModel):
+    amount_points: int
+    note: str = ""
 
 
 @router.get("/dashboard/stats", response_model=DashboardStatsOut)
@@ -38,6 +44,33 @@ def get_dashboard_stats(
         total_novels=total_novels,
         total_users=total_users,
     )
+
+
+@router.post("/users/{user_id}/adjust-points")
+def adjust_user_points(
+    user_id: str,
+    data: PointsAdjustBody,
+    db: Session = Depends(get_db),
+    admin: User = Depends(get_current_admin),
+):
+    """管理员手动调整用户积分。"""
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(404, "用户不存在")
+    
+    # 调整积分
+    user.points_balance += data.amount_points
+    
+    # 记录流水
+    tx = PointsTransaction(
+        user_id=user.id,
+        amount_points=data.amount_points,
+        transaction_type="admin_adjust",
+        note=data.note or f"管理员 {admin.username} 手动调整"
+    )
+    db.add(tx)
+    db.commit()
+    return {"status": "ok", "new_balance": user.points_balance}
 
 
 class UserAdminOut(BaseModel):

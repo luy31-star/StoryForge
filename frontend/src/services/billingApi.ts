@@ -110,3 +110,12 @@ export async function adminGetUserTokenUsage(userId: string, days = 30) {
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<DailyTokenUsageOut[]>;
 }
+
+export async function adminAdjustUserPoints(userId: string, amount: number, note?: string) {
+  const r = await apiFetch(`/api/admin/users/${userId}/adjust-points`, {
+    method: "POST",
+    body: JSON.stringify({ amount_points: amount, note }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; new_balance: number }>;
+}

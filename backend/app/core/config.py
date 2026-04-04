@@ -44,6 +44,16 @@ class Settings(BaseSettings):
     # 新注册用户赠送积分（生产可改为 0，由充值获得）
     register_initial_points: int = 100
 
+    # 邮箱配置
+    mail_server: str = "smtp.163.com"
+    mail_port: int = 465
+    mail_username: str = ""  # 从 .env 读取
+    mail_password: str = ""  # 从 .env 读取（授权码）
+    mail_from: str = ""      # 从 .env 读取
+    mail_use_tls: bool = False
+    mail_use_ssl: bool = True
+    otp_expire_minutes: int = 10
+
     # 小说模块
     reference_txt_max_bytes: int = 15 * 1024 * 1024  # 15MB
     novel_local_upload_dir: str = "./uploads/novels"

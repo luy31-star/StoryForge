@@ -12,6 +12,7 @@ import {
   adminGetUserTokenUsage,
   adminCreateModelPrice,
   adminDeleteModelPrice,
+  adminAdjustUserPoints,
   type ModelPriceRow,
   type DashboardStats,
   type UserAdminOut,
@@ -67,6 +68,27 @@ export function Admin() {
   useEffect(() => {
     void reload();
   }, [reload]);
+
+  async function adjustPoints(userId: string) {
+    const amount = prompt("请输入要调整的积分数（正数为增加，负数为减少）", "100");
+    if (!amount) return;
+    const n = parseInt(amount);
+    if (isNaN(n)) return;
+
+    const note = prompt("请输入调整备注（可选）", "管理员手动调整");
+    
+    setBusy(true);
+    setErr(null);
+    try {
+      await adminAdjustUserPoints(userId, n, note || undefined);
+      await reloadUsers();
+      alert("调整成功");
+    } catch (e: any) {
+      setErr(e.message || "调整失败");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   async function toggle(row: ModelPriceRow) {
     setErr(null);
@@ -225,9 +247,14 @@ export function Admin() {
                           Token 消耗: {u.total_tokens_used.toLocaleString()}
                         </div>
                         <div className="text-sm">剩余积分: {u.points_balance}</div>
-                        <Button variant="outline" size="sm" onClick={() => void viewUserUsage(u.id)}>
-                          查看每日消耗
-                        </Button>
+                        <div className="flex gap-2 mt-1">
+                          <Button variant="outline" size="sm" onClick={() => void viewUserUsage(u.id)}>
+                            消耗详情
+                          </Button>
+                          <Button variant="outline" size="sm" onClick={() => void adjustPoints(u.id)}>
+                            积分调整
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   ))}

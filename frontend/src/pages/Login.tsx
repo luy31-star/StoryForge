@@ -9,7 +9,7 @@ export function Login() {
   const nav = useNavigate();
   const loc = useLocation() as { state?: { from?: string } };
   const setAuth = useAuthStore((s) => s.setAuth);
-  const [username, setUsername] = useState("");
+  const [identifier, setIdentifier] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -19,7 +19,7 @@ export function Login() {
     setErr(null);
     setBusy(true);
     try {
-      const { access_token } = await login(username.trim(), password);
+      const { access_token } = await login(identifier.trim(), password);
       const me = await fetchMe(access_token);
       setAuth(access_token, me);
       nav(loc.state?.from || "/novels", { replace: true });
@@ -39,12 +39,12 @@ export function Login() {
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4">
             <div className="space-y-2">
-              <label className="text-sm font-medium">用户名</label>
+              <label className="text-sm font-medium">用户名 或 邮箱</label>
               <input
                 className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm"
-                value={username}
-                onChange={(e) => setUsername(e.target.value)}
-                autoComplete="username"
+                value={identifier}
+                onChange={(e) => setIdentifier(e.target.value)}
+                placeholder="请输入用户名或注册邮箱"
                 required
               />
             </div>

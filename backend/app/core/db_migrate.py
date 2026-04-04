@@ -131,6 +131,35 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
         logger.exception("db migrate: ensure_novel_target_chapters failed")
 
 
+def ensure_user_email_column(engine: Engine) -> None:
+    """补齐 User 表 email 列并设置默认值。"""
+    table = "users"
+    col = "email"
+    ddl = "VARCHAR(255) DEFAULT 'luyuhrbust@163.com'"
+    
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            exists = False
+            if dialect == "sqlite":
+                exists = _has_column_sqlite(conn, table, col)
+            elif dialect == "mysql":
+                exists = _has_column_mysql(conn, table, col)
+            elif dialect in ("postgresql", "postgres"):
+                exists = _has_column_postgres(conn, table, col)
+
+            if not exists:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                # 更新已有用户邮箱为默认值
+                conn.execute(text(f"UPDATE {table} SET {col} = 'luyuhrbust@163.com' WHERE {col} IS NULL"))
+                logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+            else:
+                # 即使列存在，也确保旧用户有默认邮箱
+                conn.execute(text(f"UPDATE {table} SET {col} = 'luyuhrbust@163.com' WHERE {col} IS NULL OR {col} = ''"))
+    except Exception:
+        logger.exception("db migrate: ensure_user_email_column failed")
+
+
 def ensure_app_config_row(engine: Engine) -> None:
     """轻量初始化：确保 app_config 表至少存在一行全局配置。"""
     try:

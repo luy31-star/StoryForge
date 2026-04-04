@@ -4,6 +4,7 @@ import { persist } from "zustand/middleware";
 export type AuthUser = {
   id: string;
   username: string;
+  email: string;
   points_balance: number;
   is_admin: boolean;
 };
