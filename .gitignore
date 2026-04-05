@@ -3,6 +3,8 @@
 backend/.env
 frontend/.env
 frontend/.env.local
+secrets/
+backend/secrets/
 
 # Python
 **/.venv/

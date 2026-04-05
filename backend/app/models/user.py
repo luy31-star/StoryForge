@@ -28,6 +28,9 @@ class User(Base):
     hashed_password: Mapped[str] = mapped_column(String(255))
     points_balance: Mapped[int] = mapped_column(Integer, default=0)
     is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_frozen: Mapped[bool] = mapped_column(Boolean, default=False)
+    frozen_reason: Mapped[str] = mapped_column(Text, default="")
+    frozen_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow

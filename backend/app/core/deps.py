@@ -29,6 +29,8 @@ def get_current_user(
     user = db.get(User, user_id)
     if not user:
         raise HTTPException(status_code=401, detail="用户不存在")
+    if bool(getattr(user, "is_frozen", False)):
+        raise HTTPException(status_code=403, detail="账号已被冻结，请联系管理员")
     return user
 
 

@@ -7,6 +7,7 @@ export type AuthUser = {
   email: string;
   points_balance: number;
   is_admin: boolean;
+  is_frozen: boolean;
 };
 
 type AuthState = {

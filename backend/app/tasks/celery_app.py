@@ -26,6 +26,7 @@ celery_app.conf.include = [
     "app.tasks.video_tasks",
     "app.tasks.voice_tasks",
     "app.tasks.novel_tasks",
+    "app.tasks.billing_tasks",
 ]
 celery_app.conf.beat_schedule = {
     "novel-daily-auto-chapters": {
@@ -38,5 +39,9 @@ celery_app.conf.beat_schedule = {
             hour=settings.novel_memory_beat_hour,
             minute=settings.novel_memory_beat_minute,
         ),
+    },
+    "billing-alipay-reconcile": {
+        "task": "billing.reconcile_alipay_orders",
+        "schedule": crontab(minute=f"*/{max(1, int(settings.alipay_reconcile_interval_minutes))}"),
     },
 }

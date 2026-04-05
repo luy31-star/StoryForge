@@ -19,13 +19,19 @@ export async function sendOtp(email: string) {
   return r.json() as Promise<{ status: string; message: string }>;
 }
 
-export async function register(email: string, username: string, otp: string, password: string) {
+export async function register(email: string, username: string, invite_code: string, otp: string, password: string) {
   const r = await apiFetch("/api/auth/register", {
     method: "POST",
-    body: JSON.stringify({ email, username, otp, password }),
+    body: JSON.stringify({ email, username, invite_code, otp, password }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{ access_token: string; token_type: string }>;
+}
+
+export async function getRegistrationMode() {
+  const r = await apiFetch("/api/auth/registration-mode");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ invite_only: boolean }>;
 }
 
 export async function fetchMe(token: string) {

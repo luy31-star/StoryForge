@@ -54,6 +54,18 @@ class Settings(BaseSettings):
     mail_use_ssl: bool = True
     otp_expire_minutes: int = 10
 
+    alipay_gateway_url: str = "https://openapi.alipay.com/gateway.do"
+    alipay_app_id: str = ""
+    alipay_private_key_path: str = ""
+    alipay_public_key_path: str = ""
+    alipay_return_url: str = ""
+    alipay_notify_url: str = ""
+    alipay_sign_type: str = "RSA2"
+    alipay_reconcile_enabled: bool = False
+    alipay_reconcile_interval_minutes: int = 5
+    alipay_reconcile_min_age_minutes: int = 2
+    alipay_reconcile_lookback_hours: int = 24
+
     # 小说模块
     reference_txt_max_bytes: int = 15 * 1024 * 1024  # 15MB
     novel_local_upload_dir: str = "./uploads/novels"

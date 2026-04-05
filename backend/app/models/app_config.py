@@ -24,6 +24,8 @@ class AppConfig(Base):
     novel_memory_refresh_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
     novel_inspiration_web_search: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    invite_only_registration: Mapped[bool] = mapped_column(Boolean, default=True)
+
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
     )

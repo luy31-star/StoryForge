@@ -4,6 +4,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Body
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
+from datetime import datetime
 import random
 import string
 
@@ -11,7 +12,9 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_user
 from app.core.security import create_access_token, hash_password, verify_password
+from app.models.invite_code import InviteCode
 from app.models.user import User
+from app.services.app_config_service import get_app_config
 from app.core.rate_limit import limiter
 from app.services.email_service import send_otp_email
 from app.core.redis import OTPHelper
@@ -25,6 +28,7 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 class RegisterBody(BaseModel):
     email: EmailStr
     username: str = Field(..., min_length=2, max_length=64)
+    invite_code: str = Field(default="", max_length=64)
     otp: str = Field(..., min_length=6, max_length=6)
     password: str = Field(..., min_length=6, max_length=128)
 
@@ -45,6 +49,7 @@ class UserOut(BaseModel):
     email: str
     points_balance: int
     is_admin: bool
+    is_frozen: bool
 
 
 @router.post("/send-otp")
@@ -88,6 +93,7 @@ async def register(
 ) -> TokenOut:
     email = data.email.strip().lower()
     username = data.username.strip()
+    invite_code_raw = (data.invite_code or "").strip().upper()
     
     # 1. 验证 OTP
     saved_otp = await OTPHelper.get_otp(email)
@@ -100,9 +106,32 @@ async def register(
     if db.query(User).filter(User.username == username).first():
         raise HTTPException(400, "用户名已被占用，换一个吧")
 
-    # 3. 创建用户
+    # 3. 校验邀请码（可由管理员关闭邀请码注册；首个用户始终可注册）
     n_users = db.query(func.count(User.id)).scalar() or 0
     is_admin = n_users == 0
+    cfg = get_app_config(db)
+    invite_only = bool(getattr(cfg, "invite_only_registration", True))
+    invite = None
+    now = datetime.utcnow()
+    if (not is_admin) and invite_only:
+        if not invite_code_raw:
+            raise HTTPException(400, "需要邀请码才能注册，请联系管理员获取")
+        q = db.query(InviteCode).filter(InviteCode.code == invite_code_raw)
+        try:
+            q = q.with_for_update()
+        except Exception:
+            pass
+        invite = q.first()
+        if not invite:
+            raise HTTPException(400, "邀请码不存在，请检查后重试")
+        if bool(invite.is_frozen):
+            raise HTTPException(400, "邀请码已被冻结，请联系管理员")
+        if invite.used_by_user_id:
+            raise HTTPException(400, "邀请码已被使用")
+        if invite.expires_at and invite.expires_at < now:
+            raise HTTPException(400, "邀请码已过期")
+
+    # 4. 创建用户
     points = max(0, int(settings.register_initial_points))
     
     user = User(
@@ -113,10 +142,14 @@ async def register(
         is_admin=is_admin,
     )
     db.add(user)
+    if invite is not None:
+        invite.used_by_user_id = user.id
+        invite.used_at = now
+        db.add(invite)
     db.commit()
     db.refresh(user)
 
-    # 4. 注册成功后删除 OTP
+    # 5. 注册成功后删除 OTP
     await OTPHelper.delete_otp(email)
 
     token = create_access_token({"sub": user.id})
@@ -138,6 +171,8 @@ def login(
     
     if not user or not verify_password(data.password, user.hashed_password):
         raise HTTPException(401, "账号或密码错误")
+    if bool(user.is_frozen):
+        raise HTTPException(403, "账号已被冻结，请联系管理员")
         
     token = create_access_token({"sub": user.id})
     return TokenOut(access_token=token)
@@ -152,4 +187,15 @@ def me(current: User = Depends(get_current_user)) -> UserOut:
         email=current.email,
         points_balance=int(current.points_balance or 0),
         is_admin=bool(current.is_admin),
+        is_frozen=bool(current.is_frozen),
     )
+
+
+class RegistrationModeOut(BaseModel):
+    invite_only: bool
+
+
+@router.get("/registration-mode", response_model=RegistrationModeOut)
+def get_registration_mode(db: Session = Depends(get_db)) -> RegistrationModeOut:
+    cfg = get_app_config(db)
+    return RegistrationModeOut(invite_only=bool(getattr(cfg, "invite_only_registration", True)))

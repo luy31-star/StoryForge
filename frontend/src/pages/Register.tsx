@@ -2,21 +2,37 @@ import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
-import { fetchMe, register as registerApi, sendOtp } from "@/services/authApi";
+import { fetchMe, getRegistrationMode, register as registerApi, sendOtp } from "@/services/authApi";
 import { useAuthStore } from "@/stores/authStore";
-import { Loader2 } from "lucide-react"; // 引入加载图标
+import { Loader2 } from "lucide-react";
 
 export function Register() {
   const nav = useNavigate();
   const setAuth = useAuthStore((s) => s.setAuth);
   const [email, setEmail] = useState("");
   const [username, setUsername] = useState("");
+  const [inviteCode, setInviteCode] = useState("");
   const [otp, setOtp] = useState("");
   const [password, setPassword] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [otpBusy, setOtpBusy] = useState(false);
   const [countdown, setCountdown] = useState(0);
+  const [inviteOnly, setInviteOnly] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    getRegistrationMode()
+      .then((r) => {
+        if (!cancelled) setInviteOnly(Boolean(r.invite_only));
+      })
+      .catch(() => {
+        /* ignore */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let timer: NodeJS.Timeout;
@@ -41,7 +57,6 @@ export function Register() {
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : "发送验证码失败";
       setErr(msg);
-      // 如果是频率限制，也可以从后端获取剩余时间，这里简单处理
     } finally {
       setOtpBusy(false);
     }
@@ -52,7 +67,13 @@ export function Register() {
     setErr(null);
     setBusy(true);
     try {
-      const { access_token } = await registerApi(email.trim(), username.trim(), otp.trim(), password);
+      const { access_token } = await registerApi(
+        email.trim(),
+        username.trim(),
+        inviteCode.trim(),
+        otp.trim(),
+        password
+      );
       const me = await fetchMe(access_token);
       setAuth(access_token, me);
       nav("/novels", { replace: true });
@@ -60,14 +81,17 @@ export function Register() {
       let msg = "注册失败，请稍后再试";
       if (e instanceof Error) {
         try {
-          // 尝试解析 Pydantic 的 JSON 错误格式
           const detail = JSON.parse(e.message);
           if (detail.detail && Array.isArray(detail.detail)) {
             const firstErr = detail.detail[0];
             if (firstErr.type === "string_too_short" && firstErr.loc.includes("otp")) {
               msg = "验证码必须是 6 位数字哦";
+            } else if (firstErr.type === "string_too_short" && firstErr.loc.includes("invite_code")) {
+              msg = "请输入邀请码后再注册";
             } else if (firstErr.type === "string_too_short" && firstErr.loc.includes("password")) {
               msg = "密码长度至少需要 6 位";
+            } else if (firstErr.type === "string_too_short" && firstErr.loc.includes("username")) {
+              msg = "用户名至少需要 2 个字符";
             } else if (firstErr.type === "value_error" && firstErr.msg.includes("email")) {
               msg = "邮箱格式不太对，检查一下吧";
             } else {
@@ -77,7 +101,6 @@ export function Register() {
             msg = e.message;
           }
         } catch {
-          // 如果不是 JSON，直接显示原始错误或友好提示
           msg = e.message;
         }
       }
@@ -118,6 +141,18 @@ export function Register() {
                 minLength={2}
                 maxLength={64}
                 required
+              />
+            </div>
+            <div className="space-y-2">
+              <label className="text-sm font-medium">邀请码</label>
+              <input
+                className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                value={inviteCode}
+                onChange={(e) => setInviteCode(e.target.value)}
+                placeholder={inviteOnly ? "请输入管理员发放的邀请码" : "可选：管理员开启邀请码时才需要"}
+                minLength={4}
+                maxLength={64}
+                required={inviteOnly}
               />
             </div>
             <div className="space-y-2">

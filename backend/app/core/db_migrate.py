@@ -160,6 +160,49 @@ def ensure_user_email_column(engine: Engine) -> None:
         logger.exception("db migrate: ensure_user_email_column failed")
 
 
+def ensure_user_status_columns(engine: Engine) -> None:
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "mysql":
+                cols: tuple[tuple[str, str], ...] = (
+                    ("is_frozen", "BOOLEAN DEFAULT FALSE"),
+                    ("frozen_reason", "TEXT"),
+                    ("frozen_at", "DATETIME NULL"),
+                )
+            elif dialect in ("postgresql", "postgres"):
+                cols = (
+                    ("is_frozen", "BOOLEAN DEFAULT FALSE"),
+                    ("frozen_reason", "TEXT DEFAULT ''"),
+                    ("frozen_at", "TIMESTAMP NULL"),
+                )
+            else:
+                cols = (
+                    ("is_frozen", "BOOLEAN DEFAULT FALSE"),
+                    ("frozen_reason", "TEXT DEFAULT ''"),
+                    ("frozen_at", "DATETIME NULL"),
+                )
+            for col, ddl in cols:
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, "users", col)
+                elif dialect == "mysql":
+                    exists = _has_column_mysql(conn, "users", col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, "users", col)
+                if exists:
+                    continue
+                conn.execute(text(f"ALTER TABLE users ADD COLUMN {col} {ddl}"))
+                logger.info("db migrate: added users.%s (%s)", col, dialect)
+            if dialect == "mysql":
+                if _has_column_mysql(conn, "users", "is_frozen"):
+                    conn.execute(text("UPDATE users SET is_frozen = 0 WHERE is_frozen IS NULL"))
+                if _has_column_mysql(conn, "users", "frozen_reason"):
+                    conn.execute(text("UPDATE users SET frozen_reason = '' WHERE frozen_reason IS NULL"))
+    except Exception:
+        logger.exception("db migrate: ensure_user_status_columns failed")
+
+
 def ensure_app_config_row(engine: Engine) -> None:
     """轻量初始化：确保 app_config 表至少存在一行全局配置。"""
     try:
@@ -177,8 +220,8 @@ def ensure_app_config_row(engine: Engine) -> None:
                     "INSERT INTO app_config ("
                     "id, llm_provider, llm_model, "
                     "novel_web_search, novel_generate_web_search, novel_volume_plan_web_search, novel_memory_refresh_web_search, "
-                    "novel_inspiration_web_search, updated_at"
-                    ") VALUES (:id, :p, :m, :nws, :ngws, :npws, :nmws, :niws, CURRENT_TIMESTAMP)"
+                    "novel_inspiration_web_search, invite_only_registration, updated_at"
+                    ") VALUES (:id, :p, :m, :nws, :ngws, :npws, :nmws, :niws, :invite_only, CURRENT_TIMESTAMP)"
                 ),
                 {
                     "id": "global",
@@ -189,6 +232,7 @@ def ensure_app_config_row(engine: Engine) -> None:
                     "npws": int(bool(settings.ai302_novel_web_search)),
                     "nmws": int(bool(settings.ai302_novel_web_search)),
                     "niws": 1,
+                    "invite_only": 1,
                 },
             )
             logger.info("db migrate: inserted app_config:global")
@@ -202,6 +246,7 @@ def ensure_app_config_columns(engine: Engine) -> None:
         "novel_generate_web_search",
         "novel_volume_plan_web_search",
         "novel_memory_refresh_web_search",
+        "invite_only_registration",
     )
     try:
         with engine.begin() as conn:
@@ -210,43 +255,41 @@ def ensure_app_config_columns(engine: Engine) -> None:
                 if dialect == "sqlite":
                     if _has_column_sqlite(conn, "app_config", c):
                         continue
-                    conn.execute(
-                        text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT 0")
-                    )
-                    conn.execute(
-                        text(
-                            f"UPDATE app_config SET {c} = COALESCE(novel_web_search, 0) "
-                            f"WHERE {c} IS NULL OR {c} = 0"
+                    default_v = 1 if c == "invite_only_registration" else 0
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT {default_v}"))
+                    if c != "invite_only_registration":
+                        conn.execute(
+                            text(
+                                f"UPDATE app_config SET {c} = COALESCE(novel_web_search, 0) "
+                                f"WHERE {c} IS NULL OR {c} = 0"
+                            )
                         )
-                    )
                     logger.info("db migrate: added app_config.%s (sqlite)", c)
                 elif dialect in ("postgresql", "postgres"):
                     if _has_column_postgres(conn, "app_config", c):
                         continue
-                    conn.execute(
-                        text(
-                            f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT FALSE"
+                    default_v = "TRUE" if c == "invite_only_registration" else "FALSE"
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT {default_v}"))
+                    if c != "invite_only_registration":
+                        conn.execute(
+                            text(
+                                f"UPDATE app_config SET {c} = COALESCE(novel_web_search, FALSE) "
+                                f"WHERE {c} IS NULL OR {c} = FALSE"
+                            )
                         )
-                    )
-                    conn.execute(
-                        text(
-                            f"UPDATE app_config SET {c} = COALESCE(novel_web_search, FALSE) "
-                            f"WHERE {c} IS NULL OR {c} = FALSE"
-                        )
-                    )
                     logger.info("db migrate: added app_config.%s (postgres)", c)
                 elif dialect == "mysql":
                     if _has_column_mysql(conn, "app_config", c):
                         continue
-                    conn.execute(
-                        text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT FALSE")
-                    )
-                    conn.execute(
-                        text(
-                            f"UPDATE app_config SET {c} = COALESCE(novel_web_search, FALSE) "
-                            f"WHERE {c} IS NULL OR {c} = FALSE"
+                    default_v = "TRUE" if c == "invite_only_registration" else "FALSE"
+                    conn.execute(text(f"ALTER TABLE app_config ADD COLUMN {c} BOOLEAN DEFAULT {default_v}"))
+                    if c != "invite_only_registration":
+                        conn.execute(
+                            text(
+                                f"UPDATE app_config SET {c} = COALESCE(novel_web_search, FALSE) "
+                                f"WHERE {c} IS NULL OR {c} = FALSE"
+                            )
                         )
-                    )
                     logger.info("db migrate: added app_config.%s (mysql)", c)
                 else:
                     logger.warning("db migrate: unsupported dialect=%s, skip %s", dialect, c)
@@ -479,4 +522,3 @@ def ensure_user_config_columns(engine: Engine) -> None:
                     logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
     except Exception:
         logger.exception("db migrate: ensure_user_config_columns failed")
-

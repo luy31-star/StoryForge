@@ -2,15 +2,23 @@
 
 from __future__ import annotations
 
+import json
+import time
 import uuid
-from fastapi import APIRouter, Depends, HTTPException
+from datetime import datetime
+
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.deps import get_current_admin, get_current_user
+from app.models.recharge_order import RechargeOrder
 from app.models.user import ModelPrice, PointsTransaction, User
+from app.services.alipay_client import AlipayClient
+from app.services.recharge_service import apply_recharge_paid, fmt_amount_cny
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 # 以下 admin_router 路由均通过 Depends(get_current_admin) 校验管理员身份
@@ -53,6 +61,161 @@ def mock_recharge(
     db.commit()
     db.refresh(u)
     return RechargeOut(points_added=pts, points_balance=int(u.points_balance))
+
+
+class AlipayRechargeCreateOut(BaseModel):
+    out_trade_no: str
+    amount_cny: int
+    points: int
+    form_html: str
+
+
+@router.post("/recharge/alipay-form", response_model=AlipayRechargeCreateOut)
+def create_alipay_recharge_form(
+    body: RechargeBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> AlipayRechargeCreateOut:
+    if not settings.alipay_notify_url or not settings.alipay_return_url:
+        raise HTTPException(500, "支付未配置，请联系管理员")
+
+    amount_cny = int(body.amount_cny)
+    points = amount_cny * int(settings.points_per_cny)
+    if points <= 0:
+        raise HTTPException(400, "充值金额无效")
+
+    out_trade_no = f"sf{int(time.time())}{uuid.uuid4().hex[:10]}"
+    order = RechargeOrder(
+        user_id=user.id,
+        channel="alipay",
+        out_trade_no=out_trade_no,
+        amount_cny=amount_cny,
+        points=points,
+        status="created",
+    )
+    db.add(order)
+    db.commit()
+
+    subject = f"StoryForge 积分充值 {amount_cny} 元"
+    form_html = AlipayClient().page_pay_form(
+        out_trade_no=out_trade_no,
+        total_amount=fmt_amount_cny(amount_cny),
+        subject=subject,
+        notify_url=settings.alipay_notify_url,
+        return_url=settings.alipay_return_url,
+    )
+    return AlipayRechargeCreateOut(
+        out_trade_no=out_trade_no,
+        amount_cny=amount_cny,
+        points=points,
+        form_html=form_html,
+    )
+
+
+class RechargeOrderOut(BaseModel):
+    out_trade_no: str
+    amount_cny: int
+    points: int
+    status: str
+    trade_status: str
+    created_at: datetime
+    paid_at: datetime | None = None
+
+
+@router.get("/recharge/orders/{out_trade_no}", response_model=RechargeOrderOut)
+def get_recharge_order(
+    out_trade_no: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> RechargeOrderOut:
+    row = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
+    if not row or row.user_id != user.id:
+        raise HTTPException(404, "订单不存在")
+    return RechargeOrderOut(
+        out_trade_no=row.out_trade_no,
+        amount_cny=int(row.amount_cny or 0),
+        points=int(row.points or 0),
+        status=row.status,
+        trade_status=row.trade_status,
+        created_at=row.created_at,
+        paid_at=row.paid_at,
+    )
+
+
+@router.post("/recharge/alipay-notify")
+async def alipay_notify(request: Request, db: Session = Depends(get_db)):
+    form = await request.form()
+    params = {k: str(v) for k, v in form.items()}
+    if not params:
+        return PlainTextResponse("failure")
+
+    client = AlipayClient()
+    if not client.verify(params):
+        return PlainTextResponse("failure")
+
+    out_trade_no = params.get("out_trade_no") or ""
+    trade_status = params.get("trade_status") or ""
+    total_amount = params.get("total_amount") or ""
+    alipay_trade_no = params.get("trade_no") or ""
+
+    order = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
+    if not order:
+        return PlainTextResponse("failure")
+
+    if total_amount and total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+        return PlainTextResponse("failure")
+
+    order.notify_raw = json.dumps(params, ensure_ascii=False)
+    order.notified_at = datetime.utcnow()
+    order.trade_status = trade_status
+    order.alipay_trade_no = alipay_trade_no or order.alipay_trade_no
+
+    if trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+        apply_recharge_paid(db, order, trade_status, alipay_trade_no, params, via="notify")
+        db.commit()
+        return PlainTextResponse("success")
+
+    if trade_status in ("TRADE_CLOSED",):
+        order.status = "closed"
+        db.commit()
+        return PlainTextResponse("success")
+
+    db.commit()
+    return PlainTextResponse("success")
+
+
+class AdminAlipayReconcileBody(BaseModel):
+    out_trade_no: str = Field(..., min_length=8, max_length=64)
+
+
+@admin_router.post("/recharge/alipay/reconcile-one")
+def admin_reconcile_one(
+    body: AdminAlipayReconcileBody,
+    db: Session = Depends(get_db),
+    _: User = Depends(get_current_admin),
+):
+    client = AlipayClient()
+    order = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == body.out_trade_no).first()
+    if not order:
+        raise HTTPException(404, "订单不存在")
+
+    q = client.trade_query_sync(order.out_trade_no)
+    order.query_raw = json.dumps(q.raw, ensure_ascii=False)
+    order.reconciled_at = datetime.utcnow()
+    order.trade_status = q.trade_status or order.trade_status
+    order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
+
+    if q.total_amount and q.total_amount != _fmt_amount(int(order.amount_cny or 0)):
+        db.commit()
+        raise HTTPException(400, "金额不匹配，已记录查询结果")
+
+    if q.trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+        apply_recharge_paid(db, order, q.trade_status, q.alipay_trade_no, q.raw, via="query")
+    elif q.trade_status in ("TRADE_CLOSED",):
+        order.status = "closed"
+
+    db.commit()
+    return {"status": "ok", "order_status": order.status, "trade_status": order.trade_status}
 
 
 class ModelPriceOut(BaseModel):

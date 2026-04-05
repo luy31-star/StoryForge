@@ -17,12 +17,15 @@ from app.core.db_migrate import (
     ensure_user_config_columns,
     ensure_user_email_column,
     ensure_user_isolation_columns,
+    ensure_user_status_columns,
     relax_novel_memory_norm_columns,
 )
 from app.core.database import SessionLocal
 from app.services.runtime_llm_config import ensure_app_config_llm_model_filled
 import app.models.app_config  # noqa: F401 — ensure metadata registers
 import app.models.user  # noqa: F401 — users / billing 表
+import app.models.recharge_order  # noqa: F401 — recharge orders
+import app.models.invite_code  # noqa: F401 — invite codes
 import app.models.novel  # noqa: F401 — 确保 metadata 建表
 import app.models.novel_memory_norm  # noqa: F401 — 规范化记忆表
 import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
@@ -92,6 +95,7 @@ def on_startup() -> None:
     ensure_user_isolation_columns(engine)
     ensure_user_config_columns(engine)
     ensure_user_email_column(engine)
+    ensure_user_status_columns(engine)
     ensure_novel_target_chapters(engine)
     ensure_novel_memory_norm_extended_columns(engine)
     relax_novel_memory_norm_columns(engine)

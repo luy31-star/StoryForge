@@ -1,12 +1,31 @@
 import { apiFetch } from "@/services/api";
 
-export async function mockRecharge(amountCny: number) {
-  const r = await apiFetch("/api/billing/recharge", {
+export async function createAlipayRechargeForm(amountCny: number) {
+  const r = await apiFetch("/api/billing/recharge/alipay-form", {
     method: "POST",
     body: JSON.stringify({ amount_cny: amountCny }),
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<{ points_added: number; points_balance: number }>;
+  return r.json() as Promise<{
+    out_trade_no: string;
+    amount_cny: number;
+    points: number;
+    form_html: string;
+  }>;
+}
+
+export async function getRechargeOrder(outTradeNo: string) {
+  const r = await apiFetch(`/api/billing/recharge/orders/${encodeURIComponent(outTradeNo)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    out_trade_no: string;
+    amount_cny: number;
+    points: number;
+    status: string;
+    trade_status: string;
+    created_at: string;
+    paid_at?: string | null;
+  }>;
 }
 
 export type ModelPriceRow = {
@@ -89,9 +108,13 @@ export async function adminGetDashboardStats() {
 export type UserAdminOut = {
   id: string;
   username: string;
+  email: string;
   created_at: string;
   points_balance: number;
   total_tokens_used: number;
+  is_admin: boolean;
+  is_frozen: boolean;
+  frozen_reason: string;
 };
 
 export async function adminListUsers() {
@@ -118,4 +141,88 @@ export async function adminAdjustUserPoints(userId: string, amount: number, note
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{ status: string; new_balance: number }>;
+}
+
+export async function adminFreezeUser(userId: string, reason?: string) {
+  const r = await apiFetch(`/api/admin/users/${userId}/freeze`, {
+    method: "POST",
+    body: JSON.stringify({ reason }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; is_frozen: boolean }>;
+}
+
+export async function adminUnfreezeUser(userId: string) {
+  const r = await apiFetch(`/api/admin/users/${userId}/unfreeze`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; is_frozen: boolean }>;
+}
+
+export type InviteCodeRow = {
+  id: string;
+  code: string;
+  is_frozen: boolean;
+  expires_at?: string | null;
+  used_at?: string | null;
+  used_by_user_id?: string | null;
+  used_by_username?: string | null;
+  note: string;
+  created_at: string;
+  created_by_admin_id: string;
+  created_by_admin_username?: string | null;
+};
+
+export async function adminListInviteCodes(page = 1, pageSize = 20) {
+  const r = await apiFetch(`/api/admin/invite-codes?page=${page}&page_size=${pageSize}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    items: InviteCodeRow[];
+    total: number;
+    page: number;
+    page_size: number;
+  }>;
+}
+
+export async function adminCreateInviteCode(expiresInDays?: number, note?: string) {
+  const r = await apiFetch("/api/admin/invite-codes", {
+    method: "POST",
+    body: JSON.stringify({ expires_in_days: expiresInDays, note }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<InviteCodeRow>;
+}
+
+export async function adminFreezeInviteCode(inviteId: string) {
+  const r = await apiFetch(`/api/admin/invite-codes/${inviteId}/freeze`, { method: "POST" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; is_frozen: boolean }>;
+}
+
+export async function adminUnfreezeInviteCode(inviteId: string) {
+  const r = await apiFetch(`/api/admin/invite-codes/${inviteId}/unfreeze`, { method: "POST" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; is_frozen: boolean }>;
+}
+
+export async function adminDeleteInviteCode(inviteId: string) {
+  const r = await apiFetch(`/api/admin/invite-codes/${inviteId}`, { method: "DELETE" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function adminGetRegistrationMode() {
+  const r = await apiFetch("/api/admin/registration-mode");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ invite_only: boolean }>;
+}
+
+export async function adminSetRegistrationMode(inviteOnly: boolean) {
+  const r = await apiFetch("/api/admin/registration-mode", {
+    method: "POST",
+    body: JSON.stringify({ invite_only: inviteOnly }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ invite_only: boolean }>;
 }
