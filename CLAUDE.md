@@ -45,7 +45,7 @@ docker compose up --build -d
 cd docker && docker compose -f docker-compose.dev.yml up --build
 ```
 
-Default image prefix is `docker.io/library/` (Docker Hub). For China mirrors, set `DOCKER_HUB_PREFIX=docker.m.daocloud.io/library` in `.env`.
+Default image prefix is `docker.m.daocloud.io/library/` (China mirror of Docker Hub). For direct Hub access, set `DOCKER_HUB_PREFIX=docker.io/library` in `.env`.
 
 ### Celery Tasks
 

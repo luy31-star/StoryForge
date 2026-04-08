@@ -90,6 +90,13 @@ def on_startup() -> None:
     else:
         logger.error("Failed to connect to database after several attempts.")
         if last_exc:
+            err_s = str(last_exc)
+            if "Unknown database" in err_s or "1049" in err_s:
+                logger.error(
+                    "数据库不存在（常见于 MySQL）：请在实例上先执行 CREATE DATABASE，"
+                    "库名须与 DATABASE_URL 路径中的库名一致，并授予连接用户该库的权限；"
+                    "Docker 官方 mysql 镜像可通过 MYSQL_DATABASE 自动建库，云数据库/RDS 通常需手动创建。"
+                )
             raise last_exc
 
     ensure_user_isolation_columns(engine)

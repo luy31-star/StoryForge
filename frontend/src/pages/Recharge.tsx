@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { Button } from "@/components/ui/button";
+import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { cn } from "@/lib/utils";
 import { createAlipayRechargeForm, getRechargeOrder } from "@/services/billingApi";
 import { fetchMe } from "@/services/authApi";
 import { useAuthStore } from "@/stores/authStore";
@@ -72,17 +73,38 @@ export function Recharge() {
     setErr(null);
     setNotice(null);
     setBusy(true);
+    const w = window.open("", "alipay_pay_window");
     try {
-      const { out_trade_no, form_html, points } = await createAlipayRechargeForm(cny);
-      const w = window.open("", "_blank", "noopener,noreferrer");
       if (!w) {
-        throw new Error("浏览器拦截了新窗口，请允许弹窗后重试");
+        throw new Error("浏览器拦截了新窗口，请在浏览器设置中允许本站弹窗后重试");
       }
-      w.document.open();
-      w.document.write(form_html);
-      w.document.close();
+      w.document.body.innerHTML = "<div style='padding: 20px; font-family: sans-serif;'>正在生成支付页面…</div>";
+
+      const { out_trade_no, form_html, points } = await createAlipayRechargeForm(cny);
       setPendingOutTradeNo(out_trade_no);
       setNotice(`已发起支付：${cny} 元（+${points} 积分），请在新窗口完成支付…`);
+
+      const doc = new DOMParser().parseFromString(form_html, "text/html");
+      const form = doc.getElementById("alipay_form") as HTMLFormElement | null;
+      if (!form) {
+        throw new Error("支付表单生成失败，请重试");
+      }
+
+      if (w.closed) {
+        throw new Error("支付窗口已关闭，请重试");
+      }
+
+      // 将表单插入当前页面，并设置 target 指向刚才打开的新窗口
+      const formEl = form.cloneNode(true) as HTMLFormElement;
+      formEl.style.display = "none";
+      formEl.target = "alipay_pay_window";
+      document.body.appendChild(formEl);
+      
+      try {
+        formEl.submit();
+      } finally {
+        setTimeout(() => formEl.remove(), 1000);
+      }
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "充值失败");
     } finally {
@@ -95,7 +117,7 @@ export function Recharge() {
       <div className="mx-auto max-w-lg space-y-6">
         <div className="flex items-center justify-between">
           <h1 className="text-2xl font-bold">积分充值</h1>
-          <Button variant="ghost" size="sm" asChild>
+          <Button className={buttonVariants({ variant: "ghost", size: "sm" })} asChild>
             <Link to="/novels">返回</Link>
           </Button>
         </div>
@@ -115,8 +137,7 @@ export function Recharge() {
                   <div className="text-sm text-muted-foreground">{cny} 元</div>
                   <div className="font-medium">{cny * 10} 积分</div>
                   <Button
-                    className="mt-2 w-full"
-                    size="sm"
+                    className={cn(buttonVariants({ size: "sm" }), "mt-2 w-full")}
                     disabled={busy}
                     onClick={() => void pay(cny)}
                   >

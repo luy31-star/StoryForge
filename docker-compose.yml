@@ -4,7 +4,7 @@
 #   docker compose up --build -d
 # 访问：http://localhost:8080 ；API 直连调试：http://localhost:8000
 #
-# 基础镜像默认走 DaoCloud 对 Docker Hub 的镜像（docker.m.daocloud.io/library）。海外或镜像不可用时在 .env 设：
+# 基础镜像默认 DaoCloud 同步的 Docker Hub 官方库（国内拉取更稳）。海外直连 Hub 时在 .env 设：
 #   DOCKER_HUB_PREFIX=docker.io/library
 #
 # 若报错 lookup *.io on *:53: i/o timeout：本机 DNS（常为公司路由）对 Docker 不可用。请在 Docker
@@ -14,6 +14,8 @@
 services:
   mysql:
     image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/mysql:8
+    # 并发请求 + Celery 同时更新 users 等表时，默认锁等待易 1205；适当放宽
+    command: --innodb-lock-wait-timeout=120 --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     environment:
       MYSQL_DATABASE: vocalflow
       MYSQL_USER: user
@@ -56,6 +58,7 @@ services:
       - .env
     volumes:
       - novel_uploads:/app/backend/uploads/novels
+      - ./docker/secrets:/app/backend/secrets:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -76,6 +79,7 @@ services:
       - .env
     volumes:
       - novel_uploads:/app/backend/uploads/novels
+      - ./docker/secrets:/app/backend/secrets:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -97,10 +101,14 @@ services:
     env_file:
       - .env
     depends_on:
+      mysql:
+        condition: service_healthy
       redis:
         condition: service_healthy
       backend:
         condition: service_started
+    volumes:
+      - ./docker/secrets:/app/backend/secrets:ro
 
   frontend:
     build:
@@ -108,6 +116,8 @@ services:
       dockerfile: docker/Dockerfile.frontend
       args:
         DOCKER_HUB_PREFIX: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}
+        # 国内 npm 默认 npmmirror；若仍慢可改 .env：NPM_REGISTRY=https://mirrors.cloud.tencent.com/npm/
+        NPM_REGISTRY: ${NPM_REGISTRY:-https://registry.npmmirror.com}
     ports:
       - "8080:80"
     depends_on:

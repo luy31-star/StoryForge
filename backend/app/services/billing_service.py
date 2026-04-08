@@ -119,3 +119,46 @@ def assert_sufficient_balance(db: Session, user_id: str, min_points: int = 1) ->
         raise RuntimeError(
             f"积分不足：至少需要 {min_points} 积分，当前 {user.points_balance}"
         )
+
+
+def consume_points_fixed(
+    db: Session,
+    *,
+    user_id: str,
+    cost_points: int,
+    note: str,
+) -> int:
+    cost = int(cost_points or 0)
+    if cost <= 0:
+        return 0
+
+    user = db.get(User, user_id)
+    if not user:
+        logger.warning("billing: user missing | user_id=%s", user_id)
+        return 0
+
+    if user.points_balance < cost:
+        raise RuntimeError(f"积分不足：需要 {cost}，当前 {user.points_balance}")
+
+    user.points_balance -= cost
+    db.add(
+        PointsTransaction(
+            user_id=user_id,
+            amount_points=-cost,
+            transaction_type="consumption",
+            note=note,
+        )
+    )
+    db.flush()
+    return cost
+
+
+def estimate_points_for_tts(text: str) -> int:
+    n = len((text or "").strip())
+    if n <= 0:
+        return 0
+    return max(1, int(math.ceil(n / 500.0)))
+
+
+def estimate_points_for_video_submit() -> int:
+    return 10

@@ -47,7 +47,7 @@ docker compose up --build -d
 
 包含 **Postgres、Redis、FastAPI、Celery Worker、Celery Beat、Nginx 前端**（反代 `/api`、`/ws`，上传体上限约 18MB，小说参考 txt 单文件最大 15MB）。访问 <http://localhost:8080>，API 直连 <http://localhost:8000>。小说本地上传目录挂载卷 `novel_uploads`。
 
-`docker-compose.yml` 中基础镜像默认使用 **`docker.io/library/...`**（Docker Hub 官方）。若国内访问 Hub 慢或 DaoCloud 更稳，可在根目录 `.env` 设置 `DOCKER_HUB_PREFIX=docker.m.daocloud.io/library`。
+`docker-compose.yml` 中基础镜像默认使用 **`docker.m.daocloud.io/library/...`**（DaoCloud 同步的 Docker Hub 官方库）。海外环境可在根目录 `.env` 设置 `DOCKER_HUB_PREFIX=docker.io/library`。
 
 开发组合（热更新前端 + 同上后端镜像 + Worker/Beat）：
 

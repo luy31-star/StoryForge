@@ -31,6 +31,7 @@ services:
       - ../.env
     volumes:
       - ../backend/uploads/novels:/app/backend/uploads/novels
+      - ./secrets:/app/backend/secrets:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -48,6 +49,7 @@ services:
       - ../.env
     volumes:
       - ../backend/uploads/novels:/app/backend/uploads/novels
+      - ./secrets:/app/backend/secrets:ro
     depends_on:
       mysql:
         condition: service_healthy
@@ -70,6 +72,8 @@ services:
         condition: service_healthy
       backend:
         condition: service_started
+    volumes:
+      - ./secrets:/app/backend/secrets:ro
 
   mysql:
     image: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}/mysql:8

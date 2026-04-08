@@ -40,6 +40,7 @@ export function NovelNew() {
   const [inspireBusy, setInspireBusy] = useState(false);
   const [inspireErr, setInspireErr] = useState<string | null>(null);
   const [inspireThinking, setInspireThinking] = useState("");
+  const [inspireThinkExpanded, setInspireThinkExpanded] = useState(false);
   const [inspireAbort, setInspireAbort] = useState<AbortController | null>(null);
 
   async function onSubmit(e: FormEvent) {
@@ -84,6 +85,7 @@ export function NovelNew() {
     if (!ready) return;
     setInspireErr(null);
     setInspireThinking("");
+    setInspireThinkExpanded(false);
     setInspireBusy(true);
     const nextUser: ChatTurn = { role: "user", content: text };
     const history = [...inspireTurns, nextUser];
@@ -114,7 +116,10 @@ export function NovelNew() {
             });
           },
           onError: (message) => setInspireErr(message || "请求失败"),
-          onDone: () => setInspireThinking(""),
+          onDone: () => {
+            setInspireThinking("");
+            setInspireThinkExpanded(false);
+          },
         },
         controller.signal
       );
@@ -135,6 +140,8 @@ export function NovelNew() {
 
   const lastAssistant =
     [...inspireTurns].reverse().find((t) => t.role === "assistant")?.content ?? "";
+  const thinkLineCount = inspireThinking ? inspireThinking.split("\n").length : 0;
+  const thinkTooLong = Boolean(inspireThinking) && (thinkLineCount >= 18 || inspireThinking.length >= 1600);
 
   return (
     <div className="novel-shell">
@@ -241,17 +248,32 @@ export function NovelNew() {
                   <pre className="mt-1 whitespace-pre-wrap font-sans text-xs text-foreground font-medium">{t.content}</pre>
                 </div>
               ))}
+              {inspireThinking ? (
+                <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="font-medium text-amber-700 dark:text-amber-300">Think</p>
+                    {thinkTooLong ? (
+                      <button
+                        type="button"
+                        className="rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[11px] font-semibold text-amber-800 transition-colors hover:bg-amber-500/15 dark:text-amber-200"
+                        onClick={() => setInspireThinkExpanded((v) => !v)}
+                      >
+                        {inspireThinkExpanded ? "收起" : `展开（${thinkLineCount} 行）`}
+                      </button>
+                    ) : null}
+                  </div>
+                  <div
+                    className={`mt-1 overflow-auto rounded-xl ${inspireThinkExpanded ? "max-h-[38vh]" : "max-h-32"}`}
+                  >
+                    <pre className="whitespace-pre-wrap font-sans text-[11px] text-amber-800 dark:text-amber-200">
+                      {inspireThinking}
+                    </pre>
+                  </div>
+                </div>
+              ) : null}
             </div>
             {inspireErr ? (
               <p className="text-xs text-destructive">{inspireErr}</p>
-            ) : null}
-            {inspireThinking ? (
-              <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-                <p className="font-medium text-amber-700 dark:text-amber-300">Think</p>
-                <pre className="mt-1 whitespace-pre-wrap font-sans text-[11px] text-amber-800 dark:text-amber-200">
-                  {inspireThinking}
-                </pre>
-              </div>
             ) : null}
             <div className="flex gap-2">
               <textarea

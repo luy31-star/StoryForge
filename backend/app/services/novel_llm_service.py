@@ -586,9 +586,12 @@ class NovelLLMService:
 
     @staticmethod
     def _bill_kw(db: Any, billing_user_id: str | None) -> dict[str, Any]:
-        if billing_user_id and db is not None:
-            return {"billing_user_id": billing_user_id, "billing_db": db}
-        return {}
+        if not billing_user_id:
+            return {}
+        out: dict[str, Any] = {"billing_user_id": billing_user_id}
+        if db is not None:
+            out["billing_db"] = db
+        return out
 
     def _router(
         self,

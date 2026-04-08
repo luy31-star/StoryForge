@@ -85,10 +85,7 @@ def _novel_llm_for_novel(novel: Novel) -> NovelLLMService:
     """后台任务按书主计费；无 user_id 的历史数据仍不计费。"""
     uid = getattr(novel, "user_id", None)
     if not uid:
-        logger.warning(
-            "novel task: novel has no user_id, LLM calls will not bill | novel_id=%s",
-            novel.id,
-        )
+        raise RuntimeError("该小说缺少 user_id，无法进行计费的 AI 调用")
     return NovelLLMService(billing_user_id=uid)
 
 

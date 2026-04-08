@@ -1,4 +1,5 @@
 import { apiFetch } from "@/services/api";
+import { refreshMeSilently } from "@/services/userSync";
 
 /** 前端调用后端 Gemini 代理（密钥仅在后端） */
 export async function chatGemini(body: {
@@ -14,5 +15,6 @@ export async function chatGemini(body: {
     const t = await res.text();
     throw new Error(t || res.statusText);
   }
+  void refreshMeSilently();
   return res.json() as Promise<{ text: string }>;
 }

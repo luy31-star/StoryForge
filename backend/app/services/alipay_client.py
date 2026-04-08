@@ -11,13 +11,47 @@ from typing import Any
 import httpx
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
-from cryptography.hazmat.primitives.serialization import load_pem_private_key, load_pem_public_key
+from cryptography.hazmat.primitives.serialization import (
+    load_der_private_key,
+    load_der_public_key,
+    load_pem_private_key,
+    load_pem_public_key,
+)
 
 from app.core.config import settings
 
 
 def _read_text(path: str) -> str:
     return Path(path).expanduser().read_text(encoding="utf-8")
+
+
+def _read_key_bytes(path: str) -> bytes:
+    data = _read_text(path).strip().encode("utf-8")
+    if data.startswith(b"-----BEGIN "):
+        return data
+    return b"".join(data.split())
+
+
+def _load_private_key(path: str) -> rsa.RSAPrivateKey:
+    data = _read_key_bytes(path)
+    try:
+        if data.startswith(b"-----BEGIN "):
+            return load_pem_private_key(data, password=None)  # type: ignore[return-value]
+        der = base64.b64decode(data, validate=True)
+        return load_der_private_key(der, password=None)  # type: ignore[return-value]
+    except Exception as e:
+        raise RuntimeError("支付宝应用私钥文件格式无效：需要 PEM（含 BEGIN/END）或 base64-encoded DER") from e
+
+
+def _load_public_key(path: str) -> Any:
+    data = _read_key_bytes(path)
+    try:
+        if data.startswith(b"-----BEGIN "):
+            return load_pem_public_key(data)
+        der = base64.b64decode(data, validate=True)
+        return load_der_public_key(der)
+    except Exception as e:
+        raise RuntimeError("支付宝公钥文件格式无效：需要 PEM（含 BEGIN/END）或 base64-encoded DER") from e
 
 
 def _canonical_kv(params: dict[str, Any]) -> str:
@@ -54,11 +88,8 @@ class AlipayClient:
         self.app_id = settings.alipay_app_id
         self.sign_type = settings.alipay_sign_type
 
-        priv_pem = _read_text(settings.alipay_private_key_path).encode("utf-8")
-        pub_pem = _read_text(settings.alipay_public_key_path).encode("utf-8")
-
-        self._private_key: rsa.RSAPrivateKey = load_pem_private_key(priv_pem, password=None)  # type: ignore[assignment]
-        self._public_key = load_pem_public_key(pub_pem)
+        self._private_key = _load_private_key(settings.alipay_private_key_path)
+        self._public_key = _load_public_key(settings.alipay_public_key_path)
 
     def sign(self, params: dict[str, Any]) -> str:
         msg = _canonical_kv(params).encode("utf-8")
@@ -125,7 +156,7 @@ class AlipayClient:
                 for k, v in params.items()
             ]
         )
-        html = f"""
+        page_html = f"""
 <!doctype html>
 <html lang="zh-CN">
   <head>
@@ -134,8 +165,10 @@ class AlipayClient:
     <title>跳转支付宝支付</title>
   </head>
   <body>
+    <p>正在跳转到支付宝支付页…</p>
     <form id="alipay_form" method="post" action="{self.gateway}">
       {inputs}
+      <button type="submit">如未自动跳转，请点击继续</button>
     </form>
     <script>
       setTimeout(function(){{ document.getElementById("alipay_form").submit(); }}, 50);
@@ -143,7 +176,7 @@ class AlipayClient:
   </body>
 </html>
 """
-        return html.strip()
+        return page_html.strip()
 
     def trade_query_sync(self, out_trade_no: str) -> AlipayTradeQueryResult:
         biz = {"out_trade_no": out_trade_no}

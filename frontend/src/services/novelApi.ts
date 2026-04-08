@@ -1,4 +1,5 @@
 import { apiFetch } from "@/services/api";
+import { refreshMeSilently } from "@/services/userSync";
 
 const BASE = "/api/novels";
 const LLM_BASE = "/api/llm";
@@ -38,6 +39,7 @@ export async function inspirationChat(
     body: JSON.stringify({ messages }),
   });
   if (!r.ok) throw new Error(await r.text());
+  void refreshMeSilently();
   return r.json() as Promise<{ reply: string }>;
 }
 
@@ -277,6 +279,7 @@ async function postSSE(
       else if (evt === "error") handlers.onError?.(parsed.message || "流式错误");
     }
   }
+  void refreshMeSilently();
 }
 
 export async function inspirationChatStream(

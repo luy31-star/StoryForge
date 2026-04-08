@@ -120,16 +120,6 @@ class AI302Client:
         if data is None:
             raise RuntimeError("AI302 chat failed to return data")
 
-        # Log usage if available
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            pt = usage.get("prompt_tokens", 0)
-            ct = usage.get("completion_tokens", 0)
-            tt = usage.get("total_tokens", 0)
-            logger.info("AI302 Usage: prompt=%d, completion=%d, total=%d | model=%s", pt, ct, tt, resolved)
-        else:
-            logger.info("AI302 Done | model=%s [No usage data]", resolved)
-
         try:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError):
@@ -157,6 +147,7 @@ class AI302Client:
             "messages": messages,
             "temperature": temperature,
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if web_search:
             body["web-search"] = True
@@ -164,68 +155,71 @@ class AI302Client:
         logger.info("AI302 Request (Stream): POST %s | model=%s", url, resolved)
         start = time.perf_counter()
         max_retries = 3
-        for attempt in range(max_retries + 1):
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream(
-                        "POST", url, headers=self._headers(), json=body
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if not line:
-                                continue
-                            if not line.startswith("data:"):
-                                continue
-                            payload = line[5:].strip()
-                            if not payload:
-                                continue
-                            if payload == "[DONE]":
-                                break
-                            try:
-                                evt = json.loads(payload)
-                            except json.JSONDecodeError:
-                                continue
-                            delta = (
-                                (evt.get("choices") or [{}])[0].get("delta") or {}
-                                if isinstance(evt, dict)
-                                else {}
-                            )
-                            if not isinstance(delta, dict):
-                                continue
-                            think = delta.get("reasoning_content")
-                            if isinstance(think, str) and think:
-                                yield {"type": "think", "delta": think}
-                            txt = delta.get("content")
-                            if isinstance(txt, str) and txt:
-                                yield {"type": "text", "delta": txt}
-                return  # 成功完成
+        try:
+            for attempt in range(max_retries + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=timeout) as client:
+                        async with client.stream(
+                            "POST", url, headers=self._headers(), json=body
+                        ) as resp:
+                            resp.raise_for_status()
+                            async for line in resp.aiter_lines():
+                                if not line:
+                                    continue
+                                if not line.startswith("data:"):
+                                    continue
+                                payload = line[5:].strip()
+                                if not payload:
+                                    continue
+                                if payload == "[DONE]":
+                                    break
+                                try:
+                                    evt = json.loads(payload)
+                                except json.JSONDecodeError:
+                                    continue
+                                delta = (
+                                    (evt.get("choices") or [{}])[0].get("delta") or {}
+                                    if isinstance(evt, dict)
+                                    else {}
+                                )
+                                if not isinstance(delta, dict):
+                                    continue
+                                think = delta.get("reasoning_content")
+                                if isinstance(think, str) and think:
+                                    yield {"type": "think", "delta": think}
+                                txt = delta.get("content")
+                                if isinstance(txt, str) and txt:
+                                    yield {"type": "text", "delta": txt}
+                    return  # 成功完成
 
-            except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                is_transient = False
-                if isinstance(e, httpx.HTTPStatusError):
-                    if e.response.status_code in (429, 500, 502, 503, 504):
+                except (httpx.HTTPStatusError, httpx.RequestError) as e:
+                    is_transient = False
+                    if isinstance(e, httpx.HTTPStatusError):
+                        if e.response.status_code in (429, 500, 502, 503, 504):
+                            is_transient = True
+                    else:
                         is_transient = True
-                else:
-                    is_transient = True
 
-                if is_transient and attempt < max_retries:
-                    wait = (2 ** attempt) + random.uniform(0, 1)
-                    logger.warning(
-                        "AI302 chat stream attempt %d failed (%s), retrying in %.2fs... | model=%s",
-                        attempt + 1, e, wait, resolved
+                    if is_transient and attempt < max_retries:
+                        wait = (2 ** attempt) + random.uniform(0, 1)
+                        logger.warning(
+                            "AI302 chat stream attempt %d failed (%s), retrying in %.2fs... | model=%s",
+                            attempt + 1, e, wait, resolved
+                        )
+                        await asyncio.sleep(wait)
+                        continue
+
+                    elapsed = time.perf_counter() - start
+                    logger.exception(
+                        "AI302 chat stream failed after %d attempts and %.2fs | model=%s web_search=%s",
+                        attempt + 1,
+                        elapsed,
+                        resolved,
+                        web_search,
                     )
-                    await asyncio.sleep(wait)
-                    continue
-
-                elapsed = time.perf_counter() - start
-                logger.exception(
-                    "AI302 chat stream failed after %d attempts and %.2fs | model=%s web_search=%s",
-                    attempt + 1,
-                    elapsed,
-                    resolved,
-                    web_search,
-                )
-                raise
+                    raise
+        finally:
+            pass
 
     def chat_completions_sync(
         self,
@@ -298,16 +292,6 @@ class AI302Client:
 
         if data is None:
             raise RuntimeError("AI302 chat(sync) failed to return data")
-
-        # Log usage if available
-        usage = data.get("usage")
-        if isinstance(usage, dict):
-            pt = usage.get("prompt_tokens", 0)
-            ct = usage.get("completion_tokens", 0)
-            tt = usage.get("total_tokens", 0)
-            logger.info("AI302 Usage(Sync): prompt=%d, completion=%d, total=%d | model=%s", pt, ct, tt, resolved)
-        else:
-            logger.info("AI302 Done(Sync) | model=%s [No usage data]", resolved)
 
         try:
             return data["choices"][0]["message"]["content"]

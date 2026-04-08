@@ -20,8 +20,6 @@ class GeminiService:
         system_prompt: str | None,
         messages: list[dict[str, str]],
         model: str = "gemini-2.0-flash",
-        billing_user_id: str | None = None,
-        billing_db: Session | None = None,
     ) -> str:
         if not settings.ai302_api_key:
             last = messages[-1]["content"] if messages else ""
@@ -39,9 +37,7 @@ class GeminiService:
                 role = "user"
             msgs.append({"role": role, "content": m.get("content", "")})
 
-        router = LLMRouter(model=model, user_id=billing_user_id, db=billing_db)
+        router = LLMRouter(model=model, user_id=None, db=None)
         return await router.chat_text(
             messages=msgs,
-            billing_user_id=billing_user_id,
-            billing_db=billing_db,
         )

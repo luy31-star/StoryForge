@@ -108,7 +108,5 @@ async def gemini_chat(
         system_prompt=body.systemPrompt,
         messages=body.messages,
         model=body.model or "gemini-2.0-flash",
-        billing_db=db,
-        billing_user_id=user.id,
     )
     return {"text": text}

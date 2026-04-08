@@ -4,13 +4,19 @@ FROM ${DOCKER_HUB_PREFIX}/python:3.12-slim
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
-# pip 默认约 15s 读超时，拉取 PyPI 时弱网易 Read timed out；默认清华源，海外可构建时覆盖 PIP_INDEX_URL
+# pip 默认约 15s 读超时，拉取 PyPI 时弱网易 Read timed out；可构建时覆盖 PIP_INDEX_URL
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
 COPY backend/requirements.txt .
-RUN pip install --no-cache-dir --default-timeout=300 --retries=10 \
-    -i "${PIP_INDEX_URL}" \
-    -r requirements.txt
+RUN set -eux; \
+    python -m pip install --no-cache-dir -U pip; \
+    for url in "${PIP_INDEX_URL}" "https://pypi.org/simple" "https://mirrors.aliyun.com/pypi/simple" "https://pypi.tuna.tsinghua.edu.cn/simple"; do \
+      python -m pip install --no-cache-dir --default-timeout=300 --retries=10 --prefer-binary \
+        -i "$url" \
+        -r requirements.txt \
+      && exit 0 || true; \
+    done; \
+    exit 1
 COPY backend/ ./backend/
 WORKDIR /app/backend
 EXPOSE 8000

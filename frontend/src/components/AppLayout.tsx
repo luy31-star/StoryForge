@@ -257,7 +257,7 @@ export function AppLayout() {
                     </span>
                   </div>
                   <p className="text-[11px] text-foreground dark:text-foreground/50 font-medium">
-                    计价单位为人民币/百万 token（入/出分列），扣费按积分换算。
+                    计价单位为人民币/百万 token（入/出分列），扣费按积分换算。可粗略理解为 1 token ≈ 1.5 个汉字。
                   </p>
                   <ModelPriceSelect
                     value={llmCfg?.model || ""}

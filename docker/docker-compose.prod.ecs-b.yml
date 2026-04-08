@@ -1,0 +1,40 @@
+services:
+  celery-worker:
+    image: vocalflow-studio-backend:prod
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+      args:
+        DOCKER_HUB_PREFIX: ${DOCKER_HUB_PREFIX:-docker.m.daocloud.io/library}
+    restart: unless-stopped
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app worker -l info -Q vocalflow,celery
+    env_file:
+      - ../.env
+    volumes:
+      - ./secrets:/app/backend/secrets:ro
+      - novel_uploads:/app/backend/uploads/novels
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "10"
+
+  celery-beat:
+    image: vocalflow-studio-backend:prod
+    restart: unless-stopped
+    working_dir: /app/backend
+    command: celery -A app.tasks.celery_app beat -l info
+    env_file:
+      - ../.env
+    volumes:
+      - ./secrets:/app/backend/secrets:ro
+      - novel_uploads:/app/backend/uploads/novels
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+volumes:
+  novel_uploads:

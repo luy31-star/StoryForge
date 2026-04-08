@@ -2,10 +2,26 @@
 ARG DOCKER_HUB_PREFIX=docker.m.daocloud.io/library
 FROM ${DOCKER_HUB_PREFIX}/node:20-alpine AS build
 WORKDIR /app
-COPY frontend/package.json ./
-RUN npm install
+# node 官方镜像常带 NODE_ENV=production，npm ci 会省略 devDependencies；安装依赖时必须显式 development
+# NPM_REGISTRY 默认 npmmirror（国内 npm 同步源，与 Docker 的 DOCKER_HUB_PREFIX 无关）；构建慢可在 .env 设 NPM_REGISTRY 换源
+ARG NPM_REGISTRY=https://registry.npmmirror.com
+COPY frontend/package.json frontend/package-lock.json ./
+# 勿用 npm config set production（npm 10+ 已废弃）；Alpine(musl) 上 npm ci 偶发漏装 rollup 可选原生包，需补装
+RUN set -eux; \
+  npm config set registry "${NPM_REGISTRY}"; \
+  npm config set fetch-retries 5; \
+  npm config set fetch-retry-mintimeout 20000; \
+  if ! NODE_ENV=development npm ci --no-audit --no-fund --include=dev; then \
+    npm config set registry "https://registry.npmjs.org"; \
+    NODE_ENV=development npm ci --no-audit --no-fund --include=dev; \
+  fi; \
+  case "$(uname -m)" in \
+    aarch64|arm64) npm install --no-save @rollup/rollup-linux-arm64-musl ;; \
+    *) npm install --no-save @rollup/rollup-linux-x64-musl ;; \
+  esac
 COPY frontend/ ./
-RUN npm run build
+# 勿用 NODE_ENV=production npm run build：npm 可能不把 devDependencies 的 .bin 加入 PATH，导致 tsc 找不到
+RUN ./node_modules/.bin/tsc -b && NODE_ENV=production ./node_modules/.bin/vite build
 
 FROM ${DOCKER_HUB_PREFIX}/nginx:alpine
 COPY --from=build /app/dist /usr/share/nginx/html
