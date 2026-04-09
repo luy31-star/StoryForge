@@ -1,13 +1,17 @@
 # 密钥与本地环境（切勿提交）
-# .env
-# backend/.env
-# frontend/.env
-# frontend/.env.local
-# docker/.env*
-# docker/prod/certs/*
-# docker/secrets/
-# secrets/
-# backend/secrets/
+.env
+backend/.env
+frontend/.env
+frontend/.env.local
+docker/.env*
+docker/prod/certs/*
+!docker/prod/certs/.gitkeep
+docker/secrets/
+secrets/
+backend/secrets/
+
+# IDE
+.idea/
 
 # Python
 **/.venv/

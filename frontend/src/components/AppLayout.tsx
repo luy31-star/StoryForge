@@ -1,5 +1,5 @@
 import { Link, Outlet, useNavigate } from "react-router-dom";
-import { LogOut, Settings, Sparkles, Wallet, User, Sun, Moon, Monitor, Check, HelpCircle } from "lucide-react";
+import { LogOut, Settings, Shield, User, Sun, Moon, Monitor, Check, HelpCircle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuthStore } from "@/stores/authStore";
 import { useEffect, useState } from "react";
@@ -106,7 +106,7 @@ export function AppLayout() {
           <div className="glass-panel-subtle flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:gap-4">
             <Link to="/" className="flex items-center gap-3">
               <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/12 text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.45)]">
-                <Sparkles className="size-4" />
+                <img src="/favicon.svg" className="h-5 w-5" alt="" aria-hidden="true" />
               </div>
               <div>
                 <p className="text-sm font-semibold tracking-tight text-foreground">
@@ -134,7 +134,7 @@ export function AppLayout() {
                 </Button>
                 <Button variant="ghost" size="sm" asChild>
                   <Link to="/admin">
-                    <Sparkles className="mr-1 size-3.5" />
+                    <Shield className="mr-1 size-3.5" />
                     管理后台
                   </Link>
                 </Button>
@@ -150,8 +150,8 @@ export function AppLayout() {
               </div>
               <Button variant="glass" size="sm" asChild>
                 <Link to="/recharge">
-                  <Wallet className="mr-1 size-3.5" />
-                  充值
+                  <HelpCircle className="mr-1 size-3.5" />
+                  积分获取
                 </Link>
               </Button>
               <div className="flex h-9 items-center gap-2 rounded-full border border-border/40 bg-card/40 pl-3 pr-1 shadow-sm backdrop-blur-xl ml-2">
