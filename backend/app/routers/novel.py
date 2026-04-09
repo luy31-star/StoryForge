@@ -108,7 +108,7 @@ class NovelCreate(BaseModel):
     title: str
     intro: str = ""
     background: str = ""
-    style: str = ""
+    style: str = Field(default="", max_length=255)
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
@@ -118,7 +118,7 @@ class NovelPatch(BaseModel):
     title: str | None = None
     intro: str | None = None
     background: str | None = None
-    style: str | None = None
+    style: str | None = Field(default=None, max_length=255)
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
     daily_auto_time: str | None = None

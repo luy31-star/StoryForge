@@ -382,6 +382,7 @@ export function NovelNew() {
                 value={style}
                 onChange={(e) => setStyle(e.target.value)}
                 className="field-shell mt-1 h-11 text-foreground"
+                maxLength={255}
               />
             </div>
           </div>
