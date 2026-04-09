@@ -18,6 +18,7 @@ from app.models.volume import NovelChapterPlan, NovelVolume
 from app.services.novel_generation_common import append_generation_log
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_repo import latest_memory_json
+from app.services.task_cancel import is_cancel_requested
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,19 @@ def run_volume_chapter_plan_batch_sync(
         meta={"volume_id": volume_id, "volume_no": v.volume_no},
     )
     db.commit()
+
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="volume_plan_cancelled",
+            level="warning",
+            message="任务已取消",
+            meta={"volume_id": volume_id},
+        )
+        db.commit()
+        return {"status": "cancelled", "saved": 0, "done": False, "batch_id": batch_id}
 
     mem = latest_memory_json(db, novel_id)
     llm = NovelLLMService(billing_user_id=billing_user_id)

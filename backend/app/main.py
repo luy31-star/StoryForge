@@ -31,10 +31,11 @@ import app.models.novel_memory_norm  # noqa: F401 — 规范化记忆表
 import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
 import app.models.project  # noqa: F401 — projects.user_id
 import app.models.workflow  # noqa: F401 — workflows.user_id
+import app.models.task  # noqa: F401 — user_tasks
 from app.middleware.request_log import RequestLoggingMiddleware
 from app.core.rate_limit import setup_rate_limiting
 from slowapi.middleware import SlowAPIMiddleware
-from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard
+from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard, tasks
 
 logger = logging.getLogger(__name__)
 logging.getLogger("vocalflow.request").setLevel(logging.INFO)
@@ -70,6 +71,7 @@ app.include_router(llm.router)
 app.include_router(media.router)
 app.include_router(novel.router)
 app.include_router(volume.router)
+app.include_router(tasks.router)
 app.include_router(websocket.router)
 
 

@@ -26,6 +26,7 @@ from app.services.novel_repo import (
     format_recent_approved_fulltext_context,
     latest_memory_json,
 )
+from app.services.task_cancel import is_cancel_requested
 
 logger = logging.getLogger(__name__)
 
@@ -84,7 +85,35 @@ def run_generate_chapters_batch_sync(
     )
     db.commit()
 
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="batch_cancelled",
+            level="warning",
+            message="任务已取消",
+        )
+        db.commit()
+        return {"status": "cancelled", "chapter_ids": [], "batch_id": batch_id}
+
     for idx, no in enumerate(chapter_nos):
+        if is_cancel_requested(batch_id):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="batch_cancelled",
+                level="warning",
+                message="任务已取消",
+                meta={"created": len(created), "stopped_at": no},
+            )
+            db.commit()
+            return {
+                "status": "cancelled",
+                "chapter_ids": created,
+                "batch_id": batch_id,
+            }
         step_start = time.perf_counter()
         continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
         full_context = format_recent_approved_fulltext_context(

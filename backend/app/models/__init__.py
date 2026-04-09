@@ -15,6 +15,7 @@ from app.models.novel_memory_norm import (  # noqa: F401 — metadata for create
 from app.models.volume import NovelChapterPlan, NovelVolume
 from app.models.project import Project
 from app.models.workflow import Workflow
+from app.models.task import UserTask
 
 __all__ = [
     "User",
@@ -39,4 +40,5 @@ __all__ = [
     "NovelMemoryNormSkill",
     "NovelVolume",
     "NovelChapterPlan",
+    "UserTask",
 ]

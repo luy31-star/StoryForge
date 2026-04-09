@@ -15,6 +15,7 @@ import { ProjectManagement } from "@/pages/ProjectManagement";
 import { WorkflowEditor } from "@/pages/WorkflowEditor";
 import { Register } from "@/pages/Register";
 import { Recharge } from "@/pages/Recharge";
+import { MyTasks } from "@/pages/MyTasks";
 
 export default function App() {
   const user = useAuthStore((s) => s.user);
@@ -38,6 +39,7 @@ export default function App() {
           }
         >
           <Route path="/novels" element={<NovelShelf />} />
+          <Route path="/tasks" element={<MyTasks />} />
           <Route path="/novels/new" element={<NovelNew />} />
           <Route path="/novels/:id" element={<NovelWorkspace />} />
           <Route path="/novels/:id/metrics" element={<NovelMetricsPage />} />

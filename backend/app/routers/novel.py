@@ -65,6 +65,7 @@ from app.services.novel_generation_common import (
     has_pending_memory_refresh_batch,
     memory_refresh_confirmation_token,
 )
+from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import (
     novel_chapter_approve_memory_delta,
     novel_chapter_consistency_fix,
@@ -516,6 +517,25 @@ def ai_create_and_start(
         )
         db.commit()
         raise HTTPException(503, f"后台任务入队失败：{e}") from e
+
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="ai_create_and_start",
+            title="一键AI建书",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=n.id,
+            meta={
+                "styles": styles,
+                "length_type": body.length_type,
+                "target_generate_chapters": body.target_generate_chapters,
+            },
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
 
     return {
         "status": "queued",
@@ -1016,6 +1036,21 @@ async def generate_chapters(
         meta={"task_id": task_id},
     )
     db.commit()
+
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="generate_chapters",
+            title=f"自动续写（{len(chapter_nos)} 章）",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            meta={"chapter_nos": chapter_nos, "source": source},
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
     return {
         "status": "queued",
         "batch_id": batch_id,
@@ -1132,6 +1167,21 @@ async def start_auto_pipeline(
         )
         db.commit()
         raise HTTPException(503, f"后台任务入队失败：{e}") from e
+
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="auto_generate",
+            title=f"AI一键续写（目标 {body.target_count} 章）",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            meta={"target_count": body.target_count},
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
         
     return {
         "status": "queued",

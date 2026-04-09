@@ -33,6 +33,7 @@ from app.services.novel_generation_common import (
     memory_refresh_confirmation_token,
 )
 from app.services.novel_volume_plan_batch import run_volume_chapter_plan_batch_sync
+from app.services.user_task_service import update_user_task_by_batch_id
 from app.tasks.celery_app import celery_app
 
 logger = logging.getLogger(__name__)
@@ -58,6 +59,38 @@ _AUTO_PIPELINE_TERMINAL_EVENTS = {
     "ai_create_failed",
 }
 _AUTO_PIPELINE_STALE_GRACE_SECONDS = 120
+
+
+def _task_set_started(db, *, batch_id: str, message: str = "后台任务已开始") -> None:
+    try:
+        update_user_task_by_batch_id(
+            db,
+            batch_id=batch_id,
+            status="started",
+            last_message=message,
+            started_at=datetime.utcnow(),
+        )
+    except Exception:
+        pass
+
+
+def _task_set_terminal(
+    db,
+    *,
+    batch_id: str,
+    status: str,
+    message: str = "",
+) -> None:
+    try:
+        update_user_task_by_batch_id(
+            db,
+            batch_id=batch_id,
+            status=status,
+            last_message=message,
+            finished_at=datetime.utcnow(),
+        )
+    except Exception:
+        pass
 
 
 def _novel_mem_delta_zkey(novel_id: str) -> str:
@@ -824,11 +857,12 @@ def novel_generate_chapters_for_novel(
     """
     db = SessionLocal()
     try:
+        _task_set_started(db, batch_id=batch_id, message="章节生成任务已开始")
         raw_nos = body.get("chapter_nos")
         if not isinstance(raw_nos, list) or not raw_nos:
             raise ValueError("缺少 chapter_nos")
         chapter_nos = [int(x) for x in raw_nos]
-        return run_generate_chapters_batch_sync(
+        result = run_generate_chapters_batch_sync(
             db,
             novel_id=novel_id,
             billing_user_id=user_id,
@@ -840,6 +874,11 @@ def novel_generate_chapters_for_novel(
             batch_id=batch_id,
             source=str(body.get("source") or "batch_auto"),
         )
+        if str(result.get("status") or "") == "cancelled":
+            _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        else:
+            _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return result
     except Exception as e:
         logger.exception(
             "novel.generate_chapters_for_novel failed | novel_id=%s batch_id=%s",
@@ -863,6 +902,12 @@ def novel_generate_chapters_for_novel(
                 meta={"error": str(e)},
             )
             db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"失败：{e}",
+            )
         except Exception:
             db.rollback()
         raise
@@ -879,7 +924,8 @@ def novel_volume_plan_batch_for_volume(
 ) -> dict[str, Any]:
     db = SessionLocal()
     try:
-        return run_volume_chapter_plan_batch_sync(
+        _task_set_started(db, batch_id=batch_id, message="卷章计划任务已开始")
+        result = run_volume_chapter_plan_batch_sync(
             db,
             novel_id=novel_id,
             billing_user_id=user_id,
@@ -889,6 +935,11 @@ def novel_volume_plan_batch_for_volume(
             batch_size=body.get("batch_size"),
             from_chapter=body.get("from_chapter"),
         )
+        if str(result.get("status") or "") == "cancelled":
+            _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        else:
+            _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return result
     except Exception as e:
         logger.exception(
             "novel.volume_plan_batch_for_volume failed | novel_id=%s batch_id=%s",
@@ -912,6 +963,12 @@ def novel_volume_plan_batch_for_volume(
                 meta={"error": str(e), "volume_id": body.get("volume_id")},
             )
             db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"失败：{e}",
+            )
         except Exception:
             db.rollback()
         raise
@@ -1165,8 +1222,15 @@ def novel_ai_create_and_start_task(
                     meta={"reason": "locked"},
                 )
                 db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
                 return {"status": "skipped", "reason": "locked"}
 
+        _task_set_started(db, batch_id=batch_id, message="AI 建书任务已开始")
         from app.services.novel_auto_pipeline import run_ai_create_and_start_sync
         result = run_ai_create_and_start_sync(
             db=db,
@@ -1178,15 +1242,20 @@ def novel_ai_create_and_start_task(
             billing_user_id=user_id,
             batch_id=batch_id,
         )
-        append_generation_log(
-            db,
-            novel_id=novel_id,
-            batch_id=batch_id,
-            event="ai_create_done",
-            message=f"AI 一键建书完成，本次生成 {result.get('chapters_generated', 0)} 章",
-            meta={"chapters_generated": result.get("chapters_generated", 0)},
-        )
-        db.commit()
+        if str(result.get("status") or "") == "cancelled":
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        else:
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="ai_create_done",
+                message=f"AI 一键建书完成，本次生成 {result.get('chapters_generated', 0)} 章",
+                meta={"chapters_generated": result.get("chapters_generated", 0)},
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
         return result
     except Exception as e:
         logger.exception("novel_ai_create_and_start_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
@@ -1208,6 +1277,12 @@ def novel_ai_create_and_start_task(
                 meta={"error": str(e)}
             )
             db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"失败：{e}",
+            )
         except Exception:
             db.rollback()
         raise
@@ -1264,6 +1339,12 @@ def novel_auto_pipeline_task(
                     meta={"reason": "locked", "trigger_source": trigger_source},
                 )
                 db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
                 return {"status": "skipped", "reason": "locked"}
 
         if has_pending_auto_pipeline_batch(db, novel_id, exclude_batch_id=batch_id) or (
@@ -1279,10 +1360,17 @@ def novel_auto_pipeline_task(
                 meta={"reason": "pending_batch", "trigger_source": trigger_source},
             )
             db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="skipped",
+                message="已跳过：检测到同书已有进行中的生成批次",
+            )
             return {"status": "skipped", "reason": "pending_batch"}
 
         from app.services.novel_auto_pipeline import run_full_auto_generation_sync
 
+        _task_set_started(db, batch_id=batch_id, message="全自动生成任务已开始")
         result = run_full_auto_generation_sync(
             db=db,
             novel_id=novel_id,
@@ -1293,22 +1381,27 @@ def novel_auto_pipeline_task(
             cold_recall_items=5,
             auto_consistency_check=False,
         )
-        append_generation_log(
-            db,
-            novel_id=novel_id,
-            batch_id=batch_id,
-            event="auto_pipeline_done",
-            message=f"全自动生成完成，本次生成 {result.get('chapters_generated', 0)} 章",
-            meta={
-                "trigger_source": trigger_source,
-                "chapters_generated": result.get("chapters_generated", 0),
-            },
-        )
-        if trigger_source == "schedule" and scheduled_date:
-            n = db.get(Novel, novel_id)
-            if n and (n.last_auto_date or "") < scheduled_date:
-                n.last_auto_date = scheduled_date
-        db.commit()
+        if str(result.get("status") or "") == "cancelled":
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        else:
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_done",
+                message=f"全自动生成完成，本次生成 {result.get('chapters_generated', 0)} 章",
+                meta={
+                    "trigger_source": trigger_source,
+                    "chapters_generated": result.get("chapters_generated", 0),
+                },
+            )
+            if trigger_source == "schedule" and scheduled_date:
+                n = db.get(Novel, novel_id)
+                if n and (n.last_auto_date or "") < scheduled_date:
+                    n.last_auto_date = scheduled_date
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
         return result
     except Exception as e:
         logger.exception("novel_auto_pipeline_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
@@ -1329,6 +1422,12 @@ def novel_auto_pipeline_task(
                 meta={"error": str(e)}
             )
             db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"失败：{e}",
+            )
         except Exception:
             db.rollback()
         raise

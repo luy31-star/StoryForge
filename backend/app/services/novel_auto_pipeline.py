@@ -25,6 +25,7 @@ from app.services.novel_repo import (
 from app.services.novel_chapter_generate_batch import run_generate_chapters_batch_sync
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_volume_plan_batch import run_volume_chapter_plan_batch_sync
+from app.services.task_cancel import is_cancel_requested
 
 logger = logging.getLogger(__name__)
 
@@ -256,6 +257,18 @@ def run_ai_create_and_start_sync(
     if not n:
         raise ValueError("小说不存在")
 
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="ai_create_cancelled",
+            level="warning",
+            message="任务已取消",
+        )
+        db.commit()
+        return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
+
     clean_styles = [str(x).strip() for x in styles if str(x).strip()]
     if not clean_styles:
         raise ValueError("至少需要一个题材或风格")
@@ -270,6 +283,18 @@ def run_ai_create_and_start_sync(
         message=f"正在构思小说设定（题材/风格：{styles_text}，篇幅：{length_type}）",
     )
     db.commit()
+
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="ai_create_cancelled",
+            level="warning",
+            message="任务已取消",
+        )
+        db.commit()
+        return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
 
     llm = NovelLLMService(billing_user_id=billing_user_id)
 
@@ -430,6 +455,18 @@ def run_ai_create_and_start_sync(
         message="正在生成小说大纲框架...",
     )
     db.commit()
+
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="ai_create_cancelled",
+            level="warning",
+            message="任务已取消",
+        )
+        db.commit()
+        return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
     
     try:
         framework_markdown, framework_json = _generate_framework_sync(llm, n, db)
@@ -457,6 +494,17 @@ def run_ai_create_and_start_sync(
 
     # 如果需要初始生成正文，调用全自动管线
     if target_generate_chapters > 0:
+        if is_cancel_requested(batch_id):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="ai_create_cancelled",
+                level="warning",
+                message="任务已取消",
+            )
+            db.commit()
+            return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
         return run_full_auto_generation_sync(
             db=db,
             novel_id=novel_id,
@@ -585,6 +633,23 @@ def run_full_auto_generation_sync(
     )
     db.commit()
 
+    if is_cancel_requested(batch_id):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_cancelled",
+            level="warning",
+            message="任务已取消",
+        )
+        db.commit()
+        return {
+            "status": "cancelled",
+            "batch_id": batch_id,
+            "chapters_generated": 0,
+            "chapter_ids": [],
+        }
+
     _ensure_volumes_cover(db, n, end_no)
 
     created_ids: list[str] = []
@@ -592,6 +657,24 @@ def run_full_auto_generation_sync(
     plan_batch_size = 5
 
     while current_no <= end_no:
+        if is_cancel_requested(batch_id):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_cancelled",
+                level="warning",
+                message="任务已取消",
+                meta={"chapters_generated": len(created_ids), "stopped_at": current_no},
+            )
+            db.commit()
+            return {
+                "status": "cancelled",
+                "chapter_ids": created_ids,
+                "batch_id": batch_id,
+                "chapters_generated": len(created_ids),
+            }
+
         planned_body_chunk = _next_consecutive_planned_body_chunk(
             db, novel_id, current_no, end_no
         )
@@ -648,6 +731,24 @@ def run_full_auto_generation_sync(
             },
         )
         db.commit()
+
+        if is_cancel_requested(batch_id):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_cancelled",
+                level="warning",
+                message="任务已取消",
+                meta={"chapters_generated": len(created_ids), "stopped_at": current_no},
+            )
+            db.commit()
+            return {
+                "status": "cancelled",
+                "chapter_ids": created_ids,
+                "batch_id": batch_id,
+                "chapters_generated": len(created_ids),
+            }
 
         plan_res = run_volume_chapter_plan_batch_sync(
             db=db,

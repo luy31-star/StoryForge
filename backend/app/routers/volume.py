@@ -24,6 +24,7 @@ from app.services.novel_generation_common import (
 )
 from app.services.novel_repo import latest_memory_json
 from app.services.novel_llm_service import NovelLLMService
+from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import novel_volume_plan_batch_for_volume
 
 logger = logging.getLogger(__name__)
@@ -313,6 +314,22 @@ def generate_volume_chapter_plan(
         meta={"task_id": task_id, "volume_id": volume_id},
     )
     db.commit()
+
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="volume_plan",
+            title=f"生成本卷章计划（第{v.volume_no}卷）",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            volume_id=volume_id,
+            meta=payload,
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
     return {
         "status": "queued",
         "batch_id": batch_id,
@@ -530,4 +547,3 @@ def lock_volume_chapter_plan(
     v.status = "locked"
     db.commit()
     return {"status": "ok", "count": len(rows)}
-

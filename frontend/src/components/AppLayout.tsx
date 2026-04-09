@@ -90,9 +90,9 @@ export function AppLayout() {
     setSettingsBusy(true);
     try {
       await setLlmConfig(payload);
-    } catch (e: any) {
+    } catch (e: unknown) {
       console.error(e);
-      alert(e.message);
+      alert(e instanceof Error ? e.message : "保存失败");
     } finally {
       setSettingsBusy(false);
     }
@@ -119,6 +119,9 @@ export function AppLayout() {
             <nav className="flex flex-1 flex-wrap items-center gap-1 text-sm">
             <Button variant="ghost" size="sm" asChild>
               <Link to="/novels">小说书架</Link>
+            </Button>
+            <Button variant="ghost" size="sm" asChild>
+              <Link to="/tasks">我的任务</Link>
             </Button>
             {user?.is_admin ? (
               <>
@@ -187,7 +190,7 @@ export function AppLayout() {
 
       <Dialog
         open={settingsOpen}
-        onOpenChange={(open) => {
+        onOpenChange={(open: boolean) => {
           setSettingsOpen(open);
           if (!open) setSettingsGateHint(null);
         }}
