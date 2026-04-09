@@ -89,7 +89,8 @@ export function AppLayout() {
   async function handleSaveSettings(payload: NonNullable<typeof llmCfg>) {
     setSettingsBusy(true);
     try {
-      await setLlmConfig(payload);
+      const saved = await setLlmConfig(payload);
+      setLlmCfg(saved);
     } catch (e: unknown) {
       console.error(e);
       alert(e instanceof Error ? e.message : "保存失败");
@@ -255,7 +256,7 @@ export function AppLayout() {
                 <div className="space-y-2">
                   <div className="flex items-center gap-1.5">
                     <Label className="text-foreground font-semibold">默认使用模型</Label>
-                    <span title="默认使用第一个已启用模型；您也可以在此指定自己偏好的模型。" className="cursor-help">
+                    <span title="未保存过模型时，系统默认使用最便宜的已启用模型；您也可以在此指定自己偏好的模型。" className="cursor-help">
                       <HelpCircle className="h-3.5 w-3.5 text-muted-foreground" />
                     </span>
                   </div>
@@ -270,6 +271,11 @@ export function AppLayout() {
                     models={availableModels}
                     disabled={settingsBusy}
                   />
+                  {llmCfg?.has_explicit_model === false ? (
+                    <p className="text-[11px] text-amber-700 dark:text-amber-300 font-semibold">
+                      当前为未保存状态：系统会默认使用最便宜模型；点击“保存配置”后才会固定为你的选择。
+                    </p>
+                  ) : null}
                 </div>
               </div>
 

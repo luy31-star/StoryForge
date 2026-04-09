@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -27,12 +28,26 @@ class RuntimeWebSearchConfig:
     novel_inspiration_web_search: bool
 
 
-def first_enabled_model_id(db: Session) -> str | None:
-    """管理后台「模型计价」中，按 model_id 升序第一个已启用的 model_id。"""
+def cheapest_enabled_model_id(db: Session) -> str | None:
+    """
+    管理后台「模型计价」中，选择最便宜的已启用模型：
+    - 以 (prompt_price + completion_price) 作为排序依据
+    - 若 prompt/completion 为空则回退到兼容字段 price_cny_per_million_tokens
+    """
+    p = func.coalesce(
+        ModelPrice.prompt_price_cny_per_million_tokens,
+        ModelPrice.price_cny_per_million_tokens,
+        0.0,
+    )
+    c = func.coalesce(
+        ModelPrice.completion_price_cny_per_million_tokens,
+        ModelPrice.price_cny_per_million_tokens,
+        0.0,
+    )
     r = (
         db.query(ModelPrice)
         .filter(ModelPrice.enabled.is_(True))
-        .order_by(ModelPrice.model_id.asc())
+        .order_by((p + c).asc(), ModelPrice.model_id.asc())
         .first()
     )
     return r.model_id if r else None
@@ -42,7 +57,7 @@ def resolve_effective_llm_model(db: Session, stored: str) -> str:
     """
     解析全站实际使用的模型 ID：
     - 若 stored 非空且在已启用计价中存在，则用之；
-    - 否则使用第一个已启用计价模型；
+    - 否则使用“最便宜”的已启用计价模型；
     - 若尚无可用计价，返回空字符串（调用 LLM 时由路由层报错）。
     """
     s = (stored or "").strip()
@@ -54,9 +69,9 @@ def resolve_effective_llm_model(db: Session, stored: str) -> str:
         )
         if ok:
             return s
-    first = first_enabled_model_id(db)
-    if first:
-        return first
+    m = cheapest_enabled_model_id(db)
+    if m:
+        return m
     return ""
 
 
@@ -158,7 +173,7 @@ def set_runtime_llm_config(
 ) -> AppConfig | User:
     m = (model or "").strip()
     if not m:
-        m = first_enabled_model_id(db) or ""
+        m = cheapest_enabled_model_id(db) or ""
     if not m:
         raise ValueError("请先在管理后台「模型计价」中至少添加一个已启用的模型")
 

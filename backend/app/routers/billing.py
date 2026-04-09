@@ -10,6 +10,7 @@ from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel, Field
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -231,10 +232,20 @@ class ModelPriceOut(BaseModel):
 @router.get("/model-prices", response_model=list[ModelPriceOut])
 def list_public_model_prices(db: Session = Depends(get_db)) -> list[ModelPriceOut]:
     """对普通用户展示：仅已启用模型（用于前端选模型等）。"""
+    p = func.coalesce(
+        ModelPrice.prompt_price_cny_per_million_tokens,
+        ModelPrice.price_cny_per_million_tokens,
+        0.0,
+    )
+    c = func.coalesce(
+        ModelPrice.completion_price_cny_per_million_tokens,
+        ModelPrice.price_cny_per_million_tokens,
+        0.0,
+    )
     rows = (
         db.query(ModelPrice)
         .filter(ModelPrice.enabled.is_(True))
-        .order_by(ModelPrice.model_id.asc())
+        .order_by((p + c).asc(), ModelPrice.model_id.asc())
         .all()
     )
     return [
