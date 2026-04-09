@@ -559,7 +559,7 @@ export function Admin() {
                   <p className="text-sm text-muted-foreground">暂无邀请码</p>
                 ) : null}
                 {invites.map((it) => {
-                  const used = Boolean(it.used_by_user_id);
+                  const used = Boolean(it.used_by_user_id || it.used_at);
                   const exp = it.expires_at ? new Date(it.expires_at).toLocaleString() : "永不过期";
                   return (
                     <div key={it.id} className="flex flex-col gap-2 rounded-lg border border-border/60 p-4 md:flex-row md:items-center md:justify-between">
@@ -579,7 +579,7 @@ export function Admin() {
                         </div>
                         <div className="text-xs text-muted-foreground">有效期: {exp}</div>
                         <div className="text-xs text-muted-foreground">
-                          使用者: {used ? (it.used_by_username || it.used_by_user_id) : "—"}
+                          使用者: {used ? (it.used_by_username || it.used_by_user_id || "—") : "—"}
                         </div>
                         {it.note ? <div className="text-xs text-muted-foreground">备注: {it.note}</div> : null}
                       </div>

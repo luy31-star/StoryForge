@@ -126,7 +126,7 @@ async def register(
             raise HTTPException(400, "邀请码不存在，请检查后重试")
         if bool(invite.is_frozen):
             raise HTTPException(400, "邀请码已被冻结，请联系管理员")
-        if invite.used_by_user_id:
+        if invite.used_by_user_id or invite.used_at:
             raise HTTPException(400, "邀请码已被使用")
         if invite.expires_at and invite.expires_at < now:
             raise HTTPException(400, "邀请码已过期")
@@ -142,6 +142,7 @@ async def register(
         is_admin=is_admin,
     )
     db.add(user)
+    db.flush()
     if invite is not None:
         invite.used_by_user_id = user.id
         invite.used_at = now

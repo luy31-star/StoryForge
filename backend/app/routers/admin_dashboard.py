@@ -368,7 +368,7 @@ def delete_invite_code(
     row = db.get(InviteCode, invite_id)
     if not row:
         raise HTTPException(404, "邀请码不存在")
-    if row.used_by_user_id:
+    if row.used_by_user_id or row.used_at:
         raise HTTPException(400, "已被使用的邀请码不允许删除")
     db.delete(row)
     db.commit()
