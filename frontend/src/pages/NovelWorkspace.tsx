@@ -1961,15 +1961,6 @@ export function NovelWorkspace() {
                   >
                     查看生成日志
                   </Button>
-                  <Button
-                    type="button"
-                    variant="secondary"
-                    className="font-bold"
-                    disabled={busy || !frameworkConfirmed}
-                    onClick={() => confirmGenerateChapters()}
-                  >
-                    自动续写
-                  </Button>
                 </div>
               </div>
 
