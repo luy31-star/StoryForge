@@ -2639,7 +2639,7 @@ class NovelLLMService:
                     if val and _short_id(val) in ids_to_remove:
                         to_del_ids.append(row.id)
                 if to_del_ids:
-                    db.query(table).filter(table.id.in_(to_del_ids)).delete(synchronize_session=False)
+                    db.query(table).filter(table.id.in_(to_del_ids)).delete(synchronize_session='fetch')
         active_plot_lookup = {
             str(row.body or "").strip(): row
             for row in db.query(NovelMemoryNormPlot)
@@ -2861,7 +2861,7 @@ class NovelLLMService:
             db.query(NovelMemoryNormPlot).filter(
                 NovelMemoryNormPlot.novel_id == novel_id,
                 NovelMemoryNormPlot.body.in_(top_resolved)
-            ).delete(synchronize_session=False)
+            ).delete(synchronize_session='fetch')
             stats["open_plots_resolved"] += len(top_resolved)
 
         # 3. 更新角色
