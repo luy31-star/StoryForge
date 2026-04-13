@@ -2626,6 +2626,7 @@ class NovelLLMService:
 
         # 0.1 如果是刷新模式，先清空这些章节的旧事实，确保“先删除再更新”
         if replace_timeline and target_chapter_nos:
+            # 1. 清空章节级事实
             db.query(NovelMemoryNormChapter).filter(
                 NovelMemoryNormChapter.novel_id == novel_id,
                 NovelMemoryNormChapter.chapter_no.in_(target_chapter_nos)
@@ -2637,6 +2638,12 @@ class NovelLLMService:
                 "emotional_state": "",
                 "unresolved_hooks_json": "[]"
             }, synchronize_session='fetch')
+            
+            # 2. 【核心加固】同步删除在这几章“出生”的剧情线实体，防止刷新后产生重复或残留的“孤儿”线索
+            db.query(NovelMemoryNormPlot).filter(
+                NovelMemoryNormPlot.novel_id == novel_id,
+                NovelMemoryNormPlot.introduced_chapter.in_(target_chapter_nos)
+            ).delete(synchronize_session='fetch')
 
         latest_delta_chapter_no = 0
         
