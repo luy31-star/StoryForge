@@ -2619,14 +2619,6 @@ class NovelLLMService:
             "items_updated": 0,
         }
         
-        # 0. 解析正文摘要中的 MD5 指纹（如果有）
-        hash_map: dict[int, str] = {}
-        if chapters_summary:
-            # 匹配格式：[CHAPTER_HASH: 10, abc123...]
-            matches = re.finditer(r"\[CHAPTER_HASH:\s*(\d+),\s*([a-f0-9]{32})\]", chapters_summary)
-            for m in matches:
-                hash_map[int(m.group(1))] = m.group(2)
-
         latest_delta_chapter_no = 0
         
         # 0. 处理全局删除：ids_to_remove
@@ -2683,10 +2675,6 @@ class NovelLLMService:
                 
                 entry.chapter_title = str(item.get("chapter_title") or entry.chapter_title or "").strip()
                 
-                # 记录指纹，实现断点续传的关键
-                if chapter_no in hash_map:
-                    entry.content_hash = hash_map[chapter_no]
-
                 for field in ("key_facts", "causal_results", "open_plots_resolved"):
                     json_field = f"{field}_json"
                     old_list = json.loads(getattr(entry, json_field) or "[]")
@@ -4279,12 +4267,10 @@ class NovelLLMService:
             batch_num += 1
             end = summary_len if batch_chars <= 0 else min(pos + batch_chars, summary_len)
             if batch_chars > 0 and end < summary_len:
-                # 寻找章节指纹标记作为物理切分点，确保章节完整性
-                boundary = active_summary.find("[CHAPTER_HASH:", min(pos + batch_chars // 2, summary_len))
+                # 寻找章节标题标记作为物理切分点，确保章节完整性
+                boundary = active_summary.find("\n\n第", min(pos + batch_chars // 2, summary_len))
                 if boundary != -1 and boundary < pos + batch_chars * 1.5:
-                    line_end = active_summary.find("\n", boundary)
-                    if line_end != -1:
-                        end = line_end + 1
+                    end = boundary
             
             batch_summary = active_summary[pos:end].strip()
             if not batch_summary:

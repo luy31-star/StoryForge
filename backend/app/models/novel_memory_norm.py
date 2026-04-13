@@ -154,7 +154,6 @@ class NovelMemoryNormChapter(Base):
     memory_version: Mapped[int] = mapped_column(Integer, default=0)
     chapter_no: Mapped[int] = mapped_column(Integer, default=0)
     chapter_title: Mapped[str] = mapped_column(String(512), default="")
-    content_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     key_facts_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     causal_results_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     open_plots_added_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")

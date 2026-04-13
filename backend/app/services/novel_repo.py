@@ -78,9 +78,6 @@ def format_approved_chapters_summary(
 
     def slice_one(c: Chapter) -> str:
         t = c.content or ""
-        # 计算该章正文全量 MD5
-        c_hash = hashlib.md5(t.encode("utf-8")).hexdigest()
-        
         # 构造正文截断
         if mode == "tail":
             body = t[-tail_chars:]
@@ -90,8 +87,7 @@ def format_approved_chapters_summary(
             # both：开头 + 结尾
             body = f"{t[:head_chars]}\n…（续写结尾）…\n{t[-tail_chars:]}"
             
-        # 嵌入指纹标记（格式：[CHAPTER_HASH: chapter_no, md5]）
-        return f"{body}\n[CHAPTER_HASH: {c.chapter_no}, {c_hash}]"
+        return body
 
     return "\n\n".join(
         f"第{c.chapter_no}章 {c.title}\n{slice_one(c)}"
