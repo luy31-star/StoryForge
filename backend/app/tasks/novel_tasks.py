@@ -521,8 +521,43 @@ def novel_refresh_memory_for_novel(
             or 0
         )
         llm = _novel_llm_for_novel(n)
-        result = llm.refresh_memory_from_chapters_sync(n, summary, prev, db=db, replace_timeline=True)
+        
+        def _progress_callback(batch_num: int, ch_info: str, stats: dict = None):
+            _append_refresh_log(
+                db,
+                novel_id=novel_id,
+                batch_id=bid,
+                event="memory_refresh_progress",
+                message=f"记忆刷新进度：已完成第 {batch_num} 批次 ({ch_info})",
+                meta={"batch_num": batch_num, "ch_info": ch_info, "stats": stats or {}},
+            )
+            db.commit()
+
+        result = llm.refresh_memory_from_chapters_sync(
+            n, summary, prev, db=db, replace_timeline=True, progress_callback=_progress_callback
+        )
         if not result.get("ok"):
+            _task_set_terminal(db, batch_id=bid, status="failed", message=f"失败：{result.get('error', '未知错误')}")
+            cand = str(result.get("candidate_json") or "{}")
+            _append_refresh_log(
+                db,
+                novel_id=novel_id,
+                batch_id=bid,
+                event="memory_refresh_failed",
+                level="error",
+                message=f"后台记忆刷新失败：{result.get('error', '未知错误')}",
+                meta={
+                    "error": result.get("error"),
+                    "batch": result.get("batch"),
+                    "current_version": current_version,
+                    "candidate_json": cand,
+                    "candidate_readable_zh": memory_payload_to_readable_zh(cand),
+                },
+            )
+            db.commit()
+            return {"status": "failed", "novel_id": novel_id}
+        
+        if result.get("blocking_errors"):
             _task_set_terminal(db, batch_id=bid, status="failed", message="校验失败：未覆盖当前记忆")
             cand = str(result.get("candidate_json") or "{}")
             _append_refresh_log(
@@ -533,7 +568,7 @@ def novel_refresh_memory_for_novel(
                 level="error",
                 message="后台记忆刷新被校验拦截，未覆盖当前记忆",
                 meta={
-                    "errors": result.get("blocking_errors") or result.get("errors") or [],
+                    "errors": result.get("blocking_errors") or [],
                     "warnings": result.get("warnings") or [],
                     "auto_pass_notes": result.get("auto_pass_notes") or [],
                     "batch": result.get("batch"),

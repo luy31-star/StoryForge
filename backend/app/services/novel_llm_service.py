@@ -4136,6 +4136,11 @@ class NovelLLMService:
                         candidate_json = latest_row.payload_json
             except Exception as e:
                 logger.exception("Failed to update normalized memory tables (sync savepoint): %s", e)
+                return {
+                    "ok": False,
+                    "error": f"更新规范化表失败: {e}",
+                    "payload_json": candidate_json,
+                }
         
         return {
             "ok": True,
@@ -4158,6 +4163,7 @@ class NovelLLMService:
         prev_memory: str,
         db: Any = None,
         replace_timeline: bool = False,
+        progress_callback: Any = None,
     ) -> dict[str, Any]:
         """刷新记忆，采用增量抽取 + 代码合并。"""
         batch_chars = settings.novel_memory_refresh_batch_chars
@@ -4190,23 +4196,41 @@ class NovelLLMService:
                 pos = end
                 continue
             
+            # 解析该批次包含的章节号，用于进度显示
+            chapter_nos = sorted([int(n) for n in re.findall(r"第(\d+)章", batch_summary)])
+            ch_info = f"第 {chapter_nos[0]}-{chapter_nos[-1]} 章" if len(chapter_nos) > 1 else (f"第 {chapter_nos[0]} 章" if chapter_nos else "未知章节")
+
             is_last_batch = (end >= summary_len)
-            result = await self._apply_memory_delta_batch(
-                novel,
-                batch_summary,
-                current_memory,
-                db=db,
-                replace_timeline=replace_timeline,
-                skip_snapshot=not is_last_batch,
-            )
-            if not result["ok"]:
-                result["batch"] = batch_num
-                return result
-            current_memory = result["payload_json"]
-            collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
-            collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
-            for key in total_stats:
-                total_stats[key] += int(result.get("stats", {}).get(key, 0))
+            try:
+                result = await self._apply_memory_delta_batch(
+                    novel,
+                    batch_summary,
+                    current_memory,
+                    db=db,
+                    replace_timeline=replace_timeline,
+                    skip_snapshot=not is_last_batch,
+                )
+                if not result["ok"]:
+                    result["batch"] = batch_num
+                    return result
+                
+                # 实时持久化：每批次成功后立即提交
+                if db:
+                    db.commit()
+                    logger.info("refresh_memory (async) batch commit success | batch=%d | chapters=%s", batch_num, ch_info)
+                    if progress_callback:
+                        progress_callback(batch_num, ch_info, result.get("stats"))
+
+                current_memory = result["payload_json"]
+                collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
+                collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
+                for key in total_stats:
+                    total_stats[key] += int(result.get("stats", {}).get(key, 0))
+            except Exception as e:
+                if db:
+                    db.rollback()
+                logger.exception("refresh_memory (async) batch failed | batch=%d", batch_num)
+                return {"ok": False, "error": f"批次 {batch_num} ({ch_info}) 执行异常: {e}", "batch": batch_num}
             pos = end
         
         out: dict[str, Any] = {
@@ -4231,6 +4255,7 @@ class NovelLLMService:
         prev_memory: str,
         db: Any = None,
         replace_timeline: bool = False,
+        progress_callback: Any = None,
     ) -> dict[str, Any]:
         """同步版本的记忆刷新，采用增量抽取 + 代码合并。"""
         # 不再根据 MD5 跳过，确保每一章都经过 LLM 重新扫描提取
@@ -4277,6 +4302,10 @@ class NovelLLMService:
                 pos = end
                 continue
             
+            # 解析该批次包含的章节号，用于进度显示
+            chapter_nos = sorted([int(n) for n in re.findall(r"第(\d+)章", batch_summary)])
+            ch_info = f"第 {chapter_nos[0]}-{chapter_nos[-1]} 章" if len(chapter_nos) > 1 else (f"第 {chapter_nos[0]} 章" if chapter_nos else "未知章节")
+
             # 如果还有下一批，则跳过快照生成，只更新规范化表
             is_last_batch = (end >= summary_len)
             try:
@@ -4295,7 +4324,9 @@ class NovelLLMService:
                 # 实时持久化：每批次成功后立即提交
                 if db:
                     db.commit()
-                    logger.info("refresh_memory batch commit success | batch=%d", batch_num)
+                    logger.info("refresh_memory batch commit success | batch=%d | chapters=%s", batch_num, ch_info)
+                    if progress_callback:
+                        progress_callback(batch_num, ch_info, result.get("stats"))
 
                 current_memory = result["payload_json"]
                 collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
@@ -4306,7 +4337,7 @@ class NovelLLMService:
                 if db:
                     db.rollback()
                 logger.exception("refresh_memory batch failed | batch=%d", batch_num)
-                return {"ok": False, "error": f"批次 {batch_num} 执行异常: {e}", "batch": batch_num}
+                return {"ok": False, "error": f"批次 {batch_num} ({ch_info}) 执行异常: {e}", "batch": batch_num}
             
             pos = end
         
