@@ -36,6 +36,8 @@ class Novel(Base):
     daily_auto_chapters: Mapped[int] = mapped_column(Integer, default=0)
     # 每日自动撰写定时（HH:MM）
     daily_auto_time: Mapped[str] = mapped_column(String(16), default="14:30")
+    # 每章目标字数（如 2000, 3000, 5000）
+    chapter_target_words: Mapped[int] = mapped_column(Integer, default=3000)
     # 记录最后一次执行每日自动撰写的日期（YYYY-MM-DD），防止重复执行
     last_auto_date: Mapped[str] = mapped_column(String(10), default="")
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")

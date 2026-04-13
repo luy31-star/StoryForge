@@ -342,6 +342,7 @@ export function NovelWorkspace() {
     target_chapters: 300,
     daily_auto_chapters: 0,
     daily_auto_time: "14:30",
+    chapter_target_words: 3000,
   });
   const [novelSettingsBusy, setNovelSettingsBusy] = useState(false);
 
@@ -350,6 +351,11 @@ export function NovelWorkspace() {
   const [exportEndNo, setExportEndNo] = useState(9999);
   const [exportContent, setExportContent] = useState("");
   const [exportBusy, setExportBusy] = useState(false);
+
+  const [refreshRangeOpen, setRefreshRangeOpen] = useState(false);
+  const [refreshRangeMode, setRefreshRangeMode] = useState<"recent" | "full" | "custom">("recent");
+  const [refreshFromNo, setRefreshFromNo] = useState(1);
+  const [refreshToNo, setRefreshToNo] = useState(1);
 
   async function handleExport() {
     if (!id) return;
@@ -371,6 +377,7 @@ export function NovelWorkspace() {
       target_chapters: Number(novel.target_chapters || 300),
       daily_auto_chapters: Number(novel.daily_auto_chapters || 0),
       daily_auto_time: String(novel.daily_auto_time || "14:30"),
+      chapter_target_words: Number(novel.chapter_target_words || 3000),
     });
     setNovelSettingsOpen(true);
   }
@@ -1016,13 +1023,14 @@ export function NovelWorkspace() {
     }
   }
 
-  async function runRefreshMemory() {
+  async function executeRefreshMemory(options: { from_chapter_no?: number; to_chapter_no?: number; is_full?: boolean } = {}) {
     if (!id) return;
     setErr(null);
     setNotice(null);
     setBusy(true);
+    setRefreshRangeOpen(false);
     try {
-      const resp = await refreshMemory(id);
+      const resp = await refreshMemory(id, options);
       if (resp.status !== "queued" || !resp.batch_id) {
         setErr("记忆刷新未能入队");
         return;
@@ -1878,21 +1886,7 @@ export function NovelWorkspace() {
   }
 
   function confirmRefreshMemory() {
-    void openLlmConfirm(
-      {
-        title: "确认根据已审定章节刷新记忆？",
-        description: "这会调用大模型重新整理当前小说记忆，并与现有版本做校验比较。",
-        confirmLabel: "确认刷新记忆",
-        details: [
-          "提交后任务在后台执行，关闭或离开本页不会中断。",
-          "如果系统判断只是合理压缩，会先给你看候选版本；不会直接悄悄覆盖当前记忆。",
-          "更适合在连续审定若干章节后执行，而不是每改一两句话就刷新一次。",
-        ],
-      },
-      async () => {
-        await runRefreshMemory();
-      }
-    );
+    setRefreshRangeOpen(true);
   }
 
   function formatUtc8(iso: string | null | undefined): string {
@@ -2531,6 +2525,102 @@ export function NovelWorkspace() {
               <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">{generateTrace}</p>
             ) : null}
             
+            <Dialog open={refreshRangeOpen} onOpenChange={setRefreshRangeOpen}>
+              <DialogContent className="max-w-md overflow-hidden flex flex-col">
+                <DialogHeader>
+                  <DialogTitle>刷新记忆范围选择</DialogTitle>
+                  <DialogDescription>
+                    请选择用于汇总记忆的已审定章节范围。
+                  </DialogDescription>
+                </DialogHeader>
+                <div className="space-y-4 py-2">
+                  <div className="flex flex-col gap-2">
+                    <Label className="text-sm font-semibold">选择模式</Label>
+                    <div className="grid grid-cols-3 gap-2">
+                      <Button
+                        variant={refreshRangeMode === "recent" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setRefreshRangeMode("recent")}
+                        className="text-xs"
+                      >
+                        最近 15 章
+                      </Button>
+                      <Button
+                        variant={refreshRangeMode === "full" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setRefreshRangeMode("full")}
+                        className="text-xs"
+                      >
+                        全量刷新
+                      </Button>
+                      <Button
+                        variant={refreshRangeMode === "custom" ? "default" : "outline"}
+                        size="sm"
+                        onClick={() => setRefreshRangeMode("custom")}
+                        className="text-xs"
+                      >
+                        自定义范围
+                      </Button>
+                    </div>
+                  </div>
+
+                  {refreshRangeMode === "custom" && (
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <Label className="text-xs">起始章号</Label>
+                        <Input
+                          type="number"
+                          value={refreshFromNo}
+                          onChange={(e) => setRefreshFromNo(Number(e.target.value))}
+                          className="h-9"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <Label className="text-xs">结束章号</Label>
+                        <Input
+                          type="number"
+                          value={refreshToNo}
+                          onChange={(e) => setRefreshToNo(Number(e.target.value))}
+                          className="h-9"
+                        />
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
+                    <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
+                      <div className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+                      <p className="text-xs font-bold text-amber-600 dark:text-amber-400">温馨提示</p>
+                    </div>
+                    <ul className="list-disc list-inside text-[11px] text-amber-700/80 dark:text-amber-400/80 space-y-1">
+                      <li>汇总的章节越多，AI 处理速度越慢。</li>
+                      <li>刷新操作会消耗较多积分（按汇总字数计费）。</li>
+                      <li>建议仅在产生重大剧情变更或由于逻辑偏移需要“纠偏”时进行全量刷新。</li>
+                    </ul>
+                  </div>
+                </div>
+                <DialogFooter className="mt-4">
+                  <Button variant="outline" onClick={() => setRefreshRangeOpen(false)}>
+                    取消
+                  </Button>
+                  <Button
+                    onClick={() => {
+                      const opts: any = {};
+                      if (refreshRangeMode === "full") opts.is_full = true;
+                      else if (refreshRangeMode === "custom") {
+                        opts.from_chapter_no = refreshFromNo;
+                        opts.to_chapter_no = refreshToNo;
+                      }
+                      void executeRefreshMemory(opts);
+                    }}
+                    disabled={busy}
+                  >
+                    开始刷新
+                  </Button>
+                </DialogFooter>
+              </DialogContent>
+            </Dialog>
+
             <Dialog open={exportOpen} onOpenChange={setExportOpen}>
               <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden flex flex-col">
                 <DialogHeader>
@@ -4128,6 +4218,20 @@ export function NovelWorkspace() {
                 className="field-shell text-foreground font-bold"
               />
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">由后台系统自动执行。</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="chapter_target_words" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每章期望字数（汉字）</Label>
+              <Input
+                id="chapter_target_words"
+                type="number"
+                min={500}
+                max={10000}
+                step={100}
+                value={novelSettingsDraft.chapter_target_words}
+                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, chapter_target_words: Number(e.target.value) })}
+                className="field-shell text-foreground font-bold"
+              />
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 在写正文时将以此为强约束。建议 2000-5000。</p>
             </div>
           </div>
           <DialogFooter>

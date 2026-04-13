@@ -36,6 +36,7 @@ export function NovelShelf() {
   const [aiCreateMoods, setAiCreateMoods] = useState<string[]>([]);
   const [aiCreateBackground, setAiCreateBackground] = useState<string>("现代");
   const [aiCreateTargetChapters, setAiCreateTargetChapters] = useState<number>(10);
+  const [aiCreateChapterTargetWords, setAiCreateChapterTargetWords] = useState<number>(3000);
   const [aiCreateNotes, setAiCreateNotes] = useState("");
   const [aiCreateDailyChapters, setAiCreateDailyChapters] = useState(0);
   const [aiCreateDailyTime, setAiCreateDailyTime] = useState("14:30");
@@ -80,6 +81,7 @@ export function NovelShelf() {
         moods: aiCreateMoods,
         backgrounds: aiCreateBackground ? [aiCreateBackground] : [],
         target_chapters: aiCreateTargetChapters,
+        chapter_target_words: aiCreateChapterTargetWords,
         notes: aiCreateNotes.trim(),
         target_generate_chapters: 0,
         daily_auto_chapters: aiCreateDailyChapters,
@@ -187,6 +189,7 @@ export function NovelShelf() {
   ];
   const BACKGROUNDS = ["古代", "现代", "未来", "架空", "民国", "近现代"];
   const TARGET_CHAPTERS = [5, 10, 15];
+  const WORDS_PER_CHAPTER = [2000, 3000, 5000];
 
   function toggleLimit(
     current: string[],
@@ -536,6 +539,45 @@ export function NovelShelf() {
                 <div className="space-y-2">
                   <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium pt-7">
                     章节数会影响大纲拆分与后续续写上限。
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每章期望字数（汉字）</Label>
+              <div className="flex flex-wrap gap-2">
+                {WORDS_PER_CHAPTER.map((w) => (
+                  <button
+                    key={w}
+                    type="button"
+                    onClick={() => setAiCreateChapterTargetWords(w)}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
+                      aiCreateChapterTargetWords === w
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
+                    }`}
+                  >
+                    {w} 字
+                  </button>
+                ))}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label className="text-xs font-semibold text-foreground/70">自定义字数</Label>
+                  <Input
+                    type="number"
+                    min={500}
+                    max={10000}
+                    step={100}
+                    value={aiCreateChapterTargetWords}
+                    onChange={(e) => setAiCreateChapterTargetWords(Number(e.target.value))}
+                    className="text-foreground"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium pt-7">
+                    AI 在写正文时将以此为强约束。建议 2000-5000。
                   </p>
                 </div>
               </div>

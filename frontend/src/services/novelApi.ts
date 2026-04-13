@@ -325,6 +325,7 @@ export async function createNovel(body: {
   target_chapters?: number;
   daily_auto_chapters?: number;
   daily_auto_time?: string;
+  chapter_target_words?: number;
 }) {
   const r = await apiFetch(BASE, {
     method: "POST",
@@ -346,6 +347,7 @@ export async function aiCreateAndStartNovel(body: {
   target_generate_chapters?: number;
   daily_auto_chapters?: number;
   daily_auto_time?: string;
+  chapter_target_words?: number;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
     method: "POST",
@@ -389,6 +391,7 @@ export async function getNovel(id: string) {
     length_tag: string;
     daily_auto_chapters: number;
     daily_auto_time: string;
+    chapter_target_words: number;
     framework_confirmed: boolean;
     status: string;
     [key: string]: any;
@@ -1064,9 +1067,13 @@ export async function saveMemoryPatch(
   }>;
 }
 
-export async function refreshMemory(novelId: string) {
+export async function refreshMemory(
+  novelId: string,
+  body: { from_chapter_no?: number; to_chapter_no?: number; is_full?: boolean } = {}
+) {
   const r = await apiFetch(`${BASE}/${novelId}/memory/refresh`, {
     method: "POST",
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{

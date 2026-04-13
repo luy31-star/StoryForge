@@ -28,6 +28,7 @@ export function NovelNew() {
   const [background, setBackground] = useState("");
   const [style, setStyle] = useState("");
   const [targetChapters, setTargetChapters] = useState(1500);
+  const [chapterTargetWords, setChapterTargetWords] = useState(3000);
   const [dailyChapters, setDailyChapters] = useState(0);
   const [dailyTime, setDailyTime] = useState("14:30");
   const [file, setFile] = useState<File | null>(null);
@@ -60,6 +61,7 @@ export function NovelNew() {
         target_chapters: targetChapters,
         daily_auto_chapters: dailyChapters,
         daily_auto_time: dailyTime,
+        chapter_target_words: chapterTargetWords,
       });
       if (file) {
         const verr = validateReferenceFile(file);
@@ -405,6 +407,19 @@ export function NovelNew() {
                     max={20000}
                     value={targetChapters}
                     onChange={(e) => setTargetChapters(Number(e.target.value))}
+                    className="field-shell mt-1 h-11 text-foreground"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="ctw" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每章期望字数（汉字）</Label>
+                  <Input
+                    id="ctw"
+                    type="number"
+                    min={500}
+                    max={10000}
+                    step={100}
+                    value={chapterTargetWords}
+                    onChange={(e) => setChapterTargetWords(Number(e.target.value))}
                     className="field-shell mt-1 h-11 text-foreground"
                   />
                 </div>

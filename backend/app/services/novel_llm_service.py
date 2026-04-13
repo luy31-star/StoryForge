@@ -284,12 +284,16 @@ def _chapter_messages(
         f"请写第 {chapter_no} 章"
         f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}。"
     )
+    target_words = getattr(novel, "chapter_target_words", 3000) or 3000
+    words_min = int(target_words * 0.9)
+    words_max = int(target_words * 1.2)
+    
     user_parts.append(
         "【统一输出规则】\n"
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
         "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
         "3) 第二行留空一行，再开始正文。\n"
-        "4) 正文（不含标题行）目标体量约 3000 汉字左右（建议在 2800～3500 汉字之间）；明显偏短视为不合格；"
+        f"4) 正文（不含标题行）目标体量约 {target_words} 汉字左右（建议在 {words_min}～{words_max} 汉字之间）；明显偏短视为不合格；"
         "用场景、对白与细节描写支撑篇幅，避免用一两段概括带过。\n"
         "5) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
         "6) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
@@ -2242,7 +2246,10 @@ class NovelLLMService:
             "pets_changed{added[],updated[]}, conflicts_detected[],"
             "forbidden_constraints_added[], ids_to_remove[], entity_influence_updates[]。"
             "ids_to_remove[]：非常重要！当你判断某条【待收束线】已收束、某条【硬约束】已失效、或某项技能/道具已遗失/毁坏时，"
-            "直接在 ids_to_remove 中填入该条目在下文提供的 4 位短 ID。不要通过文本匹配删除。"
+            "直接在 ids_to_remove 中填入该条目在下文提供的 4 位短 ID。不要通过文本匹配删除。\n"
+            "【同类条目替换与升级规则（通用）】\n"
+            "1. 状态/等级更新：若某项属性、技能或物品存在明显的等级递进或阶段更替（如：等级1 -> 等级2，初级 -> 中级），必须在 added 中加入新条目，并务必在 ids_to_remove 中放入旧条目的 ID。严禁同一实体的多个版本/阶段同时处于活跃状态。\n"
+            "2. 唯一性冲突：对于在设定上具有唯一性或排他性的条目，新条目出现时必须移除旧条目。"
             "canonical_entries 每项结构："
             "{chapter_no:number, chapter_title:string, key_facts:string[], causal_results:string[],"
             " open_plots_added:(string|{body,plot_type,priority,estimated_duration,current_stage,resolve_when})[],"
@@ -2268,7 +2275,8 @@ class NovelLLMService:
             f"【旧记忆热层快照（含 ID）】\n{compact_prev}\n\n"
             f"{prev_open_plots}\n\n"
             f"【新章节文本/摘要】\n{chapters_summary}\n\n"
-            "任务：提取本批章节相对旧记忆的增量事实。"
+            "任务：提取本批章节相对旧记忆的增量事实。\n"
+            "特别提醒：若实体状态/等级发生变更（升级、替换），必须找到旧版本的 ID 放入 ids_to_remove！"
             "如果某条线索在本批明确收束，请将该线索的 ID 放入 ids_to_remove；"
             "如果某条硬约束、技能或物品不再适用，也请放入 ids_to_remove。"
             "如果只是推进但未真正解决，不要移除。"
@@ -2504,8 +2512,30 @@ class NovelLLMService:
             "open_plots_added": 0,
             "open_plots_resolved": 0,
             "characters_updated": 0,
+            "skills_updated": 0,
+            "items_updated": 0,
         }
         latest_delta_chapter_no = 0
+        
+        # 0. 处理全局删除：ids_to_remove
+        ids_to_remove = set(delta.get("ids_to_remove") or [])
+        if ids_to_remove:
+            # 尝试在各分表中根据内容哈希删除匹配项
+            for table, attr in [
+                (NovelMemoryNormPlot, "body"),
+                (NovelMemoryNormCharacter, "name"),
+                (NovelMemoryNormSkill, "name"),
+                (NovelMemoryNormItem, "label"),
+                (NovelMemoryNormPet, "name"),
+            ]:
+                rows = db.query(table).filter(table.novel_id == novel_id).all()
+                to_del_ids = []
+                for row in rows:
+                    val = getattr(row, attr)
+                    if val and NovelLLMService._short_id(val) in ids_to_remove:
+                        to_del_ids.append(row.id)
+                if to_del_ids:
+                    db.query(table).filter(table.id.in_(to_del_ids)).delete(synchronize_session=False)
         active_plot_lookup = {
             str(row.body or "").strip(): row
             for row in db.query(NovelMemoryNormPlot)
@@ -2959,6 +2989,7 @@ class NovelLLMService:
                     else:
                         exists.is_active = True
                     exists.memory_version = memory_version
+                stats["items_updated"] += 1
 
         # 6. 技能
         skills_changed = delta.get("skills_changed")
@@ -3007,6 +3038,7 @@ class NovelLLMService:
                     else:
                         skill.is_active = True
                 skill.memory_version = memory_version
+                stats["skills_updated"] += 1
 
         # 6b. 宠物 / 同伴
         pets_changed = delta.get("pets_changed")
@@ -3307,7 +3339,7 @@ class NovelLLMService:
                                 if k in ("id", "name"): continue
                                 base[k] = v
                             item_map[iid] = base
-            data[key] = list(item_map.values())
+                data[key] = list(item_map.values())
 
         _merge_named_collection_with_id("inventory", "inventory_changed")
         _merge_named_collection_with_id("skills", "skills_changed")
@@ -3748,9 +3780,9 @@ class NovelLLMService:
                 "delta": delta,
             }
 
-        # 3. 如果没有 warning 且有 db，则执行规范化表更新
+        # 3. 如果没有 blocking_errors 且有 db，则执行规范化表更新
         new_version = 0
-        if db and not warnings:
+        if db and not blocking_errors:
             try:
                 # 使用 Savepoint 保护事务，防止局部失败导致全局回滚（如章节审批状态丢失）
                 with db.begin_nested():
@@ -3902,9 +3934,9 @@ class NovelLLMService:
                 "delta": delta,
             }
 
-        # 3. 如果没有 warning 且有 db，则执行规范化表更新
+        # 3. 如果没有 blocking_errors 且有 db，则执行规范化表更新
         new_version = 0
-        if db and not warnings:
+        if db and not blocking_errors:
             try:
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1

@@ -413,6 +413,9 @@ def novel_refresh_memory_for_novel(
     novel_id: str,
     reason: str = "后台：基于已审定章节自动合并",
     batch_id: str = "",
+    from_chapter_no: int | None = None,
+    to_chapter_no: int | None = None,
+    is_full: bool = False,
 ) -> dict[str, int | str]:
     """
     单本小说后台刷新记忆：用于「审定通过/已审定章节改动」后异步刷新，避免阻塞接口。
@@ -455,12 +458,18 @@ def novel_refresh_memory_for_novel(
             )
             db.commit()
             return {"status": "not_found", "novel_id": novel_id}
-        chapters = (
-            db.query(Chapter)
-            .filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
-            .order_by(Chapter.chapter_no.asc())
-            .all()
-        )
+        
+        q = db.query(Chapter).filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
+        if is_full:
+            max_chapters = 99999
+        elif from_chapter_no is not None and to_chapter_no is not None:
+            q = q.filter(Chapter.chapter_no >= from_chapter_no, Chapter.chapter_no <= to_chapter_no)
+            max_chapters = 99999
+        else:
+            max_chapters = settings.novel_memory_refresh_chapters or 15
+            
+        chapters = q.order_by(Chapter.chapter_no.asc()).all()
+        
         logger.info(
             "refresh_memory_for_novel loading approved chapters | novel_id=%s count=%s batch_id=%s",
             novel_id,
@@ -491,7 +500,7 @@ def novel_refresh_memory_for_novel(
             settings.novel_chapter_summary_tail_chars,
             head_chars=settings.novel_chapter_summary_head_chars,
             mode=settings.novel_chapter_summary_mode,
-            max_chapters=settings.novel_memory_refresh_chapters,
+            max_chapters=max_chapters,
         )
         prev = latest_memory_json(db, novel_id)
         current_version = (

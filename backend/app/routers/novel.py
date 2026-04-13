@@ -107,8 +107,8 @@ class AiCreateAndStartBody(BaseModel):
     target_generate_chapters: int = Field(default=0, ge=0, le=50)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
-
-
+    chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    
 class NovelCreate(BaseModel):
     title: str
     intro: str = ""
@@ -117,7 +117,7 @@ class NovelCreate(BaseModel):
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
-
+    chapter_target_words: int = Field(default=3000, ge=500, le=10000)
 
 class NovelPatch(BaseModel):
     title: str | None = None
@@ -127,6 +127,7 @@ class NovelPatch(BaseModel):
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
     daily_auto_time: str | None = None
+    chapter_target_words: int | None = Field(default=None, ge=500, le=10000)
     status: str | None = None
 
 
@@ -442,6 +443,7 @@ def list_novels(
             "status": n.status,
             "framework_confirmed": n.framework_confirmed,
             "target_chapters": n.target_chapters,
+            "chapter_target_words": n.chapter_target_words,
             "length_tag": _get_length_tag(n.target_chapters),
             "daily_auto_chapters": n.daily_auto_chapters,
             "daily_auto_time": n.daily_auto_time,
@@ -506,6 +508,7 @@ def ai_create_and_start(
         target_chapters=int(body.target_chapters or 300),
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
+        chapter_target_words=body.chapter_target_words,
         user_id=user.id,
         status="draft",
         framework_confirmed=False
@@ -608,6 +611,7 @@ def create_novel(
         target_chapters=body.target_chapters,
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
+        chapter_target_words=body.chapter_target_words,
         user_id=user.id,
     )
     db.add(n)
@@ -630,6 +634,7 @@ def get_novel(
         "background": n.background,
         "style": n.style,
         "target_chapters": n.target_chapters,
+        "chapter_target_words": n.chapter_target_words,
         "length_tag": _get_length_tag(n.target_chapters),
         "daily_auto_chapters": n.daily_auto_chapters,
         "daily_auto_time": n.daily_auto_time,
@@ -2540,49 +2545,70 @@ def get_novel_metrics(
     }
 
 
+class RefreshMemoryBody(BaseModel):
+    from_chapter_no: int | None = None
+    to_chapter_no: int | None = None
+    is_full: bool = False
+
 @router.post("/{novel_id}/memory/refresh")
 def refresh_memory(
     novel_id: str,
+    body: RefreshMemoryBody,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     require_novel_access(db, novel_id, user)
-    chapters = (
-        db.query(Chapter)
-        .filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
-        .order_by(Chapter.chapter_no.asc())
-        .all()
-    )
+    
+    q = db.query(Chapter).filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
+    if body.is_full:
+        # 不限制
+        pass
+    elif body.from_chapter_no is not None and body.to_chapter_no is not None:
+        q = q.filter(Chapter.chapter_no >= body.from_chapter_no, Chapter.chapter_no <= body.to_chapter_no)
+    else:
+        # 默认只刷最近 15 章
+        pass
+        
+    chapters = q.order_by(Chapter.chapter_no.asc()).all()
     if not chapters:
-        raise HTTPException(400, "暂无已审定章节可用于汇总记忆")
+        raise HTTPException(400, "选定范围或默认范围内暂无已审定章节可用于汇总记忆")
+
     if has_pending_memory_refresh_batch(db, novel_id):
         raise HTTPException(
             409,
             "当前已有记忆刷新任务进行中，请在「生成日志」中查看进度后再试",
         )
+    
     batch_id = f"mem-refresh-{int(time.time())}-{novel_id[:8]}"
     try:
         task = novel_refresh_memory_for_novel.delay(
-            novel_id, "手动：记忆页刷新", batch_id
+            novel_id, 
+            "手动：记忆页刷新", 
+            batch_id,
+            from_chapter_no=body.from_chapter_no,
+            to_chapter_no=body.to_chapter_no,
+            is_full=body.is_full
         )
         task_id = getattr(task, "id", None)
     except Exception as e:
         logger.exception("refresh_memory enqueue failed | novel_id=%s", novel_id)
         raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    
+    range_text = "全量" if body.is_full else (f"第{body.from_chapter_no}-{body.to_chapter_no}章" if body.from_chapter_no else "最近15章")
     _append_generation_log(
         db,
         novel_id=novel_id,
         batch_id=batch_id,
         event="memory_refresh_queued",
-        message="已入队手动记忆刷新",
-        meta={"reason": "手动：记忆页刷新", "task_id": task_id},
+        message=f"已入队手动记忆刷新（范围：{range_text}）",
+        meta={"reason": "手动：记忆页刷新", "task_id": task_id, "range": range_text},
     )
     db.commit()
     return {
         "status": "queued",
         "batch_id": batch_id,
         "task_id": task_id,
-        "message": "记忆刷新已在后台执行，可在生成日志中查看进度",
+        "message": f"记忆刷新（{range_text}）已在后台执行，可在生成日志中查看进度",
     }
 
 
