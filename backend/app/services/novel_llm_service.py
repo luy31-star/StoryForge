@@ -2604,6 +2604,7 @@ class NovelLLMService:
         delta: dict[str, Any],
         memory_version: int,
         replace_timeline: bool = False,
+        chapters_summary: str | None = None,
     ) -> dict[str, int]:
         """
         根据 LLM 返回的增量 Delta，直接更新规范化数据库表。
@@ -2617,6 +2618,15 @@ class NovelLLMService:
             "skills_updated": 0,
             "items_updated": 0,
         }
+        
+        # 0. 解析正文摘要中的 MD5 指纹（如果有）
+        hash_map: dict[int, str] = {}
+        if chapters_summary:
+            # 匹配格式：[CHAPTER_HASH: 10, abc123...]
+            matches = re.finditer(r"\[CHAPTER_HASH:\s*(\d+),\s*([a-f0-9]{32})\]", chapters_summary)
+            for m in matches:
+                hash_map[int(m.group(1))] = m.group(2)
+
         latest_delta_chapter_no = 0
         
         # 0. 处理全局删除：ids_to_remove
@@ -2672,6 +2682,10 @@ class NovelLLMService:
                     db.add(entry)
                 
                 entry.chapter_title = str(item.get("chapter_title") or entry.chapter_title or "").strip()
+                
+                # 记录指纹，实现断点续传的关键
+                if chapter_no in hash_map:
+                    entry.content_hash = hash_map[chapter_no]
 
                 for field in ("key_facts", "causal_results", "open_plots_resolved"):
                     json_field = f"{field}_json"
@@ -3927,7 +3941,12 @@ class NovelLLMService:
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1
                     db_stats = self._upsert_normalized_memory_from_delta(
-                        db, novel.id, delta, new_version, replace_timeline=replace_timeline
+                        db,
+                        novel.id,
+                        delta,
+                        new_version,
+                        replace_timeline=replace_timeline,
+                        chapters_summary=chapters_summary,
                     )
                     # 合并统计信息
                     for k, v in db_stats.items():
@@ -4086,7 +4105,12 @@ class NovelLLMService:
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1
                     db_stats = self._upsert_normalized_memory_from_delta(
-                        db, novel.id, delta, new_version, replace_timeline=replace_timeline
+                        db,
+                        novel.id,
+                        delta,
+                        new_version,
+                        replace_timeline=replace_timeline,
+                        chapters_summary=chapters_summary,
                     )
                     # 合并统计信息
                     for k, v in db_stats.items():
@@ -4221,8 +4245,24 @@ class NovelLLMService:
         replace_timeline: bool = False,
     ) -> dict[str, Any]:
         """同步版本的记忆刷新，采用增量抽取 + 代码合并。"""
+        # 不再根据 MD5 跳过，确保每一章都经过 LLM 重新扫描提取
+        active_summary = chapters_summary.strip()
+        
+        if not active_summary:
+            return {
+                "ok": True,
+                "status": "ok",
+                "payload_json": prev_memory,
+                "candidate_json": prev_memory,
+                "errors": [],
+                "blocking_errors": [],
+                "warnings": [],
+                "auto_pass_notes": ["无需更新：章节摘要为空"],
+                "stats": {},
+            }
+
         batch_chars = settings.novel_memory_refresh_batch_chars
-        summary_len = len(chapters_summary or "")
+        summary_len = len(active_summary)
         current_memory = prev_memory
         total_stats = {
             "canonical_entries": 0,
@@ -4232,39 +4272,72 @@ class NovelLLMService:
         }
         collected_warnings: list[str] = []
         collected_auto_pass_notes: list[str] = []
+            
         batch_num = 0
         pos = 0
         while pos < summary_len:
             batch_num += 1
             end = summary_len if batch_chars <= 0 else min(pos + batch_chars, summary_len)
             if batch_chars > 0 and end < summary_len:
-                boundary = chapters_summary.rfind("\n\n第", pos, end)
-                if boundary > pos + batch_chars // 2:
-                    end = boundary
-            batch_summary = chapters_summary[pos:end].strip()
+                # 寻找章节指纹标记作为物理切分点，确保章节完整性
+                boundary = active_summary.find("[CHAPTER_HASH:", min(pos + batch_chars // 2, summary_len))
+                if boundary != -1 and boundary < pos + batch_chars * 1.5:
+                    line_end = active_summary.find("\n", boundary)
+                    if line_end != -1:
+                        end = line_end + 1
+            
+            batch_summary = active_summary[pos:end].strip()
             if not batch_summary:
                 pos = end
                 continue
             
             # 如果还有下一批，则跳过快照生成，只更新规范化表
             is_last_batch = (end >= summary_len)
-            result = self._apply_memory_delta_batch_sync(
-                novel,
-                batch_summary,
-                current_memory,
-                db=db,
-                replace_timeline=replace_timeline,
-                skip_snapshot=not is_last_batch,
-            )
-            if not result["ok"]:
-                result["batch"] = batch_num
-                return result
-            current_memory = result["payload_json"]
-            collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
-            collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
-            for key in total_stats:
-                total_stats[key] += int(result.get("stats", {}).get(key, 0))
+            try:
+                result = self._apply_memory_delta_batch_sync(
+                    novel,
+                    batch_summary,
+                    current_memory,
+                    db=db,
+                    replace_timeline=replace_timeline,
+                    skip_snapshot=not is_last_batch,
+                )
+                if not result["ok"]:
+                    result["batch"] = batch_num
+                    return result
+                
+                # 实时持久化：每批次成功后立即提交
+                if db:
+                    db.commit()
+                    logger.info("refresh_memory batch commit success | batch=%d", batch_num)
+
+                current_memory = result["payload_json"]
+                collected_warnings.extend(_dedupe_str_list(result.get("warnings", [])))
+                collected_auto_pass_notes.extend(_dedupe_str_list(result.get("auto_pass_notes", [])))
+                for key in total_stats:
+                    total_stats[key] += int(result.get("stats", {}).get(key, 0))
+            except Exception as e:
+                if db:
+                    db.rollback()
+                logger.exception("refresh_memory batch failed | batch=%d", batch_num)
+                return {"ok": False, "error": f"批次 {batch_num} 执行异常: {e}", "batch": batch_num}
+            
             pos = end
+        
+        out_sync: dict[str, Any] = {
+            "ok": True,
+            "status": "warning" if collected_warnings else "ok",
+            "payload_json": current_memory,
+            "candidate_json": current_memory,
+            "errors": [],
+            "blocking_errors": [],
+            "warnings": _dedupe_str_list(collected_warnings),
+            "auto_pass_notes": _dedupe_str_list(collected_auto_pass_notes),
+            "stats": total_stats,
+        }
+        if db:
+            out_sync["version"] = self._get_latest_memory_version(db, novel.id)
+        return out_sync
         
         out_sync: dict[str, Any] = {
             "ok": True,

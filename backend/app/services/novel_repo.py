@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from typing import Any
@@ -60,11 +61,7 @@ def format_approved_chapters_summary(
 ) -> str:
     """
     已审定章节正文截断后拼接，供记忆合并。
-
-    mode:
-      - tail：只取结尾（默认，偏连续性）
-      - head：只取开头
-      - both：取开头 + 结尾（以控制 token，使用 head_chars/tail_chars 分段）
+    同时在文本中嵌入内容哈希，供 NovelLLMService 实现断点跳过逻辑。
     """
     if not chapters:
         return ""
@@ -79,17 +76,25 @@ def format_approved_chapters_summary(
     if head_chars is None:
         head_chars = tail_chars
 
-    def slice_one(text: str) -> str:
-        t = text or ""
+    def slice_one(c: Chapter) -> str:
+        t = c.content or ""
+        # 计算该章正文全量 MD5
+        c_hash = hashlib.md5(t.encode("utf-8")).hexdigest()
+        
+        # 构造正文截断
         if mode == "tail":
-            return t[-tail_chars:]
-        if mode == "head":
-            return t[:head_chars]
-        # both：开头 + 结尾
-        return f"{t[:head_chars]}\n…（续写结尾）…\n{t[-tail_chars:]}"
+            body = t[-tail_chars:]
+        elif mode == "head":
+            body = t[:head_chars]
+        else:
+            # both：开头 + 结尾
+            body = f"{t[:head_chars]}\n…（续写结尾）…\n{t[-tail_chars:]}"
+            
+        # 嵌入指纹标记（格式：[CHAPTER_HASH: chapter_no, md5]）
+        return f"{body}\n[CHAPTER_HASH: {c.chapter_no}, {c_hash}]"
 
     return "\n\n".join(
-        f"第{c.chapter_no}章 {c.title}\n{slice_one(c.content or '')}"
+        f"第{c.chapter_no}章 {c.title}\n{slice_one(c)}"
         for c in tail_chapters
     )
 
