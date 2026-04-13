@@ -31,10 +31,12 @@ export function NovelShelf() {
 
   const [aiCreateOpen, setAiCreateOpen] = useState(false);
   const [aiCreateBusy, setAiCreateBusy] = useState(false);
-  const [aiCreateStyles, setAiCreateStyles] = useState<string[]>(["都市修仙"]);
+  const [aiCreateSubject, setAiCreateSubject] = useState<string>("现言情感");
+  const [aiCreatePlots, setAiCreatePlots] = useState<string[]>([]);
+  const [aiCreateMoods, setAiCreateMoods] = useState<string[]>([]);
+  const [aiCreateBackground, setAiCreateBackground] = useState<string>("现代");
+  const [aiCreateTargetChapters, setAiCreateTargetChapters] = useState<number>(10);
   const [aiCreateNotes, setAiCreateNotes] = useState("");
-  const [aiCreateLength, setAiCreateLength] = useState("long");
-  const [aiCreateInitChapters, setAiCreateInitChapters] = useState(10);
   const [aiCreateDailyChapters, setAiCreateDailyChapters] = useState(0);
   const [aiCreateDailyTime, setAiCreateDailyTime] = useState("14:30");
 
@@ -73,10 +75,13 @@ export function NovelShelf() {
     setAiCreateBusy(true);
     try {
       await aiCreateAndStartNovel({
-        styles: aiCreateStyles,
+        subjects: aiCreateSubject ? [aiCreateSubject] : [],
+        plots: aiCreatePlots,
+        moods: aiCreateMoods,
+        backgrounds: aiCreateBackground ? [aiCreateBackground] : [],
+        target_chapters: aiCreateTargetChapters,
         notes: aiCreateNotes.trim(),
-        length_type: aiCreateLength,
-        target_generate_chapters: aiCreateInitChapters,
+        target_generate_chapters: 0,
         daily_auto_chapters: aiCreateDailyChapters,
         daily_auto_time: aiCreateDailyTime,
       });
@@ -89,19 +94,115 @@ export function NovelShelf() {
     }
   }
 
-  const presets = [
-    "都市修仙", "爽文", "凡人修仙", "都市兵王", "霸道总裁", "穿越异世", 
-    "重生复仇", "末世废土", "游戏异界", "虚拟网游", "科幻机甲", "星际战争", 
-    "恐怖惊悚", "悬疑推理", "灵异奇谈", "历史架空", "军事争霸", "宫廷权谋", 
-    "古言宅斗", "现言种田", "青春校园", "娱乐明星"
+  const SUBJECTS = [
+    "言情",
+    "现言情感",
+    "悬疑",
+    "惊悚",
+    "科幻",
+    "游戏",
+    "仙侠",
+    "历史",
+    "玄幻",
+    "都市",
+    "快穿",
+    "成长",
+    "校园",
+    "职场",
+    "家庭",
+    "冒险",
   ];
+  const PLOTS = [
+    "婚姻",
+    "出轨",
+    "娱乐圈",
+    "重生",
+    "穿越",
+    "犯罪",
+    "丧尸",
+    "探险",
+    "宫斗宅斗",
+    "系统",
+    "规则怪谈",
+    "团宠",
+    "先婚后爱",
+    "追妻火葬场",
+    "破镜重圆",
+    "超能力/异能",
+    "玄学风水",
+    "种田",
+    "直播",
+    "萌宝",
+    "鉴宝",
+    "聊天群",
+    "弹幕",
+    "双向救赎",
+    "替身",
+    "强制爱",
+    "全员恶人",
+    "万人嫌黑化",
+    "无限流",
+    "读心术",
+    "预知能力",
+    "侦探推理",
+    "全员读心",
+    "逆袭成长",
+    "网恋",
+  ];
+  const MOODS = [
+    "纯爱",
+    "HE",
+    "BE",
+    "甜宠",
+    "虐恋",
+    "暗恋",
+    "先虐后甜",
+    "沙雕",
+    "爽文",
+    "复仇",
+    "反转",
+    "逆袭",
+    "励志",
+    "烧脑",
+    "热血",
+    "求生",
+    "多视角反转",
+    "治愈",
+    "反套路",
+    "无CP",
+    "虐文",
+    "极限拉扯",
+    "双向暗恋",
+    "禁欲系",
+    "自切黑",
+    "事业脑",
+    "冷幽默",
+    "宿命感",
+    "清醒感",
+    "日常感",
+    "群像感",
+    "青春疼痛",
+    "大女主",
+    "大男主",
+  ];
+  const BACKGROUNDS = ["古代", "现代", "未来", "架空", "民国", "近现代"];
+  const TARGET_CHAPTERS = [5, 10, 15];
 
-  function toggleAiStyle(tag: string) {
-    setAiCreateStyles((current) =>
-      current.includes(tag)
-        ? current.filter((item) => item !== tag)
-        : [...current, tag]
-    );
+  function toggleLimit(
+    current: string[],
+    tag: string,
+    max: number,
+    setter: (next: string[]) => void
+  ) {
+    if (current.includes(tag)) {
+      setter(current.filter((x) => x !== tag));
+      return;
+    }
+    if (current.length >= max) {
+      setErr(`最多选择 ${max} 项`);
+      return;
+    }
+    setter([...current, tag]);
   }
 
   return (
@@ -265,6 +366,11 @@ export function NovelShelf() {
                           {n.status === 'failed' ? "查看失败详情" : "进入工作台"}
                         </Link>
                       </Button>
+                      {!n.framework_confirmed && (
+                        <Button asChild variant="outline" className="font-bold">
+                          <Link to={`/novels/${n.id}?wizard=1`}>修改框架</Link>
+                        </Button>
+                      )}
                       {n.status === 'failed' && (
                         <Button 
                           variant="secondary" 
@@ -298,23 +404,23 @@ export function NovelShelf() {
       <Dialog open={aiCreateOpen} onOpenChange={setAiCreateOpen}>
         <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
           <DialogHeader>
-            <DialogTitle className="text-xl font-bold text-foreground">一键 AI 全自动建书</DialogTitle>
+            <DialogTitle className="text-xl font-bold text-foreground">一键 AI 建书</DialogTitle>
             <DialogDescription className="text-foreground/80 dark:text-muted-foreground leading-relaxed">
-              选择你想要的小说题材和篇幅，AI 将自动构思书名、简介、背景、设定、大纲框架，并可以立即开始自动创作。
+              先尽量明确题材、情节、情绪与背景偏好，AI 会先生成一版大纲草案（待确认）。你可以在工作台里用“修改向导”继续迭代并确认后再续写。
             </DialogDescription>
           </DialogHeader>
 
           <div className="space-y-6 py-4">
             <div className="space-y-3">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">小说题材 / 风格（可多选）</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">题材（0/1）</Label>
               <div className="flex flex-wrap gap-2">
-                {presets.map((p) => (
+                {SUBJECTS.map((p) => (
                   <button
                     key={p}
                     type="button"
-                    onClick={() => toggleAiStyle(p)}
+                    onClick={() => setAiCreateSubject((v) => (v === p ? "" : p))}
                     className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
-                      aiCreateStyles.includes(p)
+                      aiCreateSubject === p
                         ? "border-primary bg-primary/10 text-primary"
                         : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
                     }`}
@@ -324,8 +430,115 @@ export function NovelShelf() {
                 ))}
               </div>
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
-                已选择：{aiCreateStyles.length ? aiCreateStyles.join("、") : "未选择"}
+                已选择：{aiCreateSubject || "未选择"}
               </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">情节（0/3）</Label>
+              <div className="flex flex-wrap gap-2">
+                {PLOTS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => toggleLimit(aiCreatePlots, p, 3, setAiCreatePlots)}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
+                      aiCreatePlots.includes(p)
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                已选择：{aiCreatePlots.length ? aiCreatePlots.join("、") : "未选择"}
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">情绪（0/3）</Label>
+              <div className="flex flex-wrap gap-2">
+                {MOODS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => toggleLimit(aiCreateMoods, p, 3, setAiCreateMoods)}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
+                      aiCreateMoods.includes(p)
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                已选择：{aiCreateMoods.length ? aiCreateMoods.join("、") : "未选择"}
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">背景（0/1）</Label>
+              <div className="flex flex-wrap gap-2">
+                {BACKGROUNDS.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    onClick={() => setAiCreateBackground((v) => (v === p ? "" : p))}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
+                      aiCreateBackground === p
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
+                    }`}
+                  >
+                    {p}
+                  </button>
+                ))}
+              </div>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                已选择：{aiCreateBackground || "未选择"}
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">章节数（1/1）</Label>
+              <div className="flex flex-wrap gap-2">
+                {TARGET_CHAPTERS.map((n) => (
+                  <button
+                    key={n}
+                    type="button"
+                    onClick={() => setAiCreateTargetChapters(n)}
+                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
+                      aiCreateTargetChapters === n
+                        ? "border-primary bg-primary/10 text-primary"
+                        : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
+                    }`}
+                  >
+                    {n} 章
+                  </button>
+                ))}
+              </div>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label className="text-xs font-semibold text-foreground/70">自定义章节数</Label>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={5000}
+                    value={aiCreateTargetChapters}
+                    onChange={(e) => setAiCreateTargetChapters(Number(e.target.value))}
+                    className="text-foreground"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium pt-7">
+                    章节数会影响大纲拆分与后续续写上限。
+                  </p>
+                </div>
+              </div>
             </div>
 
             <div className="space-y-2">
@@ -338,33 +551,7 @@ export function NovelShelf() {
               />
             </div>
 
-            <div className="space-y-3">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">预期篇幅</Label>
-              <select
-                value={aiCreateLength}
-                onChange={(e) => setAiCreateLength(e.target.value)}
-                className="flex h-10 w-full items-center justify-between rounded-md border border-input bg-background px-3 py-2 text-sm text-foreground ring-offset-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                <option value="short">短篇小说（约 15-50 章）</option>
-                <option value="medium">中篇小说（20-50万字，约100-250章）</option>
-                <option value="long">长篇小说（约100-150万字）</option>
-              </select>
-            </div>
-
             <div className="grid gap-4 sm:grid-cols-2">
-              <div className="space-y-2">
-                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">建书后立刻生成章数</Label>
-                <Input
-                  type="number"
-                  min={0}
-                  max={50}
-                  value={aiCreateInitChapters}
-                  onChange={(e) => setAiCreateInitChapters(Number(e.target.value))}
-                  className="text-foreground"
-                />
-                <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">设定为0则只生成大纲不写正文</p>
-              </div>
-
               <div className="space-y-2">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日定时自动写多少章</Label>
                 <Input
@@ -399,8 +586,8 @@ export function NovelShelf() {
             <Button variant="outline" onClick={() => setAiCreateOpen(false)} disabled={aiCreateBusy}>
               取消
             </Button>
-            <Button onClick={handleAiCreate} disabled={aiCreateBusy || aiCreateStyles.length === 0}>
-              {aiCreateBusy ? "正在后台执行..." : "确认开启全自动建书"}
+            <Button onClick={handleAiCreate} disabled={aiCreateBusy || !aiCreateSubject}>
+              {aiCreateBusy ? "正在后台执行..." : "确认生成大纲"}
             </Button>
           </DialogFooter>
         </DialogContent>

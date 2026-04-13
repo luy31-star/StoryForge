@@ -335,9 +335,14 @@ export async function createNovel(body: {
 }
 
 export async function aiCreateAndStartNovel(body: {
-  styles: string[];
+  styles?: string[];
+  subjects?: string[];
+  plots?: string[];
+  moods?: string[];
+  backgrounds?: string[];
+  target_chapters?: number;
   notes?: string;
-  length_type: string;
+  length_type?: string;
   target_generate_chapters?: number;
   daily_auto_chapters?: number;
   daily_auto_time?: string;
@@ -348,6 +353,27 @@ export async function aiCreateAndStartNovel(body: {
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{ id: string; status: string; message: string }>;
+}
+
+export async function regenerateFramework(novelId: string, instruction: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/framework/regenerate`, {
+    method: "POST",
+    body: JSON.stringify({ instruction }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; batch_id?: string; task_id?: string | null }>;
+}
+
+export async function updateFrameworkCharacters(
+  novelId: string,
+  characters: Record<string, unknown>[]
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/framework/update-characters`, {
+    method: "POST",
+    body: JSON.stringify({ characters }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; batch_id?: string; task_id?: string | null }>;
 }
 
 export async function getNovel(id: string) {
@@ -541,6 +567,7 @@ export async function listGenerationLogs(
     refresh_started_at: string | null;
     refresh_elapsed_seconds: number | null;
     latest_refresh_success_version: number | null;
+    latest_memory_version?: number;
     refresh_outcome?: "idle" | "ok" | "warning" | "blocked" | "failed";
     memory_refresh_preview?: Record<string, unknown> | null;
     latest_chapter_gen_batch_id?: string | null;
@@ -670,6 +697,42 @@ export async function waitForChapterReviseBatch(
     await sleep(intervalMs);
   }
   throw new Error("等待改稿超时，请稍后在生成日志中查看");
+}
+
+export async function waitForFrameworkRegenerateBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 160 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("framework_regen_done")) return "done";
+    if (ev.has("framework_regen_failed") || ev.has("framework_regen_enqueue_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待重生成大纲超时，请稍后在生成日志中查看");
+}
+
+export async function waitForFrameworkCharactersBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 160 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("framework_characters_done")) return "done";
+    if (ev.has("framework_characters_failed") || ev.has("framework_characters_enqueue_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待更新人物设定超时，请稍后在生成日志中查看");
 }
 
 export async function patchChapter(

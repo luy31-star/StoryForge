@@ -96,10 +96,15 @@ def _sse(event: str, data: dict[str, Any]) -> str:
 
 
 class AiCreateAndStartBody(BaseModel):
-    styles: list[str] = Field(default_factory=list, min_length=1, max_length=20)
+    styles: list[str] = Field(default_factory=list, max_length=40)
+    subjects: list[str] = Field(default_factory=list, max_length=20)
+    plots: list[str] = Field(default_factory=list, max_length=20)
+    moods: list[str] = Field(default_factory=list, max_length=20)
+    backgrounds: list[str] = Field(default_factory=list, max_length=20)
+    target_chapters: int | None = Field(default=None, ge=1, le=5000)
     notes: str = ""
-    length_type: str
-    target_generate_chapters: int = Field(default=10, ge=0, le=50)
+    length_type: str = "long"
+    target_generate_chapters: int = Field(default=0, ge=0, le=50)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
 
@@ -128,6 +133,14 @@ class NovelPatch(BaseModel):
 class ConfirmFrameworkBody(BaseModel):
     framework_markdown: str
     framework_json: str = "{}"
+
+
+class RegenerateFrameworkBody(BaseModel):
+    instruction: str = Field(..., min_length=1)
+
+
+class UpdateFrameworkCharactersBody(BaseModel):
+    characters: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
 class FrameworkUpdateBody(BaseModel):
@@ -456,17 +469,41 @@ def ai_create_and_start(
     if active_count >= 5:
         raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 人），请稍后再试")
 
-    styles = [str(x).strip() for x in body.styles if str(x).strip()]
-    if not styles:
-        raise HTTPException(400, "请至少选择一个小说题材或风格")
+    if len(body.subjects) > 1:
+        raise HTTPException(400, "题材最多选择 1 项")
+    if len(body.backgrounds) > 1:
+        raise HTTPException(400, "背景最多选择 1 项")
+    if len(body.plots) > 3:
+        raise HTTPException(400, "情节最多选择 3 项")
+    if len(body.moods) > 3:
+        raise HTTPException(400, "情绪最多选择 3 项")
 
-    styles_text = "、".join(styles[:6])
+    raw_tags = (
+        [*body.styles, *body.subjects, *body.plots, *body.moods, *body.backgrounds]
+        if body
+        else []
+    )
+    tags: list[str] = []
+    seen: set[str] = set()
+    for x in raw_tags:
+        s = str(x).strip()
+        if not s:
+            continue
+        if s in seen:
+            continue
+        seen.add(s)
+        tags.append(s)
+    if not tags:
+        raise HTTPException(400, "请至少选择一个题材/标签")
+
+    styles_text = "、".join(tags[:8])
+    seed_title = (body.subjects[0] if body.subjects else tags[0]).strip()
     n = Novel(
-        title=f"[AI构思中] {styles[0]}",
+        title=f"[AI构思中] {seed_title}",
         intro="",
         background="",
         style="",
-        target_chapters=300,
+        target_chapters=int(body.target_chapters or 300),
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
         user_id=user.id,
@@ -483,11 +520,16 @@ def ai_create_and_start(
         novel_id=n.id,
         batch_id=batch_id,
         event="ai_create_queued",
-        message=f"已入队全自动建书任务，题材/风格：{styles_text}，篇幅：{body.length_type}",
+        message=f"已入队 AI 建书任务（生成大纲草案），标签：{styles_text}",
         meta={
-            "styles": styles,
+            "tags": tags,
+            "subjects": body.subjects,
+            "plots": body.plots,
+            "moods": body.moods,
+            "backgrounds": body.backgrounds,
             "notes": body.notes,
             "length_type": body.length_type,
+            "target_chapters": body.target_chapters,
             "target_generate_chapters": body.target_generate_chapters,
         },
     )
@@ -499,10 +541,11 @@ def ai_create_and_start(
             n.id, 
             str(user.id), 
             batch_id, 
-            styles,
+            tags,
             body.notes,
             body.length_type, 
-            body.target_generate_chapters
+            body.target_generate_chapters,
+            body.target_chapters,
         )
         task_id = getattr(task, "id", None)
     except Exception as e:
@@ -529,7 +572,12 @@ def ai_create_and_start(
             celery_task_id=str(task_id) if task_id else None,
             novel_id=n.id,
             meta={
-                "styles": styles,
+                "tags": tags,
+                "subjects": body.subjects,
+                "plots": body.plots,
+                "moods": body.moods,
+                "backgrounds": body.backgrounds,
+                "target_chapters": body.target_chapters,
                 "length_type": body.length_type,
                 "target_generate_chapters": body.target_generate_chapters,
             },
@@ -703,6 +751,122 @@ async def generate_framework(
     n.framework_confirmed = False
     db.commit()
     return {"status": "ok"}
+
+
+@router.post("/{novel_id}/framework/regenerate")
+def regenerate_framework(
+    novel_id: str,
+    body: RegenerateFrameworkBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = require_novel_access(db, novel_id, user)
+    instruction = (body.instruction or "").strip()
+    if not instruction:
+        raise HTTPException(400, "instruction 不能为空")
+    if n.status == "failed":
+        n.status = "draft"
+    batch_id = f"fw-regen-{int(time.time())}-{novel_id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="framework_regen_queued",
+        message="已入队：按指令重生成大纲",
+        meta={"instruction": instruction[:500]},
+    )
+    db.commit()
+    try:
+        from app.tasks.novel_tasks import novel_framework_regen_task
+
+        task = novel_framework_regen_task.delay(novel_id, str(user.id), batch_id, instruction)
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("framework regenerate enqueue failed | novel_id=%s", novel_id)
+        _append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_regen_enqueue_failed",
+            level="error",
+            message=f"后台任务入队失败：{e}",
+        )
+        db.commit()
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="framework_regen",
+            title="重生成大纲",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            meta={"instruction": instruction[:500]},
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
+    return {"status": "queued", "batch_id": batch_id, "task_id": task_id}
+
+
+@router.post("/{novel_id}/framework/update-characters")
+def update_framework_characters(
+    novel_id: str,
+    body: UpdateFrameworkCharactersBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = require_novel_access(db, novel_id, user)
+    chars = body.characters or []
+    if not isinstance(chars, list) or not chars:
+        raise HTTPException(400, "characters 不能为空")
+    if n.status == "failed":
+        n.status = "draft"
+    batch_id = f"fw-chars-{int(time.time())}-{novel_id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="framework_characters_queued",
+        message="已入队：按确认的人物设定更新大纲",
+        meta={"characters_count": len(chars)},
+    )
+    db.commit()
+    try:
+        from app.tasks.novel_tasks import novel_framework_update_characters_task
+
+        task = novel_framework_update_characters_task.delay(
+            novel_id, str(user.id), batch_id, chars
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("framework update characters enqueue failed | novel_id=%s", novel_id)
+        _append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_characters_enqueue_failed",
+            level="error",
+            message=f"后台任务入队失败：{e}",
+        )
+        db.commit()
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    try:
+        create_user_task(
+            db,
+            user_id=user.id,
+            kind="framework_characters",
+            title="更新人物设定",
+            status="queued",
+            batch_id=batch_id,
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            meta={"characters_count": len(chars)},
+        )
+    except Exception:
+        logger.exception("create user task failed | batch_id=%s", batch_id)
+    return {"status": "queued", "batch_id": batch_id, "task_id": task_id}
 
 
 @router.post("/{novel_id}/confirm-framework")
@@ -1306,6 +1470,12 @@ def list_generation_logs(
         if bid.startswith("gen-"):
             latest_chapter_gen_batch_id = bid
             break
+
+    latest_memory_version = (
+        db.query(func.max(NovelMemory.version)).filter(NovelMemory.novel_id == novel_id).scalar()
+        or 0
+    )
+
     if latest_chapter_gen_batch_id:
         cg = (
             db.query(NovelGenerationLog)
@@ -1419,6 +1589,7 @@ def list_generation_logs(
         "refresh_started_at": refresh_started_at,
         "refresh_elapsed_seconds": refresh_elapsed_seconds,
         "latest_refresh_success_version": latest_refresh_success_version,
+        "latest_memory_version": latest_memory_version,
         "latest_chapter_gen_batch_id": latest_chapter_gen_batch_id,
         "chapter_generation_status": chapter_generation_status,
         "refresh_outcome": refresh_outcome,

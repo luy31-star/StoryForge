@@ -243,15 +243,15 @@ def run_ai_create_and_start_sync(
     notes: str,
     length_type: str,
     target_generate_chapters: int,
+    target_chapters: int | None,
     billing_user_id: str | None,
     batch_id: str,
 ) -> dict[str, Any]:
     """
-    一键AI建书及全流程：
-    1. 调用大模型生成书名、简介、背景、目标字数等。
+    一键AI建书（仅生成设定与大纲草案）：
+    1. 调用大模型生成书名、简介、背景、目标章节数等。
     2. 更新小说信息。
-    3. 调用大模型生成框架，并自动确认。
-    4. 触发全自动 Pipeline（补卷 -> 补章计划 -> 正文）。
+    3. 调用大模型生成框架草案（不自动确认、不写正文）。
     """
     n = db.get(Novel, novel_id)
     if not n:
@@ -300,12 +300,17 @@ def run_ai_create_and_start_sync(
 
     length_hint = "中篇约20-50万字（约100-250章）"
     length_min, length_max = 100, 250
-    if length_type == "long":
-        length_hint = "长篇约100-150万字（约300-800章）"
-        length_min, length_max = 300, 800
-    elif length_type == "short":
-        length_hint = "短篇约15-50章（通常 10 万字以内）"
-        length_min, length_max = 15, 50
+    if isinstance(target_chapters, int) and target_chapters > 0:
+        length_min = max(1, min(5000, int(target_chapters)))
+        length_max = length_min
+        length_hint = f"全书约 {length_min} 章"
+    else:
+        if length_type == "long":
+            length_hint = "长篇约100-150万字（约300-800章）"
+            length_min, length_max = 300, 800
+        elif length_type == "short":
+            length_hint = "短篇约15-50章（通常 10 万字以内）"
+            length_min, length_max = 15, 50
 
     prompt = (
         "你是一个顶级的网络小说架构师与畅销书策划编辑，擅长构思极具吸引力的书名和宏大且逻辑严密的设定。\n"
@@ -430,7 +435,7 @@ def run_ai_create_and_start_sync(
         n.style = data.get("style", "")
         raw_target = int(data.get("target_chapters", length_min))
         n.target_chapters = max(length_min, min(length_max, raw_target))
-        n.status = "active"
+        n.status = "draft"
         db.commit()
         
         append_generation_log(
@@ -471,13 +476,9 @@ def run_ai_create_and_start_sync(
     try:
         framework_markdown, framework_json = _generate_framework_sync(llm, n, db)
         db.refresh(n)
-        _confirm_framework_with_memory(
-            db,
-            n,
-            framework_markdown=framework_markdown,
-            framework_json=framework_json,
-            summary="AI 建书自动确认框架初始化",
-        )
+        n.framework_markdown = framework_markdown
+        n.framework_json = framework_json
+        n.framework_confirmed = False
         db.commit()
         
         append_generation_log(
@@ -485,38 +486,14 @@ def run_ai_create_and_start_sync(
             novel_id=novel_id,
             batch_id=batch_id,
             event="ai_create_framework_done",
-            message="框架生成完毕并已自动确认。",
+            message="框架生成完毕（待确认）。",
         )
         db.commit()
     except Exception as e:
         logger.exception("ai_create framework failed | novel_id=%s", novel_id)
         raise ValueError(f"AI 生成大纲失败: {str(e)}")
 
-    # 如果需要初始生成正文，调用全自动管线
-    if target_generate_chapters > 0:
-        if is_cancel_requested(batch_id):
-            append_generation_log(
-                db,
-                novel_id=novel_id,
-                batch_id=batch_id,
-                event="ai_create_cancelled",
-                level="warning",
-                message="任务已取消",
-            )
-            db.commit()
-            return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
-        return run_full_auto_generation_sync(
-            db=db,
-            novel_id=novel_id,
-            target_count=target_generate_chapters,
-            billing_user_id=billing_user_id,
-            batch_id=batch_id,
-            use_cold_recall=False,
-            cold_recall_items=5,
-            auto_consistency_check=False,
-        )
-    
-    return {"status": "ok", "message": "建书完成", "chapters_generated": 0}
+    return {"status": "ok", "message": "大纲已生成（待确认）", "chapters_generated": 0}
 
 
 def _ensure_volumes_cover(db: Session, novel: Novel, end_no: int) -> None:

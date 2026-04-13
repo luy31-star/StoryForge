@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import time
@@ -1190,6 +1191,7 @@ def novel_ai_create_and_start_task(
     notes: str,
     length_type: str,
     target_generate_chapters: int,
+    target_chapters: int | None = None,
 ) -> dict[str, Any]:
     db = SessionLocal()
     r = _redis_for_novel_queue()
@@ -1239,6 +1241,7 @@ def novel_ai_create_and_start_task(
             notes=notes,
             length_type=length_type,
             target_generate_chapters=target_generate_chapters,
+            target_chapters=target_chapters,
             billing_user_id=user_id,
             batch_id=batch_id,
         )
@@ -1293,6 +1296,260 @@ def novel_ai_create_and_start_task(
             except Exception:
                 logger.exception(
                     "ai_create lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
+        db.close()
+
+
+def _regenerate_framework_sync(
+    llm: NovelLLMService, novel: Novel, instruction: str, db
+) -> tuple[str, str]:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            llm.regenerate_framework(novel, instruction, db=db)
+        )
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _update_framework_characters_sync(
+    llm: NovelLLMService, novel: Novel, characters: list[dict[str, Any]], db
+) -> tuple[str, str]:
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            llm.update_framework_characters(novel, characters, db=db)
+        )
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+@celery_app.task(name="novel.framework_regen_task")
+def novel_framework_regen_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+    instruction: str,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
+    try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_framework_regen_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="framework_regen_failed",
+                    level="error",
+                    message="重生成大纲跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked"},
+                )
+                db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
+                return {"status": "skipped", "reason": "locked"}
+
+        _task_set_started(db, batch_id=batch_id, message="重生成大纲任务已开始")
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_regen_started",
+            message="正在按指令重生成大纲...",
+        )
+        db.commit()
+
+        n = db.get(Novel, novel_id)
+        if not n:
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
+            return {"status": "not_found", "novel_id": novel_id}
+        llm = NovelLLMService(billing_user_id=user_id)
+        md, fj = _regenerate_framework_sync(llm, n, instruction, db)
+        n.framework_markdown = md
+        n.framework_json = fj
+        n.framework_confirmed = False
+        db.commit()
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_regen_done",
+            message="大纲已重生成（待确认）",
+        )
+        db.commit()
+        _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return {"status": "ok", "batch_id": batch_id}
+    except Exception as e:
+        logger.exception("novel_framework_regen_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
+        try:
+            db.rollback()
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="framework_regen_failed",
+                level="error",
+                message=f"重生成大纲失败：{e}",
+                meta={"error": str(e)},
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message=f"失败：{e}")
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "framework_regen lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
+        db.close()
+
+
+@celery_app.task(name="novel.framework_update_characters_task")
+def novel_framework_update_characters_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+    characters: list[dict[str, Any]],
+) -> dict[str, Any]:
+    db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
+    try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_framework_update_characters_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="framework_characters_failed",
+                    level="error",
+                    message="更新人物设定跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked"},
+                )
+                db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
+                return {"status": "skipped", "reason": "locked"}
+
+        _task_set_started(db, batch_id=batch_id, message="更新人物设定任务已开始")
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_characters_started",
+            message="正在按人物设定更新大纲...",
+            meta={"characters_count": len(characters or [])},
+        )
+        db.commit()
+
+        n = db.get(Novel, novel_id)
+        if not n:
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
+            return {"status": "not_found", "novel_id": novel_id}
+        llm = NovelLLMService(billing_user_id=user_id)
+        md, fj = _update_framework_characters_sync(llm, n, characters or [], db)
+        n.framework_markdown = md
+        n.framework_json = fj
+        n.framework_confirmed = False
+        db.commit()
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_characters_done",
+            message="人物设定已更新到大纲（待确认）",
+            meta={"characters_count": len(characters or [])},
+        )
+        db.commit()
+        _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return {"status": "ok", "batch_id": batch_id}
+    except Exception as e:
+        logger.exception(
+            "novel_framework_update_characters_task failed | novel_id=%s batch_id=%s",
+            novel_id,
+            batch_id,
+        )
+        try:
+            db.rollback()
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="framework_characters_failed",
+                level="error",
+                message=f"更新人物设定失败：{e}",
+                meta={"error": str(e)},
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message=f"失败：{e}")
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "framework_characters lock release failed | novel_id=%s batch_id=%s",
                     novel_id,
                     batch_id,
                 )

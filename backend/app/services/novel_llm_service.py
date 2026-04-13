@@ -866,9 +866,13 @@ class NovelLLMService:
             novel.reference_public_url,
         )
         sys = (
-            "你是资深网文策划与世界观编辑。输出两部分：1) 完整可读 Markdown 设定与大纲；"
+            "你是资深网文策划与世界观编辑。请输出两部分：1) 完整可读 Markdown 设定与大纲；"
             "2) 末尾单独一个 JSON 代码块，包含 "
-            "world_rules, main_plot, arcs, characters[{name,role,traits}], themes 等键。"
+            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
+            "【框架细化要求】\n"
+            "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
+            "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10~20 章为一个子阶段/关键事件（sub_arcs 或 key_events），并提供丰富的细节支撑，不能只有一个宽泛的概括。\n"
             "参考文本仅借鉴结构与文风，禁止抄袭原句。"
         )
         target_chapters = int(getattr(novel, "target_chapters", 0) or 0)
@@ -889,6 +893,103 @@ class NovelLLMService:
                 {"role": "user", "content": user},
             ],
             temperature=0.6,
+            web_search=self._novel_web_search(db, flow="default"),
+            timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+        json_part = "{}"
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            try:
+                json.loads(m.group(1).strip())
+                json_part = m.group(1).strip()
+            except json.JSONDecodeError:
+                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
+        return text, json_part
+
+    async def regenerate_framework(
+        self, novel: Novel, instruction: str, db: Any = None
+    ) -> tuple[str, str]:
+        router = self._router(db=db)
+        ref = load_reference_text_for_llm(
+            novel.reference_storage_key,
+            novel.id,
+            novel.reference_public_url,
+        )
+        sys = (
+            "你是资深网文策划与世界观编辑。你将基于现有框架草案，并严格执行用户的自然语言修改指令，"
+            "输出一版新的完整框架。\n"
+            "请输出两部分：1) 完整可读 Markdown 设定与大纲；2) 末尾单独一个 JSON 代码块，包含 "
+            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
+            "【框架细化要求】\n"
+            "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
+            "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10~20 章为一个子阶段/关键事件（sub_arcs 或 key_events），并提供丰富的细节支撑。\n"
+            "参考文本仅借鉴结构与文风，禁止抄袭原句。"
+        )
+        fj_block = truncate_framework_json(novel.framework_json or "", 9000)
+        md_block = (novel.framework_markdown or "")[:9000]
+        user = (
+            f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
+            f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
+            f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
+            f"【用户修改指令】\n{(instruction or '').strip()}\n\n"
+            f"参考文本节选：\n{ref or '（无）'}"
+        )
+        text = await router.chat_text(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.55,
+            web_search=self._novel_web_search(db, flow="default"),
+            timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+        json_part = "{}"
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+        if m:
+            try:
+                json.loads(m.group(1).strip())
+                json_part = m.group(1).strip()
+            except json.JSONDecodeError:
+                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
+        return text, json_part
+
+    async def update_framework_characters(
+        self, novel: Novel, characters: list[dict[str, Any]], db: Any = None
+    ) -> tuple[str, str]:
+        router = self._router(db=db)
+        sys = (
+            "你是资深网文策划与世界观编辑。你将基于现有框架草案，对人物设定做定向修订，"
+            "并将修订同步反映到剧情大纲、人物关系与冲突设计中。\n"
+            "请输出两部分：1) 完整可读 Markdown 设定与大纲；2) 末尾单独一个 JSON 代码块，包含 "
+            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
+            "【框架细化要求】\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须拆解为每 10~20 章为一个子阶段/关键事件，避免宽泛。\n"
+            "要求：人物列表以用户提供为准；需要时可以补充少量关键配角，但不得删除用户给出的主角。"
+        )
+        fj_block = truncate_framework_json(novel.framework_json or "", 9000)
+        md_block = (novel.framework_markdown or "")[:9000]
+        chars_text = json.dumps(characters or [], ensure_ascii=False)
+        user = (
+            f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
+            f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
+            f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
+            f"【用户确认后的人物列表（JSON）】\n{chars_text}\n\n"
+            "请将人物变更融入框架：\n"
+            "- 若人物改名，需全局替换并保持一致\n"
+            "- traits 要落到动机/行为模式/关系张力上\n"
+            "- arcs 的关键节点应能体现主角成长与冲突升级"
+        )
+        text = await router.chat_text(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.55,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
             **self._bill_kw(db, self._billing_user_id),
@@ -2034,6 +2135,7 @@ class NovelLLMService:
             chapter_no = int(blob["chapter_no"])
             if chapter_no in existing_nos:
                 continue
+            existing_nos.add(chapter_no)
             missing_nos.append(chapter_no)
             missing_entries.append(
                 cls._build_fallback_canonical_entry(

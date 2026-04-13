@@ -1,7 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { X } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
+import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -225,6 +226,7 @@ type LlmConfirmState = {
 
 export function NovelWorkspace() {
   const { id = "" } = useParams();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [novel, setNovel] = useState<Record<string, unknown> | null>(null);
   const [chapters, setChapters] = useState<Awaited<ReturnType<typeof listChapters>>>([]);
   const [memory, setMemory] = useState<Awaited<ReturnType<typeof getMemory>> | null>(null);
@@ -234,6 +236,7 @@ export function NovelWorkspace() {
   const [memoryNormRebuildBusy, setMemoryNormRebuildBusy] = useState(false);
   const [fwMd, setFwMd] = useState("");
   const [fwJson, setFwJson] = useState("{}");
+  const [frameworkWizardOpen, setFrameworkWizardOpen] = useState(false);
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
@@ -283,6 +286,7 @@ export function NovelWorkspace() {
   const [refreshStartedAt, setRefreshStartedAt] = useState<string | null>(null);
   const [refreshElapsedSeconds, setRefreshElapsedSeconds] = useState<number | null>(null);
   const [latestRefreshVersion, setLatestRefreshVersion] = useState<number | null>(null);
+  const [latestMemoryVersion, setLatestMemoryVersion] = useState<number | null>(null);
   const [genLogs, setGenLogs] = useState<
     Awaited<ReturnType<typeof listGenerationLogs>>["items"]
   >([]);
@@ -473,6 +477,15 @@ export function NovelWorkspace() {
     if (!id) return;
     reload().catch((e: Error) => setErr(e.message));
   }, [id, reload]);
+
+  useEffect(() => {
+    const w = searchParams.get("wizard");
+    if (w !== "1") return;
+    setFrameworkWizardOpen(true);
+    const next = new URLSearchParams(searchParams);
+    next.delete("wizard");
+    setSearchParams(next, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   useEffect(() => {
     const t = String(novel?.title ?? "");
@@ -993,6 +1006,9 @@ export function NovelWorkspace() {
       setRefreshStartedAt(resp.refresh_started_at || null);
       setRefreshElapsedSeconds(resp.refresh_elapsed_seconds ?? null);
       setLatestRefreshVersion(resp.latest_refresh_success_version ?? null);
+      if (resp.latest_memory_version != null) {
+        setLatestMemoryVersion(resp.latest_memory_version);
+      }
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "加载生成日志失败");
     } finally {
@@ -1192,6 +1208,32 @@ export function NovelWorkspace() {
     }, 3000);
     return () => window.clearInterval(t);
   }, [logDialogOpen, logBatchId, logOnlyError, logViewMode]);
+
+  useEffect(() => {
+    if (
+      latestMemoryVersion != null &&
+      memory?.version != null &&
+      latestMemoryVersion > memory.version
+    ) {
+      void reload();
+    }
+  }, [latestMemoryVersion, memory?.version]);
+
+  // 后台轻量轮询记忆版本，确保不打开日志弹窗也能更新记忆状态
+  useEffect(() => {
+    if (!id) return;
+    const t = window.setInterval(async () => {
+      try {
+        const resp = await listGenerationLogs(id, { limit: 1 });
+        if (resp.latest_memory_version != null) {
+          setLatestMemoryVersion(resp.latest_memory_version);
+        }
+      } catch (e) {
+        // ignore
+      }
+    }, 10000);
+    return () => window.clearInterval(t);
+  }, [id]);
 
   async function runAutoGenerate(targetCount: number) {
     if (!id) return;
@@ -2009,6 +2051,21 @@ export function NovelWorkspace() {
           onConfirm={runConfirmedLlmAction}
         />
 
+        <FrameworkWizardDialog
+          novelId={id}
+          open={frameworkWizardOpen}
+          onOpenChange={setFrameworkWizardOpen}
+          frameworkConfirmed={frameworkConfirmed}
+          frameworkMarkdown={fwMd}
+          frameworkJson={fwJson}
+          onReload={reload}
+          onConfirmFramework={async () => {
+            await confirmFramework(id, fwMd, fwJson);
+            setNotice("框架已确认，可继续生成卷计划与正文。");
+            await reload();
+          }}
+        />
+
         {novel?.status === "failed" && (
           <div className="glass-panel-subtle relative flex flex-col gap-4 border-destructive/30 bg-destructive/5 p-6 text-sm text-destructive">
             <button
@@ -2081,6 +2138,16 @@ export function NovelWorkspace() {
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="font-bold"
+                  disabled={busy}
+                  onClick={() => setFrameworkWizardOpen(true)}
+                >
+                  修改向导
+                </Button>
                 <Button
                   type="button"
                   size="sm"
