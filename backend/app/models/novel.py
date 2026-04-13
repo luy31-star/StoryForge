@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -25,8 +26,8 @@ class Novel(Base):
         String(36), ForeignKey("users.id"), nullable=True, index=True
     )
     title: Mapped[str] = mapped_column(String(512))
-    intro: Mapped[str] = mapped_column(Text, default="")
-    background: Mapped[str] = mapped_column(Text, default="")
+    intro: Mapped[str] = mapped_column(LONGTEXT, default="")
+    background: Mapped[str] = mapped_column(LONGTEXT, default="")
     style: Mapped[str] = mapped_column(String(255), default="")
     writing_style_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("writing_styles.id"), nullable=True
@@ -46,8 +47,8 @@ class Novel(Base):
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")
     reference_public_url: Mapped[str] = mapped_column(String(2048), default="")
     reference_filename: Mapped[str] = mapped_column(String(512), default="")
-    framework_json: Mapped[str] = mapped_column(Text, default="")
-    framework_markdown: Mapped[str] = mapped_column(Text, default="")
+    framework_json: Mapped[str] = mapped_column(LONGTEXT, default="")
+    framework_markdown: Mapped[str] = mapped_column(LONGTEXT, default="")
     framework_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(
         String(32), default="draft"
@@ -76,10 +77,10 @@ class Chapter(Base):
     novel_id: Mapped[str] = mapped_column(String(36), ForeignKey("novels.id"))
     chapter_no: Mapped[int] = mapped_column(Integer)
     title: Mapped[str] = mapped_column(String(512), default="")
-    content: Mapped[str] = mapped_column(Text, default="")
+    content: Mapped[str] = mapped_column(LONGTEXT, default="")
     # 大模型修订稿；仅用户「确认覆盖」后写入 content
-    pending_content: Mapped[str] = mapped_column(Text, default="")
-    pending_revision_prompt: Mapped[str] = mapped_column(Text, default="")
+    pending_content: Mapped[str] = mapped_column(LONGTEXT, default="")
+    pending_revision_prompt: Mapped[str] = mapped_column(LONGTEXT, default="")
     # draft | pending_review | approved
     status: Mapped[str] = mapped_column(String(32), default="draft")
     source: Mapped[str] = mapped_column(
@@ -105,7 +106,7 @@ class ChapterFeedback(Base):
         String(36), primary_key=True, default=lambda: str(uuid.uuid4())
     )
     chapter_id: Mapped[str] = mapped_column(String(36), ForeignKey("novel_chapters.id"))
-    body: Mapped[str] = mapped_column(Text)
+    body: Mapped[str] = mapped_column(LONGTEXT)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     chapter = relationship("Chapter", back_populates="feedbacks")
@@ -121,8 +122,8 @@ class NovelMemory(Base):
     )
     novel_id: Mapped[str] = mapped_column(String(36), ForeignKey("novels.id"))
     version: Mapped[int] = mapped_column(Integer, default=1)
-    payload_json: Mapped[str] = mapped_column(Text, default="{}")
-    summary: Mapped[str] = mapped_column(Text, default="")
+    payload_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
+    summary: Mapped[str] = mapped_column(LONGTEXT, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
 
     novel = relationship("Novel", back_populates="memories")
@@ -141,6 +142,6 @@ class NovelGenerationLog(Base):
     level: Mapped[str] = mapped_column(String(16), default="info")
     event: Mapped[str] = mapped_column(String(64), default="unknown")
     chapter_no: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    message: Mapped[str] = mapped_column(Text, default="")
-    meta_json: Mapped[str] = mapped_column(Text, default="{}")
+    message: Mapped[str] = mapped_column(LONGTEXT, default="")
+    meta_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
