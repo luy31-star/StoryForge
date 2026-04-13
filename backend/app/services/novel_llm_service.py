@@ -2619,6 +2619,25 @@ class NovelLLMService:
             "items_updated": 0,
         }
         
+        # 0. 解析正文摘要中的章节号
+        target_chapter_nos = []
+        if chapters_summary:
+            target_chapter_nos = [int(n) for n in re.findall(r"第(\d+)章", chapters_summary)]
+
+        # 0.1 如果是刷新模式，先清空这些章节的旧事实，确保“先删除再更新”
+        if replace_timeline and target_chapter_nos:
+            db.query(NovelMemoryNormChapter).filter(
+                NovelMemoryNormChapter.novel_id == novel_id,
+                NovelMemoryNormChapter.chapter_no.in_(target_chapter_nos)
+            ).update({
+                "key_facts_json": "[]",
+                "causal_results_json": "[]",
+                "open_plots_added_json": "[]",
+                "open_plots_resolved_json": "[]",
+                "emotional_state": "",
+                "unresolved_hooks_json": "[]"
+            }, synchronize_session='fetch')
+
         latest_delta_chapter_no = 0
         
         # 0. 处理全局删除：ids_to_remove
