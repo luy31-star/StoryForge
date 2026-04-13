@@ -17,6 +17,7 @@ from app.core.database import SessionLocal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.novel import Chapter, Novel, NovelMemory
+from app.models.writing_style import WritingStyle
 from app.models.novel_memory_norm import (
     NovelMemoryNormChapter,
     NovelMemoryNormCharacter,
@@ -108,6 +109,69 @@ def _canonical_entries_from_payload(data: dict[str, Any]) -> list[dict[str, Any]
             if isinstance(item, dict):
                 entries.append(item)
     return entries
+
+
+def _writing_style_block(style: WritingStyle | None) -> str:
+    if not style:
+        return ""
+    
+    parts = ["【文风与写作要求】"]
+    
+    # 词库
+    lex = style.lexicon or {}
+    tags = lex.get("tags", [])
+    if tags:
+        parts.append(f"- 词汇标签：[{']、['.join(tags)}]")
+    lex_rules = lex.get("rules", [])
+    if lex_rules:
+        parts.append("- 词汇要求：" + "；".join(lex_rules))
+        
+    # 结构
+    struc = style.structure or {}
+    if struc.get("sentence_length"):
+        parts.append(f"- 句子长度：平均约 {struc.get('sentence_length')} 字")
+    if struc.get("complexity"):
+        parts.append(f"- 复杂度：{struc['complexity']}")
+    if struc.get("line_break"):
+        parts.append(f"- 换行频率：{struc['line_break']}")
+    if struc.get("punctuation"):
+        parts.append(f"- 标点使用：{struc['punctuation']}")
+    struc_rules = struc.get("rules", [])
+    if struc_rules:
+        parts.append("- 结构要求：" + "；".join(struc_rules))
+        
+    # 语气
+    tone = style.tone or {}
+    primary = tone.get("primary", [])
+    if primary:
+        parts.append(f"- 主要语气：{'、'.join(primary)}")
+    if tone.get("description"):
+        parts.append(f"- 语气分析：{tone['description']}")
+    tone_rules = tone.get("rules", [])
+    if tone_rules:
+        parts.append("- 语气要求：" + "；".join(tone_rules))
+        
+    # 修辞
+    rhet = style.rhetoric or {}
+    types = rhet.get("types", {})
+    if types:
+        rhet_str = "、".join([f"{k}(频率:{v})" for k, v in types.items()])
+        parts.append(f"- 主要修辞：{rhet_str}")
+    rhet_rules = rhet.get("rules", [])
+    if rhet_rules:
+        parts.append("- 修辞要求：" + "；".join(rhet_rules))
+        
+    # 负面
+    if style.negative_prompts:
+        parts.append("- 禁止生成的文本案例：" + "；".join(style.negative_prompts))
+        
+    # 代表段落
+    if style.snippets:
+        parts.append("\n【文风代表段落（参考Few-shot）】")
+        for i, s in enumerate(style.snippets[:3]):
+            parts.append(f"段落{i+1}：\n{s}")
+            
+    return "\n".join(parts)
 
 
 def _build_chapter_context_bundle(
@@ -229,6 +293,7 @@ def _chapter_messages(
     process_suggest = process_chapter_suggestions_block(
         chapter_no, novel.framework_json or "", memory_json
     )
+    style_block = _writing_style_block(getattr(novel, "writing_style", None))
 
     # 新增：卷进度锚点和卷事件摘要
     volume_progress = ""
@@ -259,6 +324,8 @@ def _chapter_messages(
         f"【世界观与框架摘要（Markdown）】\n{bible}",
         f"【框架 JSON（大纲/规则锚点，截断）】\n{fj_block}",
     ]
+    if style_block:
+        user_parts.append(style_block)
     user_parts.extend(memory_blocks)
 
     # 新增：卷级上下文（在摘录之前，提供整体视图）
@@ -315,21 +382,24 @@ def _revise_chapter_messages(
     bible = novel.framework_markdown[:8000] if novel.framework_markdown else novel.background
     fj_block = truncate_framework_json(novel.framework_json or "", 6000)
     fb = "\n".join(f"- {b}" for b in feedback_bodies) or "（无）"
+    style_block = _writing_style_block(getattr(novel, "writing_style", None))
     sys = (
         "你是资深小说编辑。在保持世界观与人物一致的前提下，根据历史反馈意见与用户最新指令，"
         "对章节全文进行改写。框架 JSON 中的 world_rules 与已定设定不得被改稿推翻；只输出改写后的正文，"
         "不要前言、标题解释或 Markdown 围栏。"
         "改写后的正文必须符合中文阅读习惯：自然分段、标点完整、避免整页只有极少数超长段落。"
     )
-    user = (
-        f"【框架摘要（Markdown）】\n{bible}\n\n"
-        f"【框架 JSON（锚点）】\n{fj_block}\n\n"
-        f"【结构化记忆 JSON】\n{memory_json}\n\n"
-        f"第 {chapter.chapter_no} 章《{chapter.title}》\n\n"
-        f"【当前正文（正式稿）】\n{chapter.content}\n\n"
-        f"【历史改进意见】\n{fb}\n\n"
-        f"【用户本次指令】\n{user_prompt}"
-    )
+    user_parts = [
+        f"【框架摘要（Markdown）】\n{bible}",
+        f"【框架 JSON（锚点）】\n{fj_block}",
+        f"【结构化记忆 JSON】\n{memory_json}",
+    ]
+    if style_block:
+        user_parts.append(style_block)
+    user_parts.append(f"第 {chapter.chapter_no} 章《{chapter.title}》\n\n【当前正文（正式稿）】\n{chapter.content}")
+    user_parts.append(f"【历史改进意见】\n{fb}")
+    user_parts.append(f"【用户本次指令】\n{user_prompt}")
+    user = "\n\n".join(user_parts)
     return [
         {"role": "system", "content": sys},
         {"role": "user", "content": user},
@@ -876,15 +946,25 @@ class NovelLLMService:
             "【框架细化要求】\n"
             "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
             "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10~20 章为一个子阶段/关键事件（sub_arcs 或 key_events），并提供丰富的细节支撑，不能只有一个宽泛的概括。\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件（sub_arcs 或 key_events），每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置，禁止宽泛的概括。\n"
             "参考文本仅借鉴结构与文风，禁止抄袭原句。"
         )
         target_chapters = int(getattr(novel, "target_chapters", 0) or 0)
         volume_size = 50
         volume_n = (target_chapters + volume_size - 1) // volume_size if target_chapters > 0 else 0
+
+        # 获取详细文风
+        ws_block = ""
+        if novel.writing_style_id and db:
+            from app.models.writing_style import WritingStyle
+            ws = db.get(WritingStyle, novel.writing_style_id)
+            if ws:
+                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
+
         user = (
             f"书名：{novel.title}\n简介：{novel.intro}\n"
-            f"背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"背景设定：{novel.background}\n文风关键词：{novel.style}\n"
+            f"{ws_block}"
             f"目标章节数：{target_chapters}\n"
             f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n"
             '要求：剧情框架必须按卷拆分 arcs，每个 arc 需明确章节范围（from_chapter/to_chapter 或 chapters: "x-y"），'
@@ -928,13 +1008,23 @@ class NovelLLMService:
             "【框架细化要求】\n"
             "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
             "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10~20 章为一个子阶段/关键事件（sub_arcs 或 key_events），并提供丰富的细节支撑。\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件（sub_arcs 或 key_events），每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置。\n"
             "参考文本仅借鉴结构与文风，禁止抄袭原句。"
         )
         fj_block = truncate_framework_json(novel.framework_json or "", 9000)
         md_block = (novel.framework_markdown or "")[:9000]
+
+        # 获取详细文风
+        ws_block = ""
+        if novel.writing_style_id and db:
+            from app.models.writing_style import WritingStyle
+            ws = db.get(WritingStyle, novel.writing_style_id)
+            if ws:
+                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
+
         user = (
-            f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风关键词：{novel.style}\n"
+            f"{ws_block}"
             f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
             f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
             f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
@@ -971,7 +1061,7 @@ class NovelLLMService:
             "请输出两部分：1) 完整可读 Markdown 设定与大纲；2) 末尾单独一个 JSON 代码块，包含 "
             "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
             "【框架细化要求】\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须拆解为每 10~20 章为一个子阶段/关键事件，避免宽泛。\n"
+            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件，每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置。\n"
             "要求：人物列表以用户提供为准；需要时可以补充少量关键配角，但不得删除用户给出的主角。"
         )
         fj_block = truncate_framework_json(novel.framework_json or "", 9000)

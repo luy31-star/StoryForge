@@ -18,6 +18,7 @@ from app.core.db_migrate import (
     ensure_user_email_column,
     ensure_user_isolation_columns,
     ensure_user_status_columns,
+    ensure_writing_style_id_column,
     relax_novel_memory_norm_columns,
 )
 from app.core.database import SessionLocal
@@ -32,10 +33,11 @@ import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
 import app.models.project  # noqa: F401 — projects.user_id
 import app.models.workflow  # noqa: F401 — workflows.user_id
 import app.models.task  # noqa: F401 — user_tasks
+import app.models.writing_style  # noqa: F401 — writing_styles
 from app.middleware.request_log import RequestLoggingMiddleware
 from app.core.rate_limit import setup_rate_limiting
 from slowapi.middleware import SlowAPIMiddleware
-from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard, tasks
+from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard, tasks, writing_style
 
 logger = logging.getLogger(__name__)
 logging.getLogger("vocalflow.request").setLevel(logging.INFO)
@@ -72,6 +74,7 @@ app.include_router(media.router)
 app.include_router(novel.router)
 app.include_router(volume.router)
 app.include_router(tasks.router)
+app.include_router(writing_style.router)
 app.include_router(websocket.router)
 
 
@@ -106,6 +109,7 @@ def on_startup() -> None:
     ensure_user_email_column(engine)
     ensure_user_status_columns(engine)
     ensure_novel_target_chapters(engine)
+    ensure_writing_style_id_column(engine)
     ensure_novel_memory_norm_extended_columns(engine)
     relax_novel_memory_norm_columns(engine)
     ensure_model_price_split_columns(engine)

@@ -1,8 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { XCircle, ArrowUpRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { cancelTask, listMyTasks, type UserTaskRow } from "@/services/taskApi";
+import {
+  cancelTask,
+  deleteTask,
+  listMyTasks,
+  type UserTaskRow,
+} from "@/services/taskApi";
+import { Trash2, XCircle, ArrowUpRight, ChevronLeft, ChevronRight } from "lucide-react";
 
 function statusLabel(s: string) {
   if (s === "queued") return "排队中";
@@ -19,16 +24,23 @@ function isRunning(s: string) {
   return s === "queued" || s === "started" || s === "cancel_requested";
 }
 
+const PAGE_SIZE = 20;
+
 export function MyTasks() {
   const [items, setItems] = useState<UserTaskRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const reload = useCallback(() => {
-    listMyTasks(80)
-      .then((r) => setItems(r.items || []))
+    listMyTasks(PAGE_SIZE, (page - 1) * PAGE_SIZE)
+      .then((r) => {
+        setItems(r.items || []);
+        setTotal(r.total || 0);
+      })
       .catch((e: Error) => setErr(e.message));
-  }, []);
+  }, [page]);
 
   useEffect(() => {
     reload();
@@ -57,6 +69,27 @@ export function MyTasks() {
     }
   }
 
+  async function onDeleteTask(t: UserTaskRow) {
+    const ok = window.confirm(`确认删除已结束的任务记录「${t.title || t.kind}」？`);
+    if (!ok) return;
+    setErr(null);
+    setBusyId(t.id);
+    try {
+      await deleteTask(t.id);
+      if (items.length === 1 && page > 1) {
+        setPage(page - 1);
+      } else {
+        reload();
+      }
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "删除任务失败");
+    } finally {
+      setBusyId(null);
+    }
+  }
+
+  const totalPages = Math.ceil(total / PAGE_SIZE);
+
   return (
     <div className="novel-shell">
       <div className="novel-container space-y-6">
@@ -70,15 +103,18 @@ export function MyTasks() {
                 这里展示你发起的后台任务（如一键续写、一键建书、生成章计划）。离开页面不会中断任务。
               </p>
             </div>
-            <Button
-              type="button"
-              variant="secondary"
-              className="font-bold"
-              onClick={() => reload()}
-              disabled={Boolean(busyId)}
-            >
-              刷新
-            </Button>
+            <div className="flex items-center gap-2">
+              <span className="text-xs text-foreground/50 font-bold mr-2">共 {total} 个记录</span>
+              <Button
+                type="button"
+                variant="secondary"
+                className="font-bold"
+                onClick={() => reload()}
+                disabled={Boolean(busyId)}
+              >
+                刷新
+              </Button>
+            </div>
           </div>
           {err ? (
             <div className="mt-4 rounded-2xl border border-red-500/30 bg-red-500/10 p-3 text-sm font-semibold text-red-700 dark:text-red-200">
@@ -97,7 +133,7 @@ export function MyTasks() {
               {items.map((t) => {
                 const latest = t.latest_log;
                 const msg = (latest?.message || t.last_message || "").trim();
-                const canCancel = isRunning(t.status);
+                const running = isRunning(t.status);
                 return (
                   <div
                     key={t.id}
@@ -105,7 +141,12 @@ export function MyTasks() {
                   >
                     <div className="min-w-0 space-y-1">
                       <div className="flex flex-wrap items-center gap-2">
-                        <span className="glass-chip font-bold">{statusLabel(t.status)}</span>
+                        <span className={`glass-chip font-bold ${
+                          t.status === "done" ? "bg-green-500/10 text-green-600 border-green-500/20" :
+                          t.status === "failed" ? "bg-red-500/10 text-red-600 border-red-500/20" : ""
+                        }`}>
+                          {statusLabel(t.status)}
+                        </span>
                         <span className="text-sm font-bold text-foreground truncate">
                           {t.title || t.kind}
                         </span>
@@ -134,21 +175,63 @@ export function MyTasks() {
                       ) : null}
                     </div>
                     <div className="flex items-center gap-2 self-end md:self-auto">
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="secondary"
-                        className="font-bold"
-                        disabled={!canCancel || busyId === t.id}
-                        onClick={() => onCancelTask(t)}
-                      >
-                        <XCircle className="mr-1 size-4" />
-                        结束任务
-                      </Button>
+                      {running ? (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="secondary"
+                          className="font-bold"
+                          disabled={busyId === t.id}
+                          onClick={() => onCancelTask(t)}
+                        >
+                          <XCircle className="mr-1 size-4" />
+                          结束任务
+                        </Button>
+                      ) : (
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          className="text-destructive hover:bg-destructive/10 hover:text-destructive font-bold"
+                          disabled={busyId === t.id}
+                          onClick={() => onDeleteTask(t)}
+                        >
+                          <Trash2 className="mr-1 size-4" />
+                          删除记录
+                        </Button>
+                      )}
                     </div>
                   </div>
                 );
               })}
+            </div>
+          )}
+
+          {totalPages > 1 && (
+            <div className="mt-8 flex items-center justify-center gap-4">
+              <Button
+                variant="outline"
+                size="sm"
+                className="font-bold"
+                disabled={page <= 1}
+                onClick={() => setPage(page - 1)}
+              >
+                <ChevronLeft className="mr-1 size-4" />
+                上一页
+              </Button>
+              <span className="text-sm font-bold text-foreground/70">
+                第 {page} / {totalPages} 页
+              </span>
+              <Button
+                variant="outline"
+                size="sm"
+                className="font-bold"
+                disabled={page >= totalPages}
+                onClick={() => setPage(page + 1)}
+              >
+                下一页
+                <ChevronRight className="ml-1 size-4" />
+              </Button>
             </div>
           )}
         </section>

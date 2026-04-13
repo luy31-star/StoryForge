@@ -322,6 +322,7 @@ export async function createNovel(body: {
   intro?: string;
   background?: string;
   style?: string;
+  writing_style_id?: string;
   target_chapters?: number;
   daily_auto_chapters?: number;
   daily_auto_time?: string;
@@ -348,6 +349,7 @@ export async function aiCreateAndStartNovel(body: {
   daily_auto_chapters?: number;
   daily_auto_time?: string;
   chapter_target_words?: number;
+  writing_style_id?: string;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
     method: "POST",
@@ -440,6 +442,18 @@ export async function generateFramework(novelId: string) {
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export async function batchReplaceNames(
+  novelId: string,
+  nameMapping: Record<string, string>
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/chapters/batch-replace-names`, {
+    method: "POST",
+    body: JSON.stringify({ name_mapping: nameMapping }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; count: number }>;
 }
 
 export async function confirmFramework(

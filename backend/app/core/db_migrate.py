@@ -69,6 +69,14 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN last_auto_date VARCHAR(10) DEFAULT ''")
                     )
                     logger.info("db migrate: added novels.last_auto_date (sqlite)")
+
+                if _has_column_sqlite(conn, "novels", "chapter_target_words"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
+                    )
+                    logger.info("db migrate: added novels.chapter_target_words (sqlite)")
                 return
             if dialect in ("postgresql", "postgres"):
                 if _has_column_postgres(conn, "novels", "target_chapters"):
@@ -100,6 +108,14 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.last_auto_date (postgres)")
+
+                if _has_column_postgres(conn, "novels", "chapter_target_words"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
+                    )
+                    logger.info("db migrate: added novels.chapter_target_words (postgres)")
                 return
             if dialect == "mysql":
                 if _has_column_mysql(conn, "novels", "target_chapters"):
@@ -125,6 +141,14 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN last_auto_date VARCHAR(10) DEFAULT ''")
                     )
                     logger.info("db migrate: added novels.last_auto_date (mysql)")
+
+                if _has_column_mysql(conn, "novels", "chapter_target_words"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
+                    )
+                    logger.info("db migrate: added novels.chapter_target_words (mysql)")
                 return
             logger.warning("db migrate: unsupported dialect=%s, skip", dialect)
     except Exception:
@@ -522,3 +546,27 @@ def ensure_user_config_columns(engine: Engine) -> None:
                     logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
     except Exception:
         logger.exception("db migrate: ensure_user_config_columns failed")
+
+
+def ensure_writing_style_id_column(engine: Engine) -> None:
+    """补齐 Novel 表 writing_style_id 列。"""
+    table = "novels"
+    col = "writing_style_id"
+    ddl = "VARCHAR(36) NULL"
+    
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            exists = False
+            if dialect == "sqlite":
+                exists = _has_column_sqlite(conn, table, col)
+            elif dialect == "mysql":
+                exists = _has_column_mysql(conn, table, col)
+            elif dialect in ("postgresql", "postgres"):
+                exists = _has_column_postgres(conn, table, col)
+
+            if not exists:
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_writing_style_id_column failed")

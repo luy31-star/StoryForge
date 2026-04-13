@@ -11,6 +11,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.novel import Novel, NovelMemory
+from app.models.writing_style import WritingStyle
 from app.models.volume import NovelChapterPlan, NovelVolume
 from app.services.memory_normalize_sync import (
     replace_normalized_from_payload,
@@ -298,26 +299,41 @@ def run_ai_create_and_start_sync(
 
     llm = NovelLLMService(billing_user_id=billing_user_id)
 
-    length_hint = "中篇约20-50万字（约100-250章）"
-    length_min, length_max = 100, 250
+    # 0. 准备文风约束
+    style_hint = ""
+    if n.writing_style_id:
+        from app.services.novel_llm_service import _writing_style_block
+        ws = db.get(WritingStyle, n.writing_style_id)
+        if ws:
+            style_hint = f"\n【特定文风深度定制要求】\n{_writing_style_block(ws)}\n"
+
+    # 1. 先根据 length_type 确定篇幅风格描述
+    if length_type == "long":
+        length_hint = "长篇约100-150万字（约300-800章），需要宏大的世界观和多线并行的复杂情节"
+        base_min, base_max = 300, 800
+    elif length_type == "short":
+        length_hint = "短篇约15-50章（通常 10 万字以内），节奏极快，冲突集中，适合快节奏阅读"
+        base_min, base_max = 15, 50
+    else:
+        length_hint = "中篇约20-50万字（约100-250章），结构稳健，情节起伏有致"
+        base_min, base_max = 100, 250
+
+    # 2. 如果提供了具体的 target_chapters，则以此为准，但保留上面的篇幅风格描述
     if isinstance(target_chapters, int) and target_chapters > 0:
         length_min = max(1, min(5000, int(target_chapters)))
         length_max = length_min
-        length_hint = f"全书约 {length_min} 章"
+        # 附加具体章节信息
+        length_hint = f"{length_hint}。本次具体目标为：{length_min} 章"
     else:
-        if length_type == "long":
-            length_hint = "长篇约100-150万字（约300-800章）"
-            length_min, length_max = 300, 800
-        elif length_type == "short":
-            length_hint = "短篇约15-50章（通常 10 万字以内）"
-            length_min, length_max = 15, 50
+        length_min, length_max = base_min, base_max
 
     prompt = (
         "你是一个顶级的网络小说架构师与畅销书策划编辑，擅长构思极具吸引力的书名和宏大且逻辑严密的设定。\n"
         f"用户提供的题材/风格标签：{styles_text}\n"
         f"篇幅要求：{length_hint}。\n"
         f"目标总章节数要求在 {length_min}-{length_max} 章之间。\n"
-        f"用户创作初衷/补充备注：{notes_text or '（无）'}\n\n"
+        f"用户创作初衷/补充备注：{notes_text or '（无）'}\n"
+        f"{style_hint}\n"
         "任务：请基于上述输入，头脑风暴并输出一部原创小说的核心构思。\n"
         "【关键：书名必须具有商业吸引力，不要直接照抄用户的备注。】\n\n"
         "请只输出一个严格合法、可直接 json.loads() 的 JSON 对象，禁止输出任何其他文字或 Markdown 格式。\n"
@@ -451,49 +467,21 @@ def run_ai_create_and_start_sync(
         logger.exception("ai_create brainstorm failed | novel_id=%s", novel_id)
         raise ValueError(f"AI 构思设定失败: {str(e)}")
 
-    # 生成大纲框架
+    # 触发异步生成大纲框架
+    from app.tasks.novel_tasks import novel_generate_framework_task
+    fw_batch_id = f"fw-gen-{int(time.time())}-{novel_id[:8]}"
+    novel_generate_framework_task.delay(novel_id, billing_user_id, fw_batch_id)
+
     append_generation_log(
         db,
         novel_id=novel_id,
         batch_id=batch_id,
-        event="ai_create_framework",
-        message="正在生成小说大纲框架...",
+        event="ai_create_framework_queued",
+        message="小说构思已完成，大纲框架生成任务已入队异步执行。",
     )
     db.commit()
 
-    if is_cancel_requested(batch_id):
-        append_generation_log(
-            db,
-            novel_id=novel_id,
-            batch_id=batch_id,
-            event="ai_create_cancelled",
-            level="warning",
-            message="任务已取消",
-        )
-        db.commit()
-        return {"status": "cancelled", "batch_id": batch_id, "chapters_generated": 0}
-    
-    try:
-        framework_markdown, framework_json = _generate_framework_sync(llm, n, db)
-        db.refresh(n)
-        n.framework_markdown = framework_markdown
-        n.framework_json = framework_json
-        n.framework_confirmed = False
-        db.commit()
-        
-        append_generation_log(
-            db,
-            novel_id=novel_id,
-            batch_id=batch_id,
-            event="ai_create_framework_done",
-            message="框架生成完毕（待确认）。",
-        )
-        db.commit()
-    except Exception as e:
-        logger.exception("ai_create framework failed | novel_id=%s", novel_id)
-        raise ValueError(f"AI 生成大纲失败: {str(e)}")
-
-    return {"status": "ok", "message": "大纲已生成（待确认）", "chapters_generated": 0}
+    return {"status": "ok", "message": "设定已构思，大纲正在后台生成中", "chapters_generated": 0}
 
 
 def _ensure_volumes_cover(db: Session, novel: Novel, end_no: int) -> None:

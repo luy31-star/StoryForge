@@ -28,6 +28,9 @@ class Novel(Base):
     intro: Mapped[str] = mapped_column(Text, default="")
     background: Mapped[str] = mapped_column(Text, default="")
     style: Mapped[str] = mapped_column(String(255), default="")
+    writing_style_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("writing_styles.id"), nullable=True
+    )
     # 目标章节数：用于框架生成与分卷（每卷默认 50 章）
     target_chapters: Mapped[int] = mapped_column(Integer, default=300)
     # 兼容历史字段（前端已不再要求用户填写）
@@ -55,6 +58,7 @@ class Novel(Base):
     )
 
     owner = relationship("User", back_populates="novels")
+    writing_style = relationship("WritingStyle")
     chapters = relationship(
         "Chapter", back_populates="novel", cascade="all, delete-orphan"
     )

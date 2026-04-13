@@ -124,6 +124,9 @@ export function AppLayout() {
             <Button variant="ghost" size="sm" asChild>
               <Link to="/tasks">我的任务</Link>
             </Button>
+            <Button variant="ghost" size="sm" asChild>
+              <Link to="/writing-styles">文风管理</Link>
+            </Button>
             {user?.is_admin ? (
               <>
                 <Button variant="ghost" size="sm" asChild>

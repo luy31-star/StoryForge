@@ -85,6 +85,60 @@ def _novel_llm(user: User) -> NovelLLMService:
     return NovelLLMService(billing_user_id=user.id)
 
 
+class BatchReplaceNamesBody(BaseModel):
+    name_mapping: dict[str, str] = Field(..., description="Mapping of old name to new name")
+
+
+@router.post("/{novel_id}/chapters/batch-replace-names")
+def batch_replace_names(
+    novel_id: str,
+    body: BatchReplaceNamesBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    if not body.name_mapping:
+        return {"status": "ok", "count": 0}
+
+    # Get all chapters
+    chapters = db.query(Chapter).filter(Chapter.novel_id == novel_id).all()
+    count = 0
+
+    for ch in chapters:
+        changed = False
+        content = ch.content or ""
+        title = ch.title or ""
+
+        for old_name, new_name in body.name_mapping.items():
+            if not old_name or not new_name or old_name == new_name:
+                continue
+            if old_name in content:
+                content = content.replace(old_name, new_name)
+                changed = True
+            if old_name in title:
+                title = title.replace(old_name, new_name)
+                changed = True
+
+        if changed:
+            ch.content = content
+            ch.title = title
+            count += 1
+
+    if count > 0:
+        db.commit()
+        _append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=f"batch-replace-{int(time.time())}",
+            event="batch_replace_names",
+            message=f"已在 {count} 个章节中批量替换了人物姓名。",
+            meta={"mapping": body.name_mapping},
+        )
+        db.commit()
+
+    return {"status": "ok", "count": count}
+
+
 class ApplyMemoryRefreshCandidateBody(BaseModel):
     current_version: int = Field(..., ge=0)
     candidate_json: str = Field(..., min_length=2)
@@ -108,12 +162,14 @@ class AiCreateAndStartBody(BaseModel):
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    writing_style_id: str | None = Field(default=None, max_length=36)
     
 class NovelCreate(BaseModel):
     title: str
     intro: str = ""
     background: str = ""
     style: str = Field(default="", max_length=255)
+    writing_style_id: str | None = Field(default=None, max_length=36)
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
@@ -124,6 +180,7 @@ class NovelPatch(BaseModel):
     intro: str | None = None
     background: str | None = None
     style: str | None = Field(default=None, max_length=255)
+    writing_style_id: str | None = Field(default=None, max_length=36)
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
     daily_auto_time: str | None = None
@@ -249,7 +306,7 @@ def _resolve_chapter_nos_for_generate(
 
 
 def _enqueue_auto_refresh_memory_from_approved(
-    db: Session, novel_id: str, *, reason: str
+    db: Session, novel_id: str, *, reason: str, user_id: str | None = None
 ) -> tuple[str, str | None, str | None]:
     """
     审定相关操作后异步刷新记忆，避免阻塞 HTTP 请求。
@@ -257,8 +314,24 @@ def _enqueue_auto_refresh_memory_from_approved(
     """
     try:
         batch_id = f"mem-refresh-{int(time.time())}-{novel_id[:8]}"
-        task = novel_refresh_memory_for_novel.delay(novel_id, reason, batch_id)
+        task = novel_refresh_memory_for_novel.delay(
+            novel_id, reason, batch_id, user_id=user_id
+        )
         task_id = getattr(task, "id", None)
+
+        if user_id:
+            from app.services.user_task_service import create_user_task
+
+            create_user_task(
+                db,
+                user_id=user_id,
+                kind="memory_refresh",
+                title=f"刷新小说记忆：{reason}",
+                novel_id=novel_id,
+                batch_id=batch_id,
+                celery_task_id=task_id,
+            )
+
         if batch_id:
             _append_generation_log(
                 db,
@@ -509,6 +582,7 @@ def ai_create_and_start(
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
         chapter_target_words=body.chapter_target_words,
+        writing_style_id=body.writing_style_id,
         user_id=user.id,
         status="draft",
         framework_confirmed=False
@@ -608,6 +682,7 @@ def create_novel(
         intro=body.intro,
         background=body.background,
         style=body.style,
+        writing_style_id=body.writing_style_id,
         target_chapters=body.target_chapters,
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
@@ -633,6 +708,7 @@ def get_novel(
         "intro": n.intro,
         "background": n.background,
         "style": n.style,
+        "writing_style_id": n.writing_style_id,
         "target_chapters": n.target_chapters,
         "chapter_target_words": n.chapter_target_words,
         "length_tag": _get_length_tag(n.target_chapters),
@@ -743,19 +819,30 @@ def download_local_reference(
 
 
 @router.post("/{novel_id}/generate-framework")
-async def generate_framework(
+def generate_framework(
     novel_id: str,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> dict[str, str]:
+) -> dict[str, Any]:
     n = require_novel_access(db, novel_id, user)
-    llm = _novel_llm(user)
-    md, fj = await llm.generate_framework(n, db=db)
-    n.framework_markdown = md
-    n.framework_json = fj
-    n.framework_confirmed = False
+    batch_id = f"fw-gen-{int(time.time())}-{novel_id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="framework_generate_queued",
+        message="已入队：异步生成全书大纲框架",
+    )
     db.commit()
-    return {"status": "ok"}
+    try:
+        from app.tasks.novel_tasks import novel_generate_framework_task
+        task = novel_generate_framework_task.delay(novel_id, str(user.id), batch_id)
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("framework generate enqueue failed | novel_id=%s", novel_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    
+    return {"status": "queued", "batch_id": batch_id, "task_id": task_id}
 
 
 @router.post("/{novel_id}/framework/regenerate")
@@ -2580,6 +2667,18 @@ def refresh_memory(
         )
     
     batch_id = f"mem-refresh-{int(time.time())}-{novel_id[:8]}"
+
+    from app.services.user_task_service import create_user_task
+
+    create_user_task(
+        db,
+        user_id=str(user.id),
+        kind="memory_refresh",
+        title="手动触发：刷新小说记忆",
+        novel_id=novel_id,
+        batch_id=batch_id,
+    )
+
     try:
         task = novel_refresh_memory_for_novel.delay(
             novel_id, 

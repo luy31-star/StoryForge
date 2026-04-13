@@ -3,6 +3,7 @@ import { Link, useParams, useSearchParams } from "react-router-dom";
 import { X } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
 import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
+import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -30,7 +31,6 @@ import {
   exportChapters,
   generateChapters,
   autoGenerateChapters,
-  generateFramework,
   generateVolumeChapterPlan,
   generateVolumes,
   getMemory,
@@ -343,6 +343,7 @@ export function NovelWorkspace() {
     daily_auto_chapters: 0,
     daily_auto_time: "14:30",
     chapter_target_words: 3000,
+    writing_style_id: "",
   });
   const [novelSettingsBusy, setNovelSettingsBusy] = useState(false);
 
@@ -378,6 +379,7 @@ export function NovelWorkspace() {
       daily_auto_chapters: Number(novel.daily_auto_chapters || 0),
       daily_auto_time: String(novel.daily_auto_time || "14:30"),
       chapter_target_words: Number(novel.chapter_target_words || 3000),
+      writing_style_id: String(novel.writing_style_id || ""),
     });
     setNovelSettingsOpen(true);
   }
@@ -1236,12 +1238,17 @@ export function NovelWorkspace() {
         if (resp.latest_memory_version != null) {
           setLatestMemoryVersion(resp.latest_memory_version);
         }
+        
+        // 如果当前大纲为空且未确认，尝试刷新小说数据以获取大纲
+        if (!frameworkConfirmed && !fwMd) {
+          await reload();
+        }
       } catch (e) {
         // ignore
       }
-    }, 10000);
+    }, 5000);
     return () => window.clearInterval(t);
-  }, [id]);
+  }, [id, frameworkConfirmed, fwMd, reload]);
 
   async function runAutoGenerate(targetCount: number) {
     if (!id) return;
@@ -1333,35 +1340,44 @@ export function NovelWorkspace() {
       });
       if (resp.status !== "queued" || !("batch_id" in resp) || !resp.batch_id) {
         setErr("卷章计划未能入队");
+        setVolumeBusy(false);
         return;
       }
-      setRefreshBatchId(resp.batch_id);
+      const bid = resp.batch_id;
+      setRefreshBatchId(bid);
       await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
-        setLogBatchId(resp.batch_id);
+        setLogBatchId(bid);
       }
-      await reloadGenerationLogs(
-        logViewMode === "batch" ? resp.batch_id : undefined
-      );
-      const outcome = await waitForVolumePlanBatch(id, resp.batch_id);
-      await reloadVolumes();
-      const plan = await listVolumeChapterPlan(id, selectedVolumeId);
-      setVolumePlan(plan);
-      setVolumePlanLastRun({
-        batch: undefined,
-        done: outcome === "done",
-        next_from_chapter: null,
-        existing: plan.length,
-      });
-      if (outcome === "failed") {
-        setErr("卷章计划生成失败，请查看生成日志");
-        setNotice("卷章计划生成失败，请查看生成日志。");
-      } else {
-        setNotice("本批卷章计划已生成，可在章计划列表中查看。");
-      }
+      await reloadGenerationLogs(logViewMode === "batch" ? bid : undefined);
+
+      // 后台等待逻辑：允许弹窗立即关闭，但主界面保持 busy 状态
+      (async () => {
+        try {
+          const outcome = await waitForVolumePlanBatch(id, bid);
+          await reloadVolumes();
+          const plan = await listVolumeChapterPlan(id, selectedVolumeId);
+          setVolumePlan(plan);
+          setVolumePlanLastRun({
+            batch: undefined,
+            done: outcome === "done",
+            next_from_chapter: null,
+            existing: plan.length,
+          });
+          if (outcome === "failed") {
+            setErr("卷章计划生成失败，请查看生成日志");
+            setNotice("卷章计划生成失败，请查看生成日志。");
+          } else {
+            setNotice("本批卷章计划已生成，可在章计划列表中查看。");
+          }
+        } catch (e: unknown) {
+          console.error("Background volume plan wait failed:", e);
+        } finally {
+          setVolumeBusy(false);
+        }
+      })();
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "生成本卷章计划失败");
-    } finally {
       setVolumeBusy(false);
     }
   }
@@ -1422,22 +1438,35 @@ export function NovelWorkspace() {
         source: "manual",
       });
       if (resp.status === "queued" && resp.batch_id) {
-        setRefreshBatchId(resp.batch_id);
-      await reload(); // 清除失败横幅
-        const outcome = await waitForChapterGenerationBatch(id, resp.batch_id);
-        setNotice(
-          outcome === "done"
-            ? `第${chapterNo}章已生成（待审定）。`
-            : `第${chapterNo}章生成失败，请查看生成日志。`
-        );
-        if (outcome === "failed") {
-          setErr("按章计划生成失败");
-        }
+        const bid = resp.batch_id;
+        setRefreshBatchId(bid);
+        await reload(); // 清除失败横幅
+
+        // 后台等待逻辑：允许弹窗立即关闭，但主界面保持 busy 状态
+        (async () => {
+          try {
+            const outcome = await waitForChapterGenerationBatch(id, bid);
+            setNotice(
+              outcome === "done"
+                ? `第${chapterNo}章已生成（待审定）。`
+                : `第${chapterNo}章生成失败，请查看生成日志。`
+            );
+            if (outcome === "failed") {
+              setErr("按章计划生成失败");
+            }
+          } catch (e: unknown) {
+            console.error("Background chapter generation wait failed:", e);
+          } finally {
+            setBusy(false);
+            await reload();
+          }
+        })();
+      } else {
+        await reload();
+        setBusy(false);
       }
-      await reload();
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "按章计划生成失败");
-    } finally {
       setBusy(false);
     }
   }
@@ -1701,23 +1730,6 @@ export function NovelWorkspace() {
     await runChapterChatPrompt(prompt);
   }
 
-  function confirmGenerateFramework() {
-    void openLlmConfirm(
-      {
-        title: "确认生成小说框架？",
-        description: "这会调用大模型，根据当前作品信息重写一版框架草案。",
-        confirmLabel: "确认生成框架",
-        details: [
-          "会覆盖当前未确认的框架草案；如果你已经手动改过内容，建议先自行保存。",
-          "书名、简介、背景和文风描述越完整，生成结果通常越稳定。",
-        ],
-      },
-      async () => {
-        await run(() => generateFramework(id));
-      }
-    );
-  }
-
   function confirmGenerateVolumes() {
     void openLlmConfirm(
       {
@@ -1923,7 +1935,9 @@ export function NovelWorkspace() {
     ? approvedChapterCount > 0
       ? "持续创作中"
       : "框架已就绪"
-    : "待确认框架";
+    : !fwMd && novel?.status === "draft"
+      ? "AI 正在构思大纲中…"
+      : "待确认框架";
 
   if (!novel) {
     return (
@@ -2142,27 +2156,6 @@ export function NovelWorkspace() {
                 >
                   修改向导
                 </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  className="font-bold"
-                  disabled={busy}
-                  onClick={() => confirmGenerateFramework()}
-                >
-                  AI 生成框架
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="font-bold"
-                  disabled={busy}
-                  onClick={() =>
-                    run(() => confirmFramework(id, fwMd, fwJson))
-                  }
-                >
-                  确认框架并开始创作
-                </Button>
               </div>
             </div>
             <div className="grid gap-3 md:grid-cols-3">
@@ -2181,17 +2174,32 @@ export function NovelWorkspace() {
               <div className="glass-panel-subtle p-4">
                 <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议下一步</p>
                 <p className="mt-2 text-sm font-bold text-foreground">
-                  {frameworkConfirmed ? "去卷与计划区推进章节" : "先确认框架，避免后续反复改动"}
+                  {frameworkConfirmed
+                    ? "去卷与计划区推进章节"
+                    : !fwMd && novel?.status === "draft"
+                      ? "AI 正在飞速构思，请稍候片刻"
+                      : "进入“修改向导”确认大纲"}
                 </p>
               </div>
             </div>
-            <div>
+            <div className="relative">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定大纲文本（可编辑后再确认）</Label>
-              <textarea
-                value={fwMd}
-                onChange={(e) => setFwMd(e.target.value)}
-                className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
-              />
+              {!fwMd && novel?.status === "draft" ? (
+                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse">
+                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+                    <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                  </div>
+                  <p className="font-bold">AI 正在飞速构思全书大纲，请稍候片刻...</p>
+                  <p className="text-xs opacity-60">构思完成后大纲将自动出现</p>
+                </div>
+              ) : (
+                <textarea
+                  value={fwMd}
+                  onChange={(e) => setFwMd(e.target.value)}
+                  className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                  placeholder="暂无大纲。进入“修改向导”或等待 AI 生成。"
+                />
+              )}
             </div>
             <div>
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定结构化配置</Label>
@@ -2525,294 +2533,6 @@ export function NovelWorkspace() {
               <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">{generateTrace}</p>
             ) : null}
             
-            <Dialog open={refreshRangeOpen} onOpenChange={setRefreshRangeOpen}>
-              <DialogContent className="max-w-md overflow-hidden flex flex-col">
-                <DialogHeader>
-                  <DialogTitle>刷新记忆范围选择</DialogTitle>
-                  <DialogDescription>
-                    请选择用于汇总记忆的已审定章节范围。
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="space-y-4 py-2">
-                  <div className="flex flex-col gap-2">
-                    <Label className="text-sm font-semibold">选择模式</Label>
-                    <div className="grid grid-cols-3 gap-2">
-                      <Button
-                        variant={refreshRangeMode === "recent" ? "default" : "outline"}
-                        size="sm"
-                        onClick={() => setRefreshRangeMode("recent")}
-                        className="text-xs"
-                      >
-                        最近 15 章
-                      </Button>
-                      <Button
-                        variant={refreshRangeMode === "full" ? "default" : "outline"}
-                        size="sm"
-                        onClick={() => setRefreshRangeMode("full")}
-                        className="text-xs"
-                      >
-                        全量刷新
-                      </Button>
-                      <Button
-                        variant={refreshRangeMode === "custom" ? "default" : "outline"}
-                        size="sm"
-                        onClick={() => setRefreshRangeMode("custom")}
-                        className="text-xs"
-                      >
-                        自定义范围
-                      </Button>
-                    </div>
-                  </div>
-
-                  {refreshRangeMode === "custom" && (
-                    <div className="grid grid-cols-2 gap-4">
-                      <div className="space-y-2">
-                        <Label className="text-xs">起始章号</Label>
-                        <Input
-                          type="number"
-                          value={refreshFromNo}
-                          onChange={(e) => setRefreshFromNo(Number(e.target.value))}
-                          className="h-9"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <Label className="text-xs">结束章号</Label>
-                        <Input
-                          type="number"
-                          value={refreshToNo}
-                          onChange={(e) => setRefreshToNo(Number(e.target.value))}
-                          className="h-9"
-                        />
-                      </div>
-                    </div>
-                  )}
-
-                  <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
-                    <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
-                      <div className="h-1.5 w-1.5 rounded-full bg-amber-500" />
-                      <p className="text-xs font-bold text-amber-600 dark:text-amber-400">温馨提示</p>
-                    </div>
-                    <ul className="list-disc list-inside text-[11px] text-amber-700/80 dark:text-amber-400/80 space-y-1">
-                      <li>汇总的章节越多，AI 处理速度越慢。</li>
-                      <li>刷新操作会消耗较多积分（按汇总字数计费）。</li>
-                      <li>建议仅在产生重大剧情变更或由于逻辑偏移需要“纠偏”时进行全量刷新。</li>
-                    </ul>
-                  </div>
-                </div>
-                <DialogFooter className="mt-4">
-                  <Button variant="outline" onClick={() => setRefreshRangeOpen(false)}>
-                    取消
-                  </Button>
-                  <Button
-                    onClick={() => {
-                      const opts: any = {};
-                      if (refreshRangeMode === "full") opts.is_full = true;
-                      else if (refreshRangeMode === "custom") {
-                        opts.from_chapter_no = refreshFromNo;
-                        opts.to_chapter_no = refreshToNo;
-                      }
-                      void executeRefreshMemory(opts);
-                    }}
-                    disabled={busy}
-                  >
-                    开始刷新
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-
-            <Dialog open={exportOpen} onOpenChange={setExportOpen}>
-              <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden flex flex-col">
-                <DialogHeader>
-                  <DialogTitle>全文本导出</DialogTitle>
-                  <DialogDescription>
-                    选择章节范围，一键拼接所有已审定或草稿正文，方便发布或备份。
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <div className="space-y-2">
-                    <Label>起始章号</Label>
-                    <Input
-                      type="number"
-                      value={exportStartNo}
-                      onChange={(e) => setExportStartNo(Number(e.target.value))}
-                    />
-                  </div>
-                  <div className="space-y-2">
-                    <Label>截止章号</Label>
-                    <Input
-                      type="number"
-                      value={exportEndNo}
-                      onChange={(e) => setExportEndNo(Number(e.target.value))}
-                    />
-                  </div>
-                </div>
-                <div className="flex-1 overflow-hidden flex flex-col mt-4 gap-3">
-                  <div className="flex items-center justify-between">
-                    <Label>导出内容预览</Label>
-                    {exportContent && (
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        className="h-7 text-xs"
-                        onClick={() => {
-                          void navigator.clipboard.writeText(exportContent);
-                          alert("已复制到剪贴板");
-                        }}
-                      >
-                        复制全文本
-                      </Button>
-                    )}
-                  </div>
-                  <textarea
-                    value={exportContent}
-                    readOnly
-                    placeholder="点击“开始导出”后在此显示内容..."
-                    className="field-shell-textarea flex-1 font-sans text-sm leading-relaxed"
-                  />
-                </div>
-                <DialogFooter className="mt-4">
-                  <Button variant="outline" onClick={() => setExportOpen(false)}>
-                    关闭
-                  </Button>
-                  <Button onClick={handleExport} disabled={exportBusy}>
-                    {exportBusy ? "正在导出..." : "开始导出"}
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-
-            <Dialog open={chapterChatOpen} onOpenChange={setChapterChatOpen}>
-              <DialogContent className="max-h-[88vh] max-w-3xl overflow-hidden">
-                <DialogHeader>
-                  <DialogTitle>章节助手对话</DialogTitle>
-                  <DialogDescription>
-                    自动基于已审定章节、框架与记忆回答问题，可用于续写决策和一致性检查。
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="soft-scroll flex max-h-[52vh] flex-col gap-3 overflow-y-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-3 text-sm">
-                  {chapterChatTurns.length === 0 ? (
-                    <p className="text-muted-foreground">
-                      例如：\"第 7 章应该先回收哪个伏笔？和主线冲突怎么排优先级？\"
-                    </p>
-                  ) : null}
-                  {chapterChatTurns.map((t, i) => (
-                    <div
-                      key={`${i}-${t.role}`}
-                      className={
-                        t.role === "user"
-                          ? "ml-8 rounded-[1.25rem] border border-primary/20 bg-primary/10 px-3.5 py-3 shadow-sm"
-                          : "mr-4 rounded-[1.25rem] border border-border/60 bg-background/80 px-3.5 py-3 shadow-sm"
-                      }
-                    >
-                      <span className="text-xs font-medium text-muted-foreground">
-                        {t.role === "user" ? "你" : "章节助手"}
-                      </span>
-                      <pre className="mt-1 whitespace-pre-wrap font-sans text-xs">{t.content}</pre>
-                    </div>
-                  ))}
-                </div>
-                <div className="space-y-2">
-                  <p className="text-xs text-muted-foreground">快捷提问</p>
-                  <div className="flex flex-wrap gap-2">
-                    {chapterQuickPrompts.map((p) => (
-                      <Button
-                        key={p.label}
-                        type="button"
-                        size="sm"
-                        variant="outline"
-                        disabled={chapterChatBusy}
-                        onClick={() => confirmSendChapterQuickPrompt(p.prompt)}
-                        className="text-xs"
-                        title={p.prompt}
-                      >
-                        {p.label}
-                      </Button>
-                    ))}
-                  </div>
-                  <div className="soft-scroll max-h-20 overflow-auto rounded-2xl border border-border/60 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-                    {chapterQuickPrompts.map((p) => (
-                      <p key={`desc-${p.label}`} className="truncate">
-                        <span className="font-medium">{p.label}：</span>
-                        {p.prompt}
-                      </p>
-                    ))}
-                  </div>
-                </div>
-                {chapterChatErr ? <p className="text-xs text-destructive">{chapterChatErr}</p> : null}
-                {chapterChatThinking ? (
-                  <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-                    <div className="flex items-center justify-between gap-2">
-                      <p className="font-medium text-amber-700 dark:text-amber-300">
-                        Think
-                      </p>
-                      <Button
-                        type="button"
-                        size="sm"
-                        variant="ghost"
-                        className="h-7 px-2 text-[11px]"
-                        onClick={() => setChapterThinkExpanded((v) => !v)}
-                      >
-                        {chapterThinkExpanded ? "折叠" : "展开"}
-                      </Button>
-                    </div>
-                    <pre
-                      className={`mt-1 overflow-auto whitespace-pre-wrap font-sans text-[11px] text-amber-800 dark:text-amber-200 ${
-                        chapterThinkExpanded ? "max-h-72" : "max-h-24"
-                      }`}
-                    >
-                      {chapterChatThinking}
-                    </pre>
-                  </div>
-                ) : null}
-                <textarea
-                  value={chapterChatInput}
-                  onChange={(e) => setChapterChatInput(e.target.value)}
-                  placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"
-                  className="field-shell-textarea min-h-[104px]"
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter" && !e.shiftKey) {
-                      e.preventDefault();
-                      confirmSendChapterChat();
-                    }
-                  }}
-                  disabled={chapterChatBusy}
-                />
-                <div className="flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    disabled={chapterChatBusy || !chapterChatInput.trim()}
-                    onClick={() => confirmSendChapterChat()}
-                  >
-                    {chapterChatBusy ? "思考中…" : "发送"}
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    disabled={!chapterChatBusy || !chapterChatAbort}
-                    onClick={() => chapterChatAbort?.abort()}
-                  >
-                    取消生成
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    disabled={chapterChatBusy || chapterChatTurns.length === 0}
-                    onClick={() => {
-                      setChapterChatTurns([]);
-                      setChapterChatErr(null);
-                      setChapterChatThinking("");
-                      setChapterThinkExpanded(false);
-                    }}
-                  >
-                    清空会话
-                  </Button>
-                </div>
-              </DialogContent>
-            </Dialog>
             <div className="grid gap-4 lg:grid-cols-12">
               <aside className="glass-panel-subtle lg:col-span-4 p-4 flex flex-col overflow-hidden max-h-[85vh]">
                 <div className="mb-4 shrink-0 space-y-2">
@@ -3177,8 +2897,9 @@ export function NovelWorkspace() {
                 <Button
                   type="button"
                   size="sm"
-                  disabled={busy}
+                  disabled={busy || approvedChapterCount === 0}
                   onClick={() => confirmRefreshMemory()}
+                  title={approvedChapterCount === 0 ? "尚无已审定章节，无法刷新记忆" : ""}
                 >
                   根据已审定章节刷新记忆
                 </Button>
@@ -3930,85 +3651,6 @@ export function NovelWorkspace() {
                 </div>
               ) : null}
             </div>
-            <Dialog open={normDetailOpen} onOpenChange={setNormDetailOpen}>
-              <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
-                <DialogHeader>
-                  <DialogTitle className="text-left text-base leading-snug">
-                    {normDetailTitle}
-                  </DialogTitle>
-                  <DialogDescription className="sr-only">
-                    结构化记忆条目完整内容
-                  </DialogDescription>
-                </DialogHeader>
-                <pre className="soft-scroll max-h-[min(60vh,520px)] overflow-auto whitespace-pre-wrap break-words rounded-[1.2rem] border border-border/70 bg-muted/30 p-3 text-[11px] leading-relaxed text-muted-foreground">
-                  {normDetailBody}
-                </pre>
-                <DialogFooter>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setNormDetailOpen(false)}
-                  >
-                    关闭
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
-
-            <Dialog open={historyDialogOpen} onOpenChange={setHistoryDialogOpen}>
-              <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
-                <DialogHeader>
-                  <DialogTitle className="text-left text-base leading-snug">
-                    记忆版本历史
-                  </DialogTitle>
-                  <DialogDescription>
-                    选择一个历史版本进行回退。回退操作会产生一个包含该版本内容的新快照，并覆盖当前结构化记忆表。
-                  </DialogDescription>
-                </DialogHeader>
-                <div className="space-y-3 py-2">
-                  {memoryHistory.length === 0 ? (
-                    <p className="py-8 text-center text-sm text-muted-foreground">暂无历史记录</p>
-                  ) : (
-                    memoryHistory.map((item) => (
-                      <div
-                        key={item.version}
-                        className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-border/50 bg-background/40 p-4 transition-all hover:border-primary/30 hover:bg-background/60"
-                      >
-                        <div className="min-w-0 flex-1 space-y-1">
-                          <div className="flex items-center gap-2">
-                            <span className="font-bold text-primary">v{item.version}</span>
-                            <span className="text-[10px] text-muted-foreground">
-                              {item.created_at ? new Date(item.created_at).toLocaleString() : "-"}
-                            </span>
-                          </div>
-                          <p className="line-clamp-2 text-xs text-muted-foreground">
-                            {item.summary || "（无摘要）"}
-                          </p>
-                        </div>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-8 shrink-0"
-                          onClick={() => void runRollbackMemory(item.version)}
-                        >
-                          回退到此版本
-                        </Button>
-                      </div>
-                    ))
-                  )}
-                </div>
-                <DialogFooter>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    onClick={() => setHistoryDialogOpen(false)}
-                  >
-                    取消
-                  </Button>
-                </DialogFooter>
-              </DialogContent>
-            </Dialog>
           </TabsContent>
         </Tabs>
       </div>
@@ -4233,6 +3875,16 @@ export function NovelWorkspace() {
               />
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 在写正文时将以此为强约束。建议 2000-5000。</p>
             </div>
+            <div className="space-y-2">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">写作风格 (深度定制)</Label>
+              <WritingStyleSelect
+                value={novelSettingsDraft.writing_style_id}
+                onChange={(id) => setNovelSettingsDraft({ ...novelSettingsDraft, writing_style_id: id })}
+              />
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                切换深度定制的文风，系统将按新文风进行后续章节创作。
+              </p>
+            </div>
           </div>
           <DialogFooter>
             <Button variant="outline" className="font-semibold" onClick={() => setNovelSettingsOpen(false)} disabled={novelSettingsBusy}>
@@ -4242,6 +3894,375 @@ export function NovelWorkspace() {
               {novelSettingsBusy ? "保存中..." : "保存设置"}
             </Button>
           </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={normDetailOpen} onOpenChange={setNormDetailOpen}>
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto text-foreground">
+          <DialogHeader>
+            <DialogTitle className="text-left text-base leading-snug">
+              {normDetailTitle}
+            </DialogTitle>
+            <DialogDescription className="sr-only">
+              结构化记忆条目完整内容
+            </DialogDescription>
+          </DialogHeader>
+          <pre className="soft-scroll max-h-[min(60vh,520px)] overflow-auto whitespace-pre-wrap break-words rounded-[1.2rem] border border-border/70 bg-muted/30 p-3 text-[11px] leading-relaxed text-muted-foreground">
+            {normDetailBody}
+          </pre>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setNormDetailOpen(false)}
+            >
+              关闭
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={historyDialogOpen} onOpenChange={setHistoryDialogOpen}>
+        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto text-foreground">
+          <DialogHeader>
+            <DialogTitle className="text-left text-base leading-snug">
+              记忆版本历史
+            </DialogTitle>
+            <DialogDescription>
+              选择一个历史版本进行回退。回退操作会产生一个包含该版本内容的新快照，并覆盖当前结构化记忆表。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3 py-2">
+            {memoryHistory.length === 0 ? (
+              <p className="py-8 text-center text-sm text-muted-foreground">暂无历史记录</p>
+            ) : (
+              memoryHistory.map((item) => (
+                <div
+                  key={item.version}
+                  className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-border/50 bg-background/40 p-4 transition-all hover:border-primary/30 hover:bg-background/60"
+                >
+                  <div className="min-w-0 flex-1 space-y-1">
+                    <div className="flex items-center gap-2">
+                      <span className="font-bold text-primary">v{item.version}</span>
+                      <span className="text-[10px] text-muted-foreground">
+                        {item.created_at ? new Date(item.created_at).toLocaleString() : "-"}
+                      </span>
+                    </div>
+                    <p className="line-clamp-2 text-xs text-muted-foreground">
+                      {item.summary || "（无摘要）"}
+                    </p>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    className="h-8 shrink-0"
+                    onClick={() => void runRollbackMemory(item.version)}
+                  >
+                    回退到此版本
+                  </Button>
+                </div>
+              ))
+            )}
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setHistoryDialogOpen(false)}
+            >
+              取消
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={refreshRangeOpen} onOpenChange={setRefreshRangeOpen}>
+        <DialogContent className="max-w-md overflow-hidden flex flex-col text-foreground">
+          <DialogHeader>
+            <DialogTitle>刷新记忆范围选择</DialogTitle>
+            <DialogDescription>
+              请选择用于汇总记忆的已审定章节范围。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4 py-2">
+            <div className="flex flex-col gap-2">
+              <Label className="text-sm font-semibold">选择模式</Label>
+              <div className="grid grid-cols-3 gap-2">
+                <Button
+                  variant={refreshRangeMode === "recent" ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setRefreshRangeMode("recent")}
+                  className="text-xs"
+                >
+                  最近 15 章
+                </Button>
+                <Button
+                  variant={refreshRangeMode === "full" ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setRefreshRangeMode("full")}
+                  className="text-xs"
+                >
+                  全量刷新
+                </Button>
+                <Button
+                  variant={refreshRangeMode === "custom" ? "default" : "outline"}
+                  size="sm"
+                  onClick={() => setRefreshRangeMode("custom")}
+                  className="text-xs"
+                >
+                  自定义范围
+                </Button>
+              </div>
+            </div>
+
+            {refreshRangeMode === "custom" && (
+              <div className="grid grid-cols-2 gap-4">
+                <div className="space-y-2">
+                  <Label className="text-xs">起始章号</Label>
+                  <Input
+                    type="number"
+                    value={refreshFromNo}
+                    onChange={(e) => setRefreshFromNo(Number(e.target.value))}
+                    className="h-9"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label className="text-xs">结束章号</Label>
+                  <Input
+                    type="number"
+                    value={refreshToNo}
+                    onChange={(e) => setRefreshToNo(Number(e.target.value))}
+                    className="h-9"
+                  />
+                </div>
+              </div>
+            )}
+
+            <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
+              <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
+                <div className="h-1.5 w-1.5 rounded-full bg-amber-500" />
+                <p className="text-xs font-bold text-amber-600 dark:text-amber-400">温馨提示</p>
+              </div>
+              <ul className="list-disc list-inside text-[11px] text-amber-700/80 dark:text-amber-400/80 space-y-1">
+                <li>汇总的章节越多，AI 处理速度越慢。</li>
+                <li>刷新操作会消耗较多积分（按汇总字数计费）。</li>
+                <li>建议仅在产生重大剧情变更或由于逻辑偏移需要“纠偏”时进行全量刷新。</li>
+              </ul>
+            </div>
+          </div>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setRefreshRangeOpen(false)}>
+              取消
+            </Button>
+            <Button
+              onClick={() => {
+                const opts: any = {};
+                if (refreshRangeMode === "full") opts.is_full = true;
+                else if (refreshRangeMode === "custom") {
+                  opts.from_chapter_no = refreshFromNo;
+                  opts.to_chapter_no = refreshToNo;
+                }
+                void executeRefreshMemory(opts);
+              }}
+              disabled={busy}
+            >
+              开始刷新
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={exportOpen} onOpenChange={setExportOpen}>
+        <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden flex flex-col text-foreground">
+          <DialogHeader>
+            <DialogTitle>全文本导出</DialogTitle>
+            <DialogDescription>
+              选择章节范围，一键拼接所有已审定或草稿正文，方便发布或备份。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label>起始章号</Label>
+              <Input
+                type="number"
+                value={exportStartNo}
+                onChange={(e) => setExportStartNo(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>截止章号</Label>
+              <Input
+                type="number"
+                value={exportEndNo}
+                onChange={(e) => setExportEndNo(Number(e.target.value))}
+              />
+            </div>
+          </div>
+          <div className="flex-1 overflow-hidden flex flex-col mt-4 gap-3">
+            <div className="flex items-center justify-between">
+              <Label>导出内容预览</Label>
+              {exportContent && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="h-7 text-xs"
+                  onClick={() => {
+                    void navigator.clipboard.writeText(exportContent);
+                    alert("已复制到剪贴板");
+                  }}
+                >
+                  复制全文本
+                </Button>
+              )}
+            </div>
+            <textarea
+              value={exportContent}
+              readOnly
+              placeholder="点击“开始导出”后在此显示内容..."
+              className="field-shell-textarea flex-1 font-sans text-sm leading-relaxed"
+            />
+          </div>
+          <DialogFooter className="mt-4">
+            <Button variant="outline" onClick={() => setExportOpen(false)}>
+              关闭
+            </Button>
+            <Button onClick={handleExport} disabled={exportBusy}>
+              {exportBusy ? "正在导出..." : "开始导出"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={chapterChatOpen} onOpenChange={setChapterChatOpen}>
+        <DialogContent className="max-h-[88vh] max-w-3xl overflow-hidden text-foreground">
+          <DialogHeader>
+            <DialogTitle>章节助手对话</DialogTitle>
+            <DialogDescription>
+              自动基于已审定章节、框架与记忆回答问题，可用于续写决策和一致性检查。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="soft-scroll flex max-h-[52vh] flex-col gap-3 overflow-y-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-3 text-sm">
+            {chapterChatTurns.length === 0 ? (
+              <p className="text-muted-foreground">
+                例如：\"第 7 章应该先回收哪个伏笔？和主线冲突怎么排优先级？\"
+              </p>
+            ) : null}
+            {chapterChatTurns.map((t, i) => (
+              <div
+                key={`${i}-${t.role}`}
+                className={
+                  t.role === "user"
+                    ? "ml-8 rounded-[1.25rem] border border-primary/20 bg-primary/10 px-3.5 py-3 shadow-sm"
+                    : "mr-4 rounded-[1.25rem] border border-border/60 bg-background/80 px-3.5 py-3 shadow-sm"
+                }
+              >
+                <span className="text-xs font-medium text-muted-foreground">
+                  {t.role === "user" ? "你" : "章节助手"}
+                </span>
+                <pre className="mt-1 whitespace-pre-wrap font-sans text-xs">{t.content}</pre>
+              </div>
+            ))}
+          </div>
+          <div className="space-y-2">
+            <p className="text-xs text-muted-foreground">快捷提问</p>
+            <div className="flex flex-wrap gap-2">
+              {chapterQuickPrompts.map((p) => (
+                <Button
+                  key={p.label}
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  disabled={chapterChatBusy}
+                  onClick={() => confirmSendChapterQuickPrompt(p.prompt)}
+                  className="text-xs"
+                  title={p.prompt}
+                >
+                  {p.label}
+                </Button>
+              ))}
+            </div>
+            <div className="soft-scroll max-h-20 overflow-auto rounded-2xl border border-border/60 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
+              {chapterQuickPrompts.map((p) => (
+                <p key={`desc-${p.label}`} className="truncate">
+                  <span className="font-medium">{p.label}：</span>
+                  {p.prompt}
+                </p>
+              ))}
+            </div>
+          </div>
+          {chapterChatErr ? <p className="text-xs text-destructive">{chapterChatErr}</p> : null}
+          {chapterChatThinking ? (
+            <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+              <div className="flex items-center justify-between gap-2">
+                <p className="font-medium text-amber-700 dark:text-amber-300">
+                  Think
+                </p>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-[11px]"
+                  onClick={() => setChapterThinkExpanded((v) => !v)}
+                >
+                  {chapterThinkExpanded ? "折叠" : "展开"}
+                </Button>
+              </div>
+              <pre
+                className={`mt-1 overflow-auto whitespace-pre-wrap font-sans text-[11px] text-amber-800 dark:text-amber-200 ${
+                  chapterThinkExpanded ? "max-h-72" : "max-h-24"
+                }`}
+              >
+                {chapterChatThinking}
+              </pre>
+            </div>
+          ) : null}
+          <textarea
+            value={chapterChatInput}
+            onChange={(e) => setChapterChatInput(e.target.value)}
+            placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"
+            className="field-shell-textarea min-h-[104px]"
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && !e.shiftKey) {
+                e.preventDefault();
+                confirmSendChapterChat();
+              }
+            }}
+            disabled={chapterChatBusy}
+          />
+          <div className="flex flex-wrap gap-2">
+            <Button
+              type="button"
+              size="sm"
+              disabled={chapterChatBusy || !chapterChatInput.trim()}
+              onClick={() => confirmSendChapterChat()}
+            >
+              {chapterChatBusy ? "思考中…" : "发送"}
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="secondary"
+              disabled={!chapterChatBusy || !chapterChatAbort}
+              onClick={() => chapterChatAbort?.abort()}
+            >
+              取消生成
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={chapterChatBusy || chapterChatTurns.length === 0}
+              onClick={() => {
+                setChapterChatTurns([]);
+                setChapterChatErr(null);
+                setChapterChatThinking("");
+                setChapterThinkExpanded(false);
+              }}
+            >
+              清空会话
+            </Button>
+          </div>
         </DialogContent>
       </Dialog>
     </div>

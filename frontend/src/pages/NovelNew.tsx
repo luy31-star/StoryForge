@@ -2,6 +2,7 @@ import { useState, type FormEvent } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { Sparkles } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import {
   Dialog,
   DialogContent,
@@ -27,6 +28,7 @@ export function NovelNew() {
   const [intro, setIntro] = useState("");
   const [background, setBackground] = useState("");
   const [style, setStyle] = useState("");
+  const [writingStyleId, setWritingStyleId] = useState<string | undefined>();
   const [targetChapters, setTargetChapters] = useState(1500);
   const [chapterTargetWords, setChapterTargetWords] = useState(3000);
   const [dailyChapters, setDailyChapters] = useState(0);
@@ -58,6 +60,7 @@ export function NovelNew() {
         intro,
         background,
         style,
+        writing_style_id: writingStyleId,
         target_chapters: targetChapters,
         daily_auto_chapters: dailyChapters,
         daily_auto_time: dailyTime,
@@ -378,14 +381,25 @@ export function NovelNew() {
               />
             </div>
             <div className="space-y-2">
-              <Label htmlFor="style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风</Label>
+              <Label htmlFor="style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风描述 (简要)</Label>
               <Input
                 id="style"
                 value={style}
                 onChange={(e) => setStyle(e.target.value)}
                 className="field-shell mt-1 h-11 text-foreground"
                 maxLength={255}
+                placeholder="例如：硬核推理、轻快幽默..."
               />
+            </div>
+            <div className="space-y-2">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">写作风格 (深度定制)</Label>
+              <WritingStyleSelect
+                value={writingStyleId}
+                onChange={setWritingStyleId}
+              />
+              <p className="text-[11px] text-foreground/50 dark:text-muted-foreground font-medium">
+                选择已创建的深度文风，系统将严格按其词库、句式和修辞进行创作。
+              </p>
             </div>
           </div>
 

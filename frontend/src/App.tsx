@@ -16,6 +16,8 @@ import { WorkflowEditor } from "@/pages/WorkflowEditor";
 import { Register } from "@/pages/Register";
 import { Recharge } from "@/pages/Recharge";
 import { MyTasks } from "@/pages/MyTasks";
+import { WritingStyleList } from "@/pages/WritingStyleList";
+import { WritingStyleEditor } from "@/pages/WritingStyleEditor";
 
 export default function App() {
   const user = useAuthStore((s) => s.user);
@@ -43,6 +45,9 @@ export default function App() {
           <Route path="/novels/new" element={<NovelNew />} />
           <Route path="/novels/:id" element={<NovelWorkspace />} />
           <Route path="/novels/:id/metrics" element={<NovelMetricsPage />} />
+          <Route path="/writing-styles" element={<WritingStyleList />} />
+          <Route path="/writing-styles/new" element={<WritingStyleEditor />} />
+          <Route path="/writing-styles/:id" element={<WritingStyleEditor />} />
           <Route path="/recharge" element={<Recharge />} />
           <Route
             path="/editor"

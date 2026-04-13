@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { BookOpen, Plus } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import {
   Card,
   CardContent,
@@ -35,11 +36,23 @@ export function NovelShelf() {
   const [aiCreatePlots, setAiCreatePlots] = useState<string[]>([]);
   const [aiCreateMoods, setAiCreateMoods] = useState<string[]>([]);
   const [aiCreateBackground, setAiCreateBackground] = useState<string>("现代");
-  const [aiCreateTargetChapters, setAiCreateTargetChapters] = useState<number>(10);
+  const [aiCreateLengthType, setAiCreateLengthType] = useState<string>("medium");
+  const [aiCreateTargetChapters, setAiCreateTargetChapters] = useState<number>(150);
   const [aiCreateChapterTargetWords, setAiCreateChapterTargetWords] = useState<number>(3000);
   const [aiCreateNotes, setAiCreateNotes] = useState("");
   const [aiCreateDailyChapters, setAiCreateDailyChapters] = useState(0);
   const [aiCreateDailyTime, setAiCreateDailyTime] = useState("14:30");
+  const [aiCreateWritingStyleId, setAiCreateWritingStyleId] = useState<string | undefined>(undefined);
+
+  const [addedSubjects, setAddedSubjects] = useState<string[]>([]);
+  const [addedPlots, setAddedPlots] = useState<string[]>([]);
+  const [addedMoods, setAddedMoods] = useState<string[]>([]);
+  const [addedBackgrounds, setAddedBackgrounds] = useState<string[]>([]);
+
+  const [newSubject, setNewSubject] = useState("");
+  const [newPlot, setNewPlot] = useState("");
+  const [newMood, setNewMood] = useState("");
+  const [newBackground, setNewBackground] = useState("");
 
   const reload = useCallback(() => {
     listNovels()
@@ -83,9 +96,11 @@ export function NovelShelf() {
         target_chapters: aiCreateTargetChapters,
         chapter_target_words: aiCreateChapterTargetWords,
         notes: aiCreateNotes.trim(),
+        length_type: aiCreateLengthType,
         target_generate_chapters: 0,
         daily_auto_chapters: aiCreateDailyChapters,
         daily_auto_time: aiCreateDailyTime,
+        writing_style_id: aiCreateWritingStyleId || undefined,
       });
       setAiCreateOpen(false);
       reload();
@@ -188,7 +203,11 @@ export function NovelShelf() {
     "大男主",
   ];
   const BACKGROUNDS = ["古代", "现代", "未来", "架空", "民国", "近现代"];
-  const TARGET_CHAPTERS = [5, 10, 15];
+  const LENGTH_TYPES = [
+    { id: "short", label: "短篇", defaultChapters: 30 },
+    { id: "medium", label: "中篇", defaultChapters: 150 },
+    { id: "long", label: "长篇", defaultChapters: 500 },
+  ];
   const WORDS_PER_CHAPTER = [2000, 3000, 5000];
 
   function toggleLimit(
@@ -417,7 +436,7 @@ export function NovelShelf() {
             <div className="space-y-3">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">题材（0/1）</Label>
               <div className="flex flex-wrap gap-2">
-                {SUBJECTS.map((p) => (
+                {[...SUBJECTS, ...addedSubjects].map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -431,6 +450,41 @@ export function NovelShelf() {
                     {p}
                   </button>
                 ))}
+                <div className="flex items-center gap-1 ml-1">
+                  <Input
+                    placeholder="自定义..."
+                    value={newSubject}
+                    onChange={(e) => setNewSubject(e.target.value)}
+                    className="h-7 w-24 text-[10px] px-2 rounded-full bg-background/50"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const val = newSubject.trim();
+                        if (val && ![...SUBJECTS, ...addedSubjects].includes(val)) {
+                          setAddedSubjects(prev => [...prev, val]);
+                          setAiCreateSubject(val);
+                          setNewSubject("");
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 rounded-full bg-primary/5 text-primary hover:bg-primary/10"
+                    onClick={() => {
+                      const val = newSubject.trim();
+                      if (val && ![...SUBJECTS, ...addedSubjects].includes(val)) {
+                        setAddedSubjects(prev => [...prev, val]);
+                        setAiCreateSubject(val);
+                        setNewSubject("");
+                      }
+                    }}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                 已选择：{aiCreateSubject || "未选择"}
@@ -440,7 +494,7 @@ export function NovelShelf() {
             <div className="space-y-3">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">情节（0/3）</Label>
               <div className="flex flex-wrap gap-2">
-                {PLOTS.map((p) => (
+                {[...PLOTS, ...addedPlots].map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -454,6 +508,41 @@ export function NovelShelf() {
                     {p}
                   </button>
                 ))}
+                <div className="flex items-center gap-1 ml-1">
+                  <Input
+                    placeholder="自定义..."
+                    value={newPlot}
+                    onChange={(e) => setNewPlot(e.target.value)}
+                    className="h-7 w-24 text-[10px] px-2 rounded-full bg-background/50"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const val = newPlot.trim();
+                        if (val && ![...PLOTS, ...addedPlots].includes(val)) {
+                          setAddedPlots(prev => [...prev, val]);
+                          toggleLimit([...aiCreatePlots], val, 3, setAiCreatePlots);
+                          setNewPlot("");
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 rounded-full bg-primary/5 text-primary hover:bg-primary/10"
+                    onClick={() => {
+                      const val = newPlot.trim();
+                      if (val && ![...PLOTS, ...addedPlots].includes(val)) {
+                        setAddedPlots(prev => [...prev, val]);
+                        toggleLimit([...aiCreatePlots], val, 3, setAiCreatePlots);
+                        setNewPlot("");
+                      }
+                    }}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                 已选择：{aiCreatePlots.length ? aiCreatePlots.join("、") : "未选择"}
@@ -463,7 +552,7 @@ export function NovelShelf() {
             <div className="space-y-3">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">情绪（0/3）</Label>
               <div className="flex flex-wrap gap-2">
-                {MOODS.map((p) => (
+                {[...MOODS, ...addedMoods].map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -477,6 +566,41 @@ export function NovelShelf() {
                     {p}
                   </button>
                 ))}
+                <div className="flex items-center gap-1 ml-1">
+                  <Input
+                    placeholder="自定义..."
+                    value={newMood}
+                    onChange={(e) => setNewMood(e.target.value)}
+                    className="h-7 w-24 text-[10px] px-2 rounded-full bg-background/50"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const val = newMood.trim();
+                        if (val && ![...MOODS, ...addedMoods].includes(val)) {
+                          setAddedMoods(prev => [...prev, val]);
+                          toggleLimit([...aiCreateMoods], val, 3, setAiCreateMoods);
+                          setNewMood("");
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 rounded-full bg-primary/5 text-primary hover:bg-primary/10"
+                    onClick={() => {
+                      const val = newMood.trim();
+                      if (val && ![...MOODS, ...addedMoods].includes(val)) {
+                        setAddedMoods(prev => [...prev, val]);
+                        toggleLimit([...aiCreateMoods], val, 3, setAiCreateMoods);
+                        setNewMood("");
+                      }
+                    }}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                 已选择：{aiCreateMoods.length ? aiCreateMoods.join("、") : "未选择"}
@@ -486,7 +610,7 @@ export function NovelShelf() {
             <div className="space-y-3">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">背景（0/1）</Label>
               <div className="flex flex-wrap gap-2">
-                {BACKGROUNDS.map((p) => (
+                {[...BACKGROUNDS, ...addedBackgrounds].map((p) => (
                   <button
                     key={p}
                     type="button"
@@ -500,6 +624,41 @@ export function NovelShelf() {
                     {p}
                   </button>
                 ))}
+                <div className="flex items-center gap-1 ml-1">
+                  <Input
+                    placeholder="自定义..."
+                    value={newBackground}
+                    onChange={(e) => setNewBackground(e.target.value)}
+                    className="h-7 w-24 text-[10px] px-2 rounded-full bg-background/50"
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const val = newBackground.trim();
+                        if (val && ![...BACKGROUNDS, ...addedBackgrounds].includes(val)) {
+                          setAddedBackgrounds(prev => [...prev, val]);
+                          setAiCreateBackground(val);
+                          setNewBackground("");
+                        }
+                      }
+                    }}
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 rounded-full bg-primary/5 text-primary hover:bg-primary/10"
+                    onClick={() => {
+                      const val = newBackground.trim();
+                      if (val && ![...BACKGROUNDS, ...addedBackgrounds].includes(val)) {
+                        setAddedBackgrounds(prev => [...prev, val]);
+                        setAiCreateBackground(val);
+                        setNewBackground("");
+                      }
+                    }}
+                  >
+                    <Plus className="h-3 w-3" />
+                  </Button>
+                </div>
               </div>
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                 已选择：{aiCreateBackground || "未选择"}
@@ -507,33 +666,47 @@ export function NovelShelf() {
             </div>
 
             <div className="space-y-3">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">章节数（1/1）</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">写作风格 (深度定制)</Label>
+              <WritingStyleSelect
+                value={aiCreateWritingStyleId}
+                onChange={setAiCreateWritingStyleId}
+              />
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                若不选择深度文风，系统将按题材和篇幅默认提示词进行创作。
+              </p>
+            </div>
+
+            <div className="space-y-3">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">篇幅规模（1/1）</Label>
               <div className="flex flex-wrap gap-2">
-                {TARGET_CHAPTERS.map((n) => (
+                {LENGTH_TYPES.map((lt) => (
                   <button
-                    key={n}
+                    key={lt.id}
                     type="button"
-                    onClick={() => setAiCreateTargetChapters(n)}
-                    className={`rounded-full px-3 py-1 text-xs border transition-colors font-medium ${
-                      aiCreateTargetChapters === n
+                    onClick={() => {
+                      setAiCreateLengthType(lt.id);
+                      setAiCreateTargetChapters(lt.defaultChapters);
+                    }}
+                    className={`rounded-full px-4 py-1.5 text-xs border transition-colors font-bold ${
+                      aiCreateLengthType === lt.id
                         ? "border-primary bg-primary/10 text-primary"
                         : "border-border/70 bg-background/50 text-foreground/70 hover:bg-muted/50 hover:text-foreground dark:text-muted-foreground"
                     }`}
                   >
-                    {n} 章
+                    {lt.label}
                   </button>
                 ))}
               </div>
               <div className="grid gap-3 sm:grid-cols-2">
                 <div className="space-y-2">
-                  <Label className="text-xs font-semibold text-foreground/70">自定义章节数</Label>
+                  <Label className="text-xs font-semibold text-foreground/70">设定总章节数</Label>
                   <Input
                     type="number"
                     min={1}
                     max={5000}
                     value={aiCreateTargetChapters}
                     onChange={(e) => setAiCreateTargetChapters(Number(e.target.value))}
-                    className="text-foreground"
+                    className="text-foreground font-bold"
                   />
                 </div>
                 <div className="space-y-2">

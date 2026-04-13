@@ -28,12 +28,24 @@ export type UserTaskRow = {
 
 const BASE = "/api/tasks";
 
-export async function listMyTasks(limit = 50) {
+export async function listMyTasks(limit = 50, offset = 0) {
   const q = new URLSearchParams();
   q.set("limit", String(limit));
+  q.set("offset", String(offset));
   const r = await apiFetch(`${BASE}?${q.toString()}`);
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<{ items: UserTaskRow[] }>;
+  return r.json() as Promise<{
+    items: UserTaskRow[];
+    total: number;
+    limit: number;
+    offset: number;
+  }>;
+}
+
+export async function deleteTask(taskId: string) {
+  const r = await apiFetch(`${BASE}/${taskId}`, { method: "DELETE" });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; task_id: string }>;
 }
 
 export async function cancelTask(taskId: string) {

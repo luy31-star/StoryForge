@@ -48,15 +48,16 @@ def list_my_tasks(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
     limit: int = 50,
+    offset: int = 0,
 ) -> dict[str, Any]:
     lim = max(1, min(int(limit or 50), 200))
-    rows = (
-        db.query(UserTask)
-        .filter(UserTask.user_id == user.id)
-        .order_by(UserTask.created_at.desc())
-        .limit(lim)
-        .all()
-    )
+    off = max(0, int(offset or 0))
+
+    q = db.query(UserTask).filter(UserTask.user_id == user.id)
+    total = q.count()
+
+    rows = q.order_by(UserTask.created_at.desc()).offset(off).limit(lim).all()
+
     out: list[dict[str, Any]] = []
     for t in rows:
         last_log = _latest_log_for_batch(db, t.batch_id or "")
@@ -82,7 +83,25 @@ def list_my_tasks(
                 "latest_log": last_log,
             }
         )
-    return {"items": out}
+    return {"items": out, "total": total, "limit": lim, "offset": off}
+
+
+@router.delete("/{task_id}")
+def delete_task(
+    task_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    t = db.get(UserTask, task_id)
+    if not t or t.user_id != user.id:
+        raise HTTPException(404, "任务不存在")
+
+    if t.status not in TERMINAL_STATUSES:
+        raise HTTPException(400, "运行中的任务不可删除，请先取消任务")
+
+    db.delete(t)
+    db.commit()
+    return {"status": "ok", "task_id": task_id}
 
 
 @router.post("/{task_id}/cancel")

@@ -423,6 +423,7 @@ def novel_refresh_memory_for_novel(
     db = SessionLocal()
     bid = batch_id or f"mem-refresh-{novel_id[:8]}-{int(time.time())}"
     try:
+        _task_set_started(db, batch_id=bid, message="开始执行刷新记忆流程")
         logger.info(
             "refresh_memory_for_novel consumed | novel_id=%s batch_id=%s reason=%s",
             novel_id,
@@ -448,6 +449,7 @@ def novel_refresh_memory_for_novel(
         db.commit()
         n = db.get(Novel, novel_id)
         if not n:
+            _task_set_terminal(db, batch_id=bid, status="failed", message="小说不存在")
             _append_refresh_log(
                 db,
                 novel_id=novel_id,
@@ -477,6 +479,7 @@ def novel_refresh_memory_for_novel(
             bid,
         )
         if not chapters:
+            _task_set_terminal(db, batch_id=bid, status="done", message="无需更新：暂无已审定章节")
             _append_refresh_log(
                 db,
                 novel_id=novel_id,
@@ -512,6 +515,7 @@ def novel_refresh_memory_for_novel(
         llm = _novel_llm_for_novel(n)
         result = llm.refresh_memory_from_chapters_sync(n, summary, prev, db=db)
         if not result.get("ok"):
+            _task_set_terminal(db, batch_id=bid, status="failed", message="校验失败：未覆盖当前记忆")
             cand = str(result.get("candidate_json") or "{}")
             _append_refresh_log(
                 db,
@@ -533,6 +537,7 @@ def novel_refresh_memory_for_novel(
             db.commit()
             return {"status": "blocked", "novel_id": novel_id}
         if result.get("status") == "warning":
+            _task_set_terminal(db, batch_id=bid, status="done", message="完成（有警告，待人工确认）")
             cand = str(result.get("candidate_json") or "{}")
             _append_refresh_log(
                 db,
@@ -560,6 +565,7 @@ def novel_refresh_memory_for_novel(
             .scalar()
             or 0
         )
+        _task_set_terminal(db, batch_id=bid, status="done", message=f"记忆已更新 v{done_ver}")
         _append_refresh_log(
             db,
             novel_id=novel_id,
@@ -576,9 +582,10 @@ def novel_refresh_memory_for_novel(
             bid,
         )
         return {"status": "ok", "novel_id": novel_id, "version": done_ver}
-    except Exception:
+    except Exception as e:
         db.rollback()
         try:
+            _task_set_terminal(db, batch_id=bid, status="failed", message=f"异常：{e}")
             _append_refresh_log(
                 db,
                 novel_id=novel_id,
@@ -1337,6 +1344,118 @@ def _update_framework_characters_sync(
     finally:
         asyncio.set_event_loop(None)
         loop.close()
+
+
+@celery_app.task(name="novel.novel_generate_framework_task")
+def novel_generate_framework_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
+    try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_generate_framework_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="framework_generate_failed",
+                    level="error",
+                    message="生成大纲跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked"},
+                )
+                db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
+                return {"status": "skipped", "reason": "locked"}
+
+        _task_set_started(db, batch_id=batch_id, message="生成大纲任务已开始")
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_generate_started",
+            message="正在生成全书大纲框架...",
+        )
+        db.commit()
+
+        n = db.get(Novel, novel_id)
+        if not n:
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
+            return {"status": "not_found", "novel_id": novel_id}
+        
+        llm = NovelLLMService(billing_user_id=user_id)
+        from app.services.novel_auto_pipeline import _generate_framework_sync
+        md, fj = _generate_framework_sync(llm, n, db)
+        n.framework_markdown = md
+        n.framework_json = fj
+        n.framework_confirmed = False
+        db.commit()
+        
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_generate_done",
+            message="大纲框架生成完毕（待确认）",
+        )
+        db.commit()
+        _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return {"status": "ok", "batch_id": batch_id}
+    except Exception as e:
+        logger.exception("novel_generate_framework_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
+        try:
+            db.rollback()
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="framework_generate_failed",
+                level="error",
+                message=f"生成大纲失败：{e}",
+                meta={"error": str(e)},
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message=f"失败：{e}")
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "framework_generate lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
+        db.close()
 
 
 @celery_app.task(name="novel.framework_regen_task")
