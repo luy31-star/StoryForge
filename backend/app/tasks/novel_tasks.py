@@ -469,8 +469,16 @@ def novel_refresh_memory_for_novel(
             max_chapters = 99999
         else:
             max_chapters = settings.novel_memory_refresh_chapters or 15
+            # 优化：只查最近的 max_chapters 个已审定章节
+            # 先拿到总数，然后跳过前面的，只取最后 N 个
+            # 或者直接取 order_by(desc).limit(N) 然后再倒序回来
+            pass
             
-        chapters = q.order_by(Chapter.chapter_no.asc()).all()
+        if not is_full and (from_chapter_no is None or to_chapter_no is None):
+            chapters = q.order_by(Chapter.chapter_no.desc()).limit(max_chapters).all()
+            chapters.reverse() # 恢复正序
+        else:
+            chapters = q.order_by(Chapter.chapter_no.asc()).all()
         
         logger.info(
             "refresh_memory_for_novel loading approved chapters | novel_id=%s count=%s batch_id=%s",
@@ -513,7 +521,7 @@ def novel_refresh_memory_for_novel(
             or 0
         )
         llm = _novel_llm_for_novel(n)
-        result = llm.refresh_memory_from_chapters_sync(n, summary, prev, db=db)
+        result = llm.refresh_memory_from_chapters_sync(n, summary, prev, db=db, replace_timeline=True)
         if not result.get("ok"):
             _task_set_terminal(db, batch_id=bid, status="failed", message="校验失败：未覆盖当前记忆")
             cand = str(result.get("candidate_json") or "{}")

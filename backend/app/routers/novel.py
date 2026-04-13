@@ -315,7 +315,7 @@ def _enqueue_auto_refresh_memory_from_approved(
     try:
         batch_id = f"mem-refresh-{int(time.time())}-{novel_id[:8]}"
         task = novel_refresh_memory_for_novel.delay(
-            novel_id, reason, batch_id, user_id=user_id
+            novel_id, reason, batch_id
         )
         task_id = getattr(task, "id", None)
 
@@ -2656,8 +2656,8 @@ def refresh_memory(
         # 默认只刷最近 15 章
         pass
         
-    chapters = q.order_by(Chapter.chapter_no.asc()).all()
-    if not chapters:
+    has_chapters = q.limit(1).first() is not None
+    if not has_chapters:
         raise HTTPException(400, "选定范围或默认范围内暂无已审定章节可用于汇总记忆")
 
     if has_pending_memory_refresh_batch(db, novel_id):

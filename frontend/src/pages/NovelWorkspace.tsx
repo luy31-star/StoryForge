@@ -343,6 +343,7 @@ export function NovelWorkspace() {
     daily_auto_chapters: 0,
     daily_auto_time: "14:30",
     chapter_target_words: 3000,
+    style: "",
     writing_style_id: "",
   });
   const [novelSettingsBusy, setNovelSettingsBusy] = useState(false);
@@ -379,6 +380,7 @@ export function NovelWorkspace() {
       daily_auto_chapters: Number(novel.daily_auto_chapters || 0),
       daily_auto_time: String(novel.daily_auto_time || "14:30"),
       chapter_target_words: Number(novel.chapter_target_words || 3000),
+      style: String(novel.style || ""),
       writing_style_id: String(novel.writing_style_id || ""),
     });
     setNovelSettingsOpen(true);
@@ -3874,6 +3876,17 @@ export function NovelWorkspace() {
                 className="field-shell text-foreground font-bold"
               />
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 在写正文时将以此为强约束。建议 2000-5000。</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="novel_style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风描述 (简要)</Label>
+              <Input
+                id="novel_style"
+                value={novelSettingsDraft.style}
+                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, style: e.target.value })}
+                className="field-shell text-foreground font-bold"
+                placeholder="例如：硬核推理、轻快幽默..."
+              />
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">简单描述文风关键词，会注入所有生成环节。</p>
             </div>
             <div className="space-y-2">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">写作风格 (深度定制)</Label>

@@ -1067,8 +1067,19 @@ class NovelLLMService:
         fj_block = truncate_framework_json(novel.framework_json or "", 9000)
         md_block = (novel.framework_markdown or "")[:9000]
         chars_text = json.dumps(characters or [], ensure_ascii=False)
+
+        # 获取详细文风
+        ws_block = ""
+        if novel.writing_style_id and db:
+            from app.models.writing_style import WritingStyle
+
+            ws = db.get(WritingStyle, novel.writing_style_id)
+            if ws:
+                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
+
         user = (
             f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
+            f"{ws_block}"
             f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
             f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
             f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
@@ -2592,6 +2603,7 @@ class NovelLLMService:
         novel_id: str,
         delta: dict[str, Any],
         memory_version: int,
+        replace_timeline: bool = False,
     ) -> dict[str, int]:
         """
         根据 LLM 返回的增量 Delta，直接更新规范化数据库表。
@@ -2622,7 +2634,7 @@ class NovelLLMService:
                 to_del_ids = []
                 for row in rows:
                     val = getattr(row, attr)
-                    if val and NovelLLMService._short_id(val) in ids_to_remove:
+                    if val and _short_id(val) in ids_to_remove:
                         to_del_ids.append(row.id)
                 if to_del_ids:
                     db.query(table).filter(table.id.in_(to_del_ids)).delete(synchronize_session=False)
@@ -2667,15 +2679,28 @@ class NovelLLMService:
                     inc = item.get(field) or []
                     if not isinstance(inc, list):
                         inc = []
-                    if field == "open_plots_resolved":
-                        inc_norm = NovelLLMService._filter_key_resolved_plot_bodies(
-                            NovelLLMService._open_plot_bodies_from_mixed(inc),
-                            plot_lookup=active_plot_lookup,
-                            current_chapter_no=chapter_no,
-                        )
-                        new_list = _dedupe_str_list([*old_list, *inc_norm])
+                    
+                    if replace_timeline:
+                        # 刷新模式：直接使用 LLM 提取的内容替换旧内容（但仍做基础去重）
+                        if field == "open_plots_resolved":
+                            new_list = NovelLLMService._filter_key_resolved_plot_bodies(
+                                NovelLLMService._open_plot_bodies_from_mixed(inc),
+                                plot_lookup=active_plot_lookup,
+                                current_chapter_no=chapter_no,
+                            )
+                        else:
+                            new_list = _dedupe_str_list(inc)
                     else:
-                        new_list = _dedupe_str_list([*old_list, *inc])
+                        # 增量模式：追加
+                        if field == "open_plots_resolved":
+                            inc_norm = NovelLLMService._filter_key_resolved_plot_bodies(
+                                NovelLLMService._open_plot_bodies_from_mixed(inc),
+                                plot_lookup=active_plot_lookup,
+                                current_chapter_no=chapter_no,
+                            )
+                            new_list = _dedupe_str_list([*old_list, *inc_norm])
+                        else:
+                            new_list = _dedupe_str_list([*old_list, *inc])
                     setattr(entry, json_field, json.dumps(new_list, ensure_ascii=False))
 
                 oa_raw = item.get("open_plots_added") or []
@@ -2720,26 +2745,40 @@ class NovelLLMService:
                         s = str(x or "").strip()
                         if s:
                             bodies_add.append(s)
-                old_oa = json.loads(entry.open_plots_added_json or "[]")
-                entry.open_plots_added_json = json.dumps(
-                    _dedupe_str_list([*old_oa, *bodies_add]), ensure_ascii=False
-                )
+                
+                if replace_timeline:
+                    # 刷新模式：替换 open_plots_added
+                    entry.open_plots_added_json = json.dumps(
+                        _dedupe_str_list(bodies_add), ensure_ascii=False
+                    )
+                else:
+                    # 增量模式：追加
+                    old_oa = json.loads(entry.open_plots_added_json or "[]")
+                    entry.open_plots_added_json = json.dumps(
+                        _dedupe_str_list([*old_oa, *bodies_add]), ensure_ascii=False
+                    )
 
                 emo = str(item.get("emotional_state") or "").strip()
                 if emo:
                     entry.emotional_state = emo[:2000]
+                
                 uh = item.get("unresolved_hooks")
                 if isinstance(uh, list) and uh:
-                    old_uh = json.loads(entry.unresolved_hooks_json or "[]")
-                    if not isinstance(old_uh, list):
-                        old_uh = []
-                    merged_uh = _dedupe_str_list(
-                        [
-                            *old_uh,
-                            *[str(x).strip() for x in uh if str(x).strip()],
-                        ]
-                    )
-                    entry.unresolved_hooks_json = json.dumps(merged_uh, ensure_ascii=False)
+                    if replace_timeline:
+                        # 刷新模式：替换
+                        new_uh = _dedupe_str_list([str(x).strip() for x in uh if str(x).strip()])
+                    else:
+                        # 增量模式：追加
+                        old_uh = json.loads(entry.unresolved_hooks_json or "[]")
+                        if not isinstance(old_uh, list):
+                            old_uh = []
+                        new_uh = _dedupe_str_list(
+                            [
+                                *old_uh,
+                                *[str(x).strip() for x in uh if str(x).strip()],
+                            ]
+                        )
+                    entry.unresolved_hooks_json = json.dumps(new_uh, ensure_ascii=False)
 
                 entry.memory_version = memory_version
                 stats["canonical_entries"] += 1
@@ -3197,7 +3236,10 @@ class NovelLLMService:
         return stats
 
     def _merge_memory_delta(
-        self, prev_memory_json: str, delta: dict[str, Any]
+        self,
+        prev_memory_json: str,
+        delta: dict[str, Any],
+        replace_timeline: bool = False,
     ) -> tuple[dict[str, Any], dict[str, int]]:
         prev_data = _safe_json_dict(prev_memory_json)
         data = dict(prev_data)
@@ -3222,9 +3264,14 @@ class NovelLLMService:
                 if normalized is None:
                     continue
                 chapter_no = normalized["chapter_no"]
-                canonical_map[chapter_no] = self._merge_timeline_entry(
-                    canonical_map.get(chapter_no, {"chapter_no": chapter_no}), normalized
-                )
+                if replace_timeline:
+                    # 刷新模式：直接覆盖该章节的时间线条目
+                    canonical_map[chapter_no] = normalized
+                else:
+                    # 增量模式：合并
+                    canonical_map[chapter_no] = self._merge_timeline_entry(
+                        canonical_map.get(chapter_no, {"chapter_no": chapter_no}), normalized
+                    )
                 stats["canonical_entries"] += 1
 
         ordered_timeline = [canonical_map[k] for k in sorted(canonical_map.keys())]
@@ -3783,6 +3830,8 @@ class NovelLLMService:
         chapters_summary: str,
         prev_memory: str,
         db: Any = None,
+        replace_timeline: bool = False,
+        skip_snapshot: bool = False,
     ) -> dict[str, Any]:
         router = self._router(db=db)
         raw = await self._chat_text_with_timeout_retry(
@@ -3835,7 +3884,7 @@ class NovelLLMService:
             }
         
         # 1. 计算合并后的 JSON (用于校验和快照)
-        merged, stats = self._merge_memory_delta(prev_memory, delta)
+        merged, stats = self._merge_memory_delta(prev_memory, delta, replace_timeline=replace_timeline)
         candidate_json = self._postprocess_memory_layers(
             json.dumps(merged, ensure_ascii=False), prev_memory_json=prev_memory
         )
@@ -3877,7 +3926,9 @@ class NovelLLMService:
                 # 使用 Savepoint 保护事务，防止局部失败导致全局回滚（如章节审批状态丢失）
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1
-                    db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
+                    db_stats = self._upsert_normalized_memory_from_delta(
+                        db, novel.id, delta, new_version, replace_timeline=replace_timeline
+                    )
                     # 合并统计信息
                     for k, v in db_stats.items():
                         stats[k] = max(stats.get(k, 0), v)
@@ -3896,22 +3947,24 @@ class NovelLLMService:
                         outline.memory_version = new_version
 
                     # 真源为规范化表：快照由分表派生
-                    snap_ver = sync_json_snapshot_from_normalized(
-                        db, novel.id, summary="规范化存储自动快照（batch/incremental）"
-                    )
-                    new_version = snap_ver
+                    if not skip_snapshot:
+                        snap_ver = sync_json_snapshot_from_normalized(
+                            db, novel.id, summary="规范化存储自动快照（batch/incremental）"
+                        )
+                        new_version = snap_ver
                 
                 # 显式 flush 确保状态可见，但由外部调用者（Router）负责最终 commit
                 db.flush()
                 
-                latest_row = (
-                    db.query(NovelMemory)
-                    .filter(NovelMemory.novel_id == novel.id)
-                    .order_by(NovelMemory.version.desc())
-                    .first()
-                )
-                if latest_row and latest_row.payload_json:
-                    candidate_json = latest_row.payload_json
+                if not skip_snapshot:
+                    latest_row = (
+                        db.query(NovelMemory)
+                        .filter(NovelMemory.novel_id == novel.id)
+                        .order_by(NovelMemory.version.desc())
+                        .first()
+                    )
+                    if latest_row and latest_row.payload_json:
+                        candidate_json = latest_row.payload_json
             except Exception as e:
                 # 局部回滚 Savepoint，不影响外部事务（如章节审批状态）
                 logger.exception("Failed to update normalized memory tables (savepoint rolled back): %s", e)
@@ -3937,6 +3990,8 @@ class NovelLLMService:
         chapters_summary: str,
         prev_memory: str,
         db: Any = None,
+        replace_timeline: bool = False,
+        skip_snapshot: bool = False,
     ) -> dict[str, Any]:
         router = self._router(db=db)
         raw = self._chat_text_sync_with_timeout_retry(
@@ -3989,7 +4044,7 @@ class NovelLLMService:
             }
         
         # 1. 计算合并后的 JSON (用于校验和快照)
-        merged, stats = self._merge_memory_delta(prev_memory, delta)
+        merged, stats = self._merge_memory_delta(prev_memory, delta, replace_timeline=replace_timeline)
         candidate_json = self._postprocess_memory_layers(
             json.dumps(merged, ensure_ascii=False), prev_memory_json=prev_memory
         )
@@ -4030,7 +4085,9 @@ class NovelLLMService:
             try:
                 with db.begin_nested():
                     new_version = self._get_latest_memory_version(db, novel.id) + 1
-                    db_stats = self._upsert_normalized_memory_from_delta(db, novel.id, delta, new_version)
+                    db_stats = self._upsert_normalized_memory_from_delta(
+                        db, novel.id, delta, new_version, replace_timeline=replace_timeline
+                    )
                     # 合并统计信息
                     for k, v in db_stats.items():
                         stats[k] = max(stats.get(k, 0), v)
@@ -4048,21 +4105,23 @@ class NovelLLMService:
                     else:
                         outline.memory_version = new_version
 
-                    snap_ver = sync_json_snapshot_from_normalized(
-                        db, novel.id, summary="规范化存储自动快照（batch_sync/incremental）"
-                    )
-                    new_version = snap_ver
+                    if not skip_snapshot:
+                        snap_ver = sync_json_snapshot_from_normalized(
+                            db, novel.id, summary="规范化存储自动快照（batch_sync/incremental）"
+                        )
+                        new_version = snap_ver
                 
                 db.flush()
                 
-                latest_row = (
-                    db.query(NovelMemory)
-                    .filter(NovelMemory.novel_id == novel.id)
-                    .order_by(NovelMemory.version.desc())
-                    .first()
-                )
-                if latest_row and latest_row.payload_json:
-                    candidate_json = latest_row.payload_json
+                if not skip_snapshot:
+                    latest_row = (
+                        db.query(NovelMemory)
+                        .filter(NovelMemory.novel_id == novel.id)
+                        .order_by(NovelMemory.version.desc())
+                        .first()
+                    )
+                    if latest_row and latest_row.payload_json:
+                        candidate_json = latest_row.payload_json
             except Exception as e:
                 logger.exception("Failed to update normalized memory tables (sync savepoint): %s", e)
         
@@ -4081,7 +4140,12 @@ class NovelLLMService:
         }
 
     async def refresh_memory_from_chapters(
-        self, novel: Novel, chapters_summary: str, prev_memory: str, db: Any = None
+        self,
+        novel: Novel,
+        chapters_summary: str,
+        prev_memory: str,
+        db: Any = None,
+        replace_timeline: bool = False,
     ) -> dict[str, Any]:
         """刷新记忆，采用增量抽取 + 代码合并。"""
         batch_chars = settings.novel_memory_refresh_batch_chars
@@ -4092,7 +4156,12 @@ class NovelLLMService:
             batch_chars,
         )
         current_memory = prev_memory
-        total_stats = {"canonical_entries": 0, "open_plots_added": 0, "open_plots_resolved": 0, "characters_updated": 0}
+        total_stats = {
+            "canonical_entries": 0,
+            "open_plots_added": 0,
+            "open_plots_resolved": 0,
+            "characters_updated": 0,
+        }
         collected_warnings: list[str] = []
         collected_auto_pass_notes: list[str] = []
         batch_num = 0
@@ -4108,8 +4177,15 @@ class NovelLLMService:
             if not batch_summary:
                 pos = end
                 continue
+            
+            is_last_batch = (end >= summary_len)
             result = await self._apply_memory_delta_batch(
-                novel, batch_summary, current_memory, db=db
+                novel,
+                batch_summary,
+                current_memory,
+                db=db,
+                replace_timeline=replace_timeline,
+                skip_snapshot=not is_last_batch,
             )
             if not result["ok"]:
                 result["batch"] = batch_num
@@ -4120,6 +4196,7 @@ class NovelLLMService:
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
+        
         out: dict[str, Any] = {
             "ok": True,
             "status": "warning" if collected_warnings else "ok",
@@ -4136,13 +4213,23 @@ class NovelLLMService:
         return out
 
     def refresh_memory_from_chapters_sync(
-        self, novel: Novel, chapters_summary: str, prev_memory: str, db: Any = None
+        self,
+        novel: Novel,
+        chapters_summary: str,
+        prev_memory: str,
+        db: Any = None,
+        replace_timeline: bool = False,
     ) -> dict[str, Any]:
         """同步版本的记忆刷新，采用增量抽取 + 代码合并。"""
         batch_chars = settings.novel_memory_refresh_batch_chars
         summary_len = len(chapters_summary or "")
         current_memory = prev_memory
-        total_stats = {"canonical_entries": 0, "open_plots_added": 0, "open_plots_resolved": 0, "characters_updated": 0}
+        total_stats = {
+            "canonical_entries": 0,
+            "open_plots_added": 0,
+            "open_plots_resolved": 0,
+            "characters_updated": 0,
+        }
         collected_warnings: list[str] = []
         collected_auto_pass_notes: list[str] = []
         batch_num = 0
@@ -4158,8 +4245,16 @@ class NovelLLMService:
             if not batch_summary:
                 pos = end
                 continue
+            
+            # 如果还有下一批，则跳过快照生成，只更新规范化表
+            is_last_batch = (end >= summary_len)
             result = self._apply_memory_delta_batch_sync(
-                novel, batch_summary, current_memory, db=db
+                novel,
+                batch_summary,
+                current_memory,
+                db=db,
+                replace_timeline=replace_timeline,
+                skip_snapshot=not is_last_batch,
             )
             if not result["ok"]:
                 result["batch"] = batch_num
@@ -4170,6 +4265,7 @@ class NovelLLMService:
             for key in total_stats:
                 total_stats[key] += int(result.get("stats", {}).get(key, 0))
             pos = end
+        
         out_sync: dict[str, Any] = {
             "ok": True,
             "status": "warning" if collected_warnings else "ok",
