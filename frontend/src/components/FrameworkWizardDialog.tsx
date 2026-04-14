@@ -13,9 +13,11 @@ import { Label } from "@/components/ui/label";
 import {
   autoGenerateChapters,
   batchReplaceNames,
+  generateFramework,
   regenerateFramework,
   updateFrameworkCharacters,
   waitForFrameworkCharactersBatch,
+  waitForFrameworkGenerateBatch,
   waitForFrameworkRegenerateBatch,
 } from "@/services/novelApi";
 import { ensureLlmReady } from "@/services/llmReady";
@@ -56,6 +58,7 @@ export function FrameworkWizardDialog(props: {
   frameworkConfirmed: boolean;
   frameworkMarkdown: string;
   frameworkJson: string;
+  status: string;
   onReload: () => Promise<void>;
   onConfirmFramework: () => Promise<void>;
 }) {
@@ -102,6 +105,24 @@ export function FrameworkWizardDialog(props: {
       setRegenInstruction("");
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "重生成大纲失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runRetryInitialFramework() {
+    setErr(null);
+    setBusy(true);
+    try {
+      const r = await generateFramework(props.novelId);
+      const bid = r.batch_id;
+      if (r.status === "queued" && bid) {
+        const o = await waitForFrameworkGenerateBatch(props.novelId, bid);
+        if (o === "failed") throw new Error("生成大纲失败，请查看生成日志");
+      }
+      await props.onReload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "重新生成大纲失败");
     } finally {
       setBusy(false);
     }
@@ -244,12 +265,33 @@ export function FrameworkWizardDialog(props: {
                 大纲草案（可先浏览确认）
               </Label>
               {!props.frameworkMarkdown ? (
-                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
-                    <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-                  </div>
-                  <p className="font-bold text-base">AI 正在努力构思全书大纲中...</p>
-                  <p className="text-xs opacity-60 max-w-xs">这通常需要 15-30 秒，构思完成后此页面将自动刷新并显示内容。</p>
+                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 text-center">
+                  {props.status === "failed" ? (
+                    <>
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-destructive/10">
+                        <div className="h-4 w-4 rounded-full bg-destructive" />
+                      </div>
+                      <p className="font-bold text-base text-destructive">大纲生成任务似乎失败了</p>
+                      <p className="text-xs opacity-60 max-w-xs mb-2">你可以尝试重新触发生成任务，或者稍后在生成日志中查看原因。</p>
+                      <Button 
+                        size="sm" 
+                        variant="outline" 
+                        className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
+                        onClick={() => void runRetryInitialFramework()}
+                        disabled={busy}
+                      >
+                        {busy ? "重试中..." : "手动重试生成大纲"}
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+                        <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                      </div>
+                      <p className="font-bold text-base animate-pulse">AI 正在努力构思全书大纲中...</p>
+                      <p className="text-xs opacity-60 max-w-xs">这通常需要 15-30 秒，构思完成后此页面将自动刷新并显示内容。</p>
+                    </>
+                  )}
                 </div>
               ) : (
                 <textarea

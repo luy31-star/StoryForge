@@ -734,6 +734,24 @@ export async function waitForFrameworkRegenerateBatch(
   throw new Error("等待重生成大纲超时，请稍后在生成日志中查看");
 }
 
+export async function waitForFrameworkGenerateBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 160 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("framework_generate_done")) return "done";
+    if (ev.has("framework_generate_failed") || ev.has("framework_generate_enqueue_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待生成大纲超时，请稍后在生成日志中查看");
+}
+
 export async function waitForFrameworkCharactersBatch(
   novelId: string,
   batchId: string,

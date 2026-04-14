@@ -2068,6 +2068,7 @@ export function NovelWorkspace() {
           frameworkConfirmed={frameworkConfirmed}
           frameworkMarkdown={fwMd}
           frameworkJson={fwJson}
+          status={novel?.status || ""}
           onReload={reload}
           onConfirmFramework={async () => {
             await confirmFramework(id, fwMd, fwJson);
@@ -2178,21 +2179,43 @@ export function NovelWorkspace() {
                 <p className="mt-2 text-sm font-bold text-foreground">
                   {frameworkConfirmed
                     ? "去卷与计划区推进章节"
-                    : !fwMd && novel?.status === "draft"
-                      ? "AI 正在飞速构思，请稍候片刻"
-                      : "进入“修改向导”确认大纲"}
+                    : novel?.status === "failed"
+                      ? "AI 构思似乎失败了，请尝试重试"
+                      : !fwMd && novel?.status === "draft"
+                        ? "AI 正在飞速构思，请稍候片刻"
+                        : "进入“修改向导”确认大纲"}
                 </p>
               </div>
             </div>
             <div className="relative">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定大纲文本（可编辑后再确认）</Label>
-              {!fwMd && novel?.status === "draft" ? (
-                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse">
-                  <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
-                    <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-                  </div>
-                  <p className="font-bold">AI 正在飞速构思全书大纲，请稍候片刻...</p>
-                  <p className="text-xs opacity-60">构思完成后大纲将自动出现</p>
+              {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
+                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
+                  {novel?.status === "failed" ? (
+                    <>
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-destructive/10">
+                        <div className="h-4 w-4 rounded-full bg-destructive" />
+                      </div>
+                      <p className="font-bold text-base text-destructive">AI 构思似乎失败了</p>
+                      <p className="text-xs opacity-60 max-w-xs mb-2">可能是网络波动或 AI 解析错误。建议点击下方“修改向导”进行手动重试。</p>
+                      <Button 
+                        size="sm" 
+                        variant="outline" 
+                        className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
+                        onClick={() => setFrameworkWizardOpen(true)}
+                      >
+                        进入修改向导重试
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
+                        <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
+                      </div>
+                      <p className="font-bold">AI 正在飞速构思全书大纲，请稍候片刻...</p>
+                      <p className="text-xs opacity-60">构思完成后大纲将自动出现</p>
+                    </>
+                  )}
                 </div>
               ) : (
                 <textarea
