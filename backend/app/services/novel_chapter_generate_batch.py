@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.novel import Chapter, Novel
 from app.models.volume import NovelChapterPlan
+from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.novel_generation_common import (
     append_generation_log,
     build_chapter_plan_hint,
@@ -133,6 +134,7 @@ def run_generate_chapters_batch_sync(
             beats = json.loads(plan.beats_json or "{}")
         except Exception:
             beats = {}
+        beats = normalize_beats_to_v2(beats)
         try:
             added = json.loads(plan.open_plots_intent_added_json or "[]")
         except Exception:

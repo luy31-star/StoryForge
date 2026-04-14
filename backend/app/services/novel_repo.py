@@ -21,6 +21,11 @@ from app.models.novel_memory_norm import (
     NovelMemoryNormRelation,
     NovelMemoryNormSkill,
 )
+from app.services.chapter_plan_schema import (
+    chapter_plan_goal,
+    chapter_plan_turn,
+    normalize_beats_to_v2,
+)
 from app.services.memory_schema import extract_aliases, memory_schema_guide
 
 
@@ -1339,9 +1344,10 @@ def format_volume_event_summary(
             beats = json.loads(plan.beats_json or "{}")
         except json.JSONDecodeError:
             beats = {}
+        beats = normalize_beats_to_v2(beats)
 
-        goal = beats.get("goal", "")
-        turn = beats.get("turn", "")
+        goal = chapter_plan_goal(beats)
+        turn = chapter_plan_turn(beats)
 
         event_desc = ""
         if turn:

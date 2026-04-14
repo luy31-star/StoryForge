@@ -18,6 +18,10 @@ from app.core.deps import get_current_user, require_novel_access
 from app.models.novel import Novel
 from app.models.user import User
 from app.models.volume import NovelChapterPlan, NovelVolume
+from app.services.chapter_plan_schema import (
+    merge_execution_card_patch,
+    normalize_beats_to_v2,
+)
 from app.services.novel_generation_common import (
     append_generation_log,
     has_pending_volume_plan_batch,
@@ -342,6 +346,21 @@ class ChapterPlanRegenerateBody(BaseModel):
     instruction: str = ""
 
 
+class ChapterPlanPatchBody(BaseModel):
+    chapter_title: str | None = None
+    beats: dict[str, Any] | None = None
+
+
+def _load_plan_beats(row: NovelChapterPlan | None) -> dict[str, Any]:
+    if not row:
+        return normalize_beats_to_v2({})
+    try:
+        beats = json.loads(row.beats_json or "{}")
+    except Exception:
+        beats = {}
+    return normalize_beats_to_v2(beats)
+
+
 @router.post("/{volume_id}/chapter-plan/{chapter_no}/regenerate")
 async def regenerate_chapter_plan(
     novel_id: str,
@@ -394,10 +413,7 @@ async def regenerate_chapter_plan(
     )
 
     def row_to_dict(r):
-        try:
-            beats = json.loads(r.beats_json or "{}")
-        except:
-            beats = {}
+        beats = _load_plan_beats(r)
         return {
             "chapter_no": r.chapter_no,
             "title": r.chapter_title,
@@ -421,7 +437,7 @@ async def regenerate_chapter_plan(
 
     # 落库更新
     title = new_data.get("title") or f"第{chapter_no}章"
-    beats = new_data.get("beats") or {}
+    beats = normalize_beats_to_v2(new_data.get("beats") or {})
     added = new_data.get("open_plots_intent_added") or []
     resolved = new_data.get("open_plots_intent_resolved") or []
 
@@ -447,6 +463,65 @@ async def regenerate_chapter_plan(
     
     db.commit()
     return {"status": "ok", "chapter_no": chapter_no, "title": title}
+
+
+@router.patch("/{volume_id}/chapter-plan/{chapter_no}")
+def patch_chapter_plan(
+    novel_id: str,
+    volume_id: str,
+    chapter_no: int,
+    body: ChapterPlanPatchBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    v = db.get(NovelVolume, volume_id)
+    if not v or v.novel_id != novel_id:
+        raise HTTPException(404, "卷不存在")
+    row = (
+        db.query(NovelChapterPlan)
+        .filter(
+            NovelChapterPlan.volume_id == volume_id,
+            NovelChapterPlan.chapter_no == chapter_no,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "章计划不存在")
+    if row.status == "locked":
+        raise HTTPException(400, "该章节计划已锁定，无法编辑执行卡")
+
+    changed = False
+    if body.chapter_title is not None:
+        row.chapter_title = (body.chapter_title.strip() or f"第{chapter_no}章")[:512]
+        changed = True
+    if body.beats is not None:
+        merged = merge_execution_card_patch(
+            _load_plan_beats(row),
+            body.beats,
+            editor_id=str(user.id) if getattr(user, "id", None) else None,
+        )
+        row.beats_json = json.dumps(merged, ensure_ascii=False)
+        changed = True
+
+    if not changed:
+        return {
+            "status": "ok",
+            "chapter_no": chapter_no,
+            "chapter_title": row.chapter_title,
+            "beats": _load_plan_beats(row),
+        }
+
+    if row.status == "revised":
+        row.status = "planned"
+    db.commit()
+    db.refresh(row)
+    return {
+        "status": "ok",
+        "chapter_no": chapter_no,
+        "chapter_title": row.chapter_title,
+        "beats": _load_plan_beats(row),
+    }
 
 
 @router.delete("/{volume_id}/chapter-plan")
@@ -503,10 +578,7 @@ def list_volume_chapter_plan(
     )
     out: list[dict[str, Any]] = []
     for r in rows:
-        try:
-            beats = json.loads(r.beats_json or "{}")
-        except Exception:
-            beats = {}
+        beats = _load_plan_beats(r)
         out.append(
             {
                 "id": r.id,

@@ -30,6 +30,11 @@ from app.models.novel_memory_norm import (
 )
 from app.services.memory_normalize_sync import sync_json_snapshot_from_normalized
 from app.services.ai302_client import AI302Client
+from app.services.chapter_plan_schema import (
+    chapter_plan_hook,
+    chapter_plan_plot_summary,
+    normalize_beats_to_v2,
+)
 from app.services.llm_router import LLMRouter
 from app.services.novel_repo import (
     build_hot_memory_for_prompt,
@@ -1219,6 +1224,8 @@ class NovelLLMService:
             )
         for i, ch in enumerate(sorted_ch):
             ch["chapter_no"] = batch_start + i
+            beats = ch.get("beats")
+            ch["beats"] = normalize_beats_to_v2(beats if isinstance(beats, dict) else {})
         return sorted_ch
 
     def _validate_merged_volume_plan_chapters(
@@ -1732,6 +1739,7 @@ class NovelLLMService:
             if "chapters" in data and isinstance(data["chapters"], list) and len(data["chapters"]) > 0:
                 data = data["chapters"][0]
             data["chapter_no"] = chapter_no # 强制修正
+            data["beats"] = normalize_beats_to_v2(data.get("beats") or {})
             return data
         except Exception as e:
             logger.error("regenerate_single_chapter_plan parse failed: %s | resp=%r", e, resp[:500])
@@ -1757,9 +1765,9 @@ class NovelLLMService:
                 continue
             ch_no = ch.get("chapter_no", "?")
             title = ch.get("title", "")
-            beats = ch.get("beats", {})
-            plot_summary = beats.get("plot_summary", "") if isinstance(beats, dict) else ""
-            hook = beats.get("hook", "") if isinstance(beats, dict) else ""
+            beats = normalize_beats_to_v2(ch.get("beats", {}))
+            plot_summary = chapter_plan_plot_summary(beats)
+            hook = chapter_plan_hook(beats)
 
             # 收集新增和解决的 open_plots
             added = ch.get("open_plots_intent_added", [])

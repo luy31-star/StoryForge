@@ -15,6 +15,11 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.novel import Novel
 from app.models.volume import NovelChapterPlan, NovelVolume
+from app.services.chapter_plan_schema import (
+    chapter_plan_hook,
+    chapter_plan_plot_summary,
+    normalize_beats_to_v2,
+)
 from app.services.novel_generation_common import append_generation_log
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_repo import latest_memory_json
@@ -93,8 +98,9 @@ def build_prev_batch_context_from_db(
             beats = json.loads(r.beats_json or "{}")
         except Exception:
             beats = {}
-        plot_summary = beats.get("plot_summary", "") if isinstance(beats, dict) else ""
-        hook = beats.get("hook", "") if isinstance(beats, dict) else ""
+        beats = normalize_beats_to_v2(beats)
+        plot_summary = chapter_plan_plot_summary(beats)
+        hook = chapter_plan_hook(beats)
         try:
             added = json.loads(r.open_plots_intent_added_json or "[]")
         except Exception:
@@ -274,6 +280,7 @@ def run_volume_chapter_plan_batch_sync(
             title = f"第{cn}章"
         if not isinstance(beats, dict):
             beats = {}
+        beats = normalize_beats_to_v2(beats)
         added = item.get("open_plots_intent_added")
         resolved = item.get("open_plots_intent_resolved")
         added_list = (

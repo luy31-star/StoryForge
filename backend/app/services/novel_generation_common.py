@@ -16,6 +16,7 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.novel import NovelGenerationLog
+from app.services.chapter_plan_schema import normalize_beats_to_v2
 
 
 def memory_refresh_confirmation_token(
@@ -106,6 +107,15 @@ def build_chapter_plan_hint(
     并明确每个章节的执行检查点，确保 LLM 按步骤完成而非跳过。
     """
     _ = chapter_no  # 保留参数与路由层一致
+    normalized = normalize_beats_to_v2(beats)
+    meta = normalized.get("meta", {}) if isinstance(normalized, dict) else {}
+    summary = (
+        normalized.get("display_summary", {}) if isinstance(normalized, dict) else {}
+    )
+    card = (
+        normalized.get("execution_card", {}) if isinstance(normalized, dict) else {}
+    )
+
     lines: list[str] = [
         "【本章执行清单（逐项勾选，禁止跳过）】",
         f"计划章名：{plan_title}",
@@ -113,10 +123,13 @@ def build_chapter_plan_hint(
         "=== 执行检查点（完成后勾选） ===",
     ]
 
-    goal = beats.get("goal", "")
-    conflict = beats.get("conflict", "")
-    turn = beats.get("turn", "")
-    hook = beats.get("hook", "")
+    if meta.get("edited_by_user"):
+        lines.append("[ ] 该执行卡已被用户手动编辑，优先按执行卡写作，不得自行改意图")
+
+    goal = card.get("chapter_goal", "")
+    conflict = card.get("core_conflict", "")
+    turn = card.get("key_turn", "")
+    hook = card.get("ending_hook", "")
 
     if isinstance(goal, str) and goal.strip():
         lines.append(f"[ ] 开局目标：{goal.strip()}")
@@ -127,13 +140,33 @@ def build_chapter_plan_hint(
     if isinstance(hook, str) and hook.strip():
         lines.append(f"[ ] 结尾钩子：{hook.strip()}")
 
+    must_happen = card.get("must_happen")
+    if isinstance(must_happen, list) and must_happen:
+        bullets = "\n".join(f"  [ ] 必须发生：{str(x).strip()}" for x in must_happen if str(x).strip())
+        if bullets:
+            lines.append(bullets)
+
+    callbacks = card.get("required_callbacks")
+    if isinstance(callbacks, list) and callbacks:
+        bullets = "\n".join(f"  [ ] 必须承接：{str(x).strip()}" for x in callbacks if str(x).strip())
+        if bullets:
+            lines.append(bullets)
+
     lines.append("")
 
-    ps = beats.get("plot_summary")
+    if isinstance(summary.get("stage_position"), str) and summary.get("stage_position", "").strip():
+        lines.append(f"=== 本章阶段位置 ===\n{summary['stage_position'].strip()}")
+    if isinstance(summary.get("pacing_justification"), str) and summary.get("pacing_justification", "").strip():
+        lines.append(f"=== 节奏护栏说明 ===\n{summary['pacing_justification'].strip()}")
+
+    ps = summary.get("plot_summary")
     scenes: list[dict[str, Any]] = []
-    if isinstance(ps, list):
+    raw_scene_cards = card.get("scene_cards")
+    if isinstance(raw_scene_cards, list):
+        scenes = [s for s in raw_scene_cards if isinstance(s, dict)]
+    elif isinstance(ps, list):
         scenes = [s for s in ps if isinstance(s, dict)]
-    elif isinstance(ps, str) and ps.strip():
+    if isinstance(ps, str) and ps.strip():
         lines.append(f"=== 本章剧情梗概 ===\n{ps.strip()}")
 
     if scenes:
@@ -143,7 +176,9 @@ def build_chapter_plan_hint(
             if not isinstance(scene, dict):
                 continue
             scene_goal = scene.get("goal", "")
+            scene_conflict = scene.get("conflict", "")
             scene_content = scene.get("content", "")
+            scene_outcome = scene.get("outcome", "")
             scene_words = scene.get("words", 600)
             if isinstance(scene_words, int) and scene_words > 0:
                 total_words += scene_words
@@ -153,14 +188,18 @@ def build_chapter_plan_hint(
             lines.append(f"\n场景{i}:")
             if scene_goal:
                 lines.append(f"  [ ] 目标：{scene_goal}")
+            if scene_conflict:
+                lines.append(f"  冲突：{scene_conflict}")
             if scene_content:
                 lines.append(f"  内容：{scene_content}")
+            if scene_outcome:
+                lines.append(f"  收束：{scene_outcome}")
             lines.append(f"  建议字数：约{scene_words}字")
         lines.append(f"\n本章建议总字数：{total_words}字")
 
     lines.append("")
 
-    pa = beats.get("progress_allowed")
+    pa = card.get("allowed_progress")
     if isinstance(pa, str) and pa.strip():
         lines.append(f"=== 进度边界·允许推进 ===\n{pa.strip()}")
     elif isinstance(pa, list) and pa:
@@ -168,13 +207,13 @@ def build_chapter_plan_hint(
         if bullets:
             lines.append(f"=== 进度边界·允许推进 ===\n{bullets}")
 
-    mn = beats.get("must_not")
+    mn = card.get("must_not")
     if isinstance(mn, list) and mn:
         bullets = "\n".join(f"  [ ] 禁止：{x}" for x in mn if str(x).strip())
         if bullets:
             lines.append(f"\n=== 绝对禁止（违反视为不合格） ===\n{bullets}")
 
-    rsv = beats.get("reserved_for_later")
+    rsv = card.get("reserved_for_later")
     if isinstance(rsv, list) and rsv:
         parts: list[str] = []
         for it in rsv:
@@ -182,17 +221,44 @@ def build_chapter_plan_hint(
                 continue
             item = it.get("item")
             nb = it.get("not_before_chapter")
+            reason = it.get("reason")
             if not (isinstance(item, str) and item.strip()):
                 continue
             item_s = item.strip()
             if isinstance(nb, int):
-                parts.append(
-                    f"  [ ] 禁写「{item_s}」——须在第{nb}章及之后才可出现"
-                )
+                msg = f"  [ ] 禁写「{item_s}」——须在第{nb}章及之后才可出现"
             else:
-                parts.append(f"  [ ] 禁写「{item_s}」——留待后续章")
+                msg = f"  [ ] 禁写「{item_s}」——留待后续章"
+            if isinstance(reason, str) and reason.strip():
+                msg += f"（{reason.strip()}）"
+            parts.append(msg)
         if parts:
             lines.append("\n=== 延后解锁（当前章不得写出） ===\n" + "\n".join(parts))
+
+    end_state_targets = card.get("end_state_targets")
+    if isinstance(end_state_targets, dict):
+        sections: list[str] = []
+        labels = {
+            "characters": "角色状态",
+            "relations": "关系状态",
+            "items": "物品状态",
+            "plots": "线索状态",
+        }
+        for key, label in labels.items():
+            value = end_state_targets.get(key)
+            if not isinstance(value, list):
+                continue
+            bullets = [str(x).strip() for x in value if str(x).strip()]
+            if bullets:
+                sections.append(f"{label}：\n" + "\n".join(f"  · {x}" for x in bullets))
+        if sections:
+            lines.append("\n=== 本章结束状态目标 ===\n" + "\n\n".join(sections))
+
+    style_guardrails = card.get("style_guardrails")
+    if isinstance(style_guardrails, list) and style_guardrails:
+        bullets = "\n".join(f"  [ ] 风格要求：{x}" for x in style_guardrails if str(x).strip())
+        if bullets:
+            lines.append("\n=== 风格护栏 ===\n" + bullets)
 
     lines.append("")
 

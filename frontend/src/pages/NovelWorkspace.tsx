@@ -50,11 +50,14 @@ import {
   getNovel,
   listChapters,
   patchChapter,
+  patchChapterPlan,
   patchNovel,
   refreshMemory,
   regenerateChapterPlan,
   retryChapterMemory,
   reviseChapter,
+  type ChapterPlanReservedItem,
+  type ChapterPlanV2Beats,
   waitForChapterConsistencyBatch,
   waitForChapterGenerationBatch,
   waitForChapterReviseBatch,
@@ -85,6 +88,43 @@ function safeJsonStringify(data: unknown): string {
     return String(data);
   }
 }
+
+type NormalizedPlanBeats = {
+  schema_version: number;
+  meta: {
+    edited_by_user: boolean;
+    last_editor_id: string | null;
+    last_edited_at: string | null;
+  };
+  display_summary: {
+    plot_summary: string;
+    stage_position: string;
+    pacing_justification: string;
+  };
+  execution_card: {
+    chapter_goal: string;
+    core_conflict: string;
+    key_turn: string;
+    must_happen: string[];
+    required_callbacks: string[];
+    scene_cards: ChapterPlanV2Beats["execution_card"] extends infer T
+      ? T extends { scene_cards?: infer S }
+        ? NonNullable<S>
+        : []
+      : [];
+    allowed_progress: string[];
+    must_not: string[];
+    reserved_for_later: ChapterPlanReservedItem[];
+    end_state_targets: {
+      characters: string[];
+      relations: string[];
+      items: string[];
+      plots: string[];
+    };
+    ending_hook: string;
+    style_guardrails: string[];
+  };
+};
 
 function isJsonLikeText(value: string): boolean {
   const trimmed = value.trim();
@@ -126,60 +166,226 @@ function inventoryDisplaySummary(
 }
 
 function formatVolumePlanBeatsText(beats: unknown): string {
-  if (!beats || typeof beats !== "object" || Array.isArray(beats)) {
-    return typeof beats === "string" ? beats : JSON.stringify(beats);
-  }
-  const b = beats as Record<string, unknown>;
+  const b = normalizePlanBeats(beats);
   const lines: string[] = [];
-  if (typeof b.plot_summary === "string" && b.plot_summary.trim()) {
-    lines.push(`梗概：${b.plot_summary.trim()}`);
+  if (b.meta.edited_by_user) lines.push("已由用户手动编辑执行卡");
+  if (b.execution_card.chapter_goal) lines.push(`本章目标：${b.execution_card.chapter_goal}`);
+  if (b.execution_card.core_conflict) lines.push(`核心冲突：${b.execution_card.core_conflict}`);
+  if (b.execution_card.key_turn) lines.push(`关键转折：${b.execution_card.key_turn}`);
+  if (b.display_summary.plot_summary) lines.push(`剧情梗概：${b.display_summary.plot_summary}`);
+  if (b.display_summary.stage_position) lines.push(`阶段位置：${b.display_summary.stage_position}`);
+  if (b.display_summary.pacing_justification) {
+    lines.push(`节奏说明：${b.display_summary.pacing_justification}`);
   }
-  if (typeof b.stage_position === "string" && b.stage_position.trim()) {
-    lines.push(`阶段位置：${b.stage_position.trim()}`);
+  const mustHappen = b.execution_card.must_happen;
+  if (mustHappen.length) {
+    lines.push(`必须发生：\n${mustHappen.map((x) => `  · ${x}`).join("\n")}`);
   }
-  if (typeof b.pacing_justification === "string" && b.pacing_justification.trim()) {
-    lines.push(`节奏说明：${b.pacing_justification.trim()}`);
+  const callbacks = b.execution_card.required_callbacks;
+  if (callbacks.length) {
+    lines.push(`必须承接：\n${callbacks.map((x) => `  · ${x}`).join("\n")}`);
   }
-  const pa = b.progress_allowed;
-  if (typeof pa === "string" && pa.trim()) {
-    lines.push(`允许推进：${pa.trim()}`);
-  } else if (Array.isArray(pa) && pa.length) {
-    lines.push(`允许推进：\n${pa.map((x) => `  · ${String(x)}`).join("\n")}`);
+  const pa = b.execution_card.allowed_progress;
+  if (pa.length) {
+    lines.push(`允许推进：\n${pa.map((x) => `  · ${x}`).join("\n")}`);
   }
-  if (Array.isArray(b.must_not) && b.must_not.length) {
-    lines.push(`禁止：\n${b.must_not.map((x) => `  · ${String(x)}`).join("\n")}`);
+  if (b.execution_card.must_not.length) {
+    lines.push(`禁止：\n${b.execution_card.must_not.map((x) => `  · ${x}`).join("\n")}`);
   }
-  const rsv = b.reserved_for_later;
-  if (Array.isArray(rsv) && rsv.length) {
+  const rsv = b.execution_card.reserved_for_later;
+  if (rsv.length) {
     const parts = rsv
       .map((item) => {
-        if (item && typeof item === "object" && !Array.isArray(item)) {
-          const o = item as Record<string, unknown>;
-          const it = o.item;
-          const nb = o.not_before_chapter;
-          if (typeof it === "string" && it.trim()) {
-            return typeof nb === "number"
-              ? `  · 「${it.trim()}」须第${nb}章及之后`
-              : `  · 「${it.trim()}」延后`;
-          }
-        }
-        return "";
+        const note = item.reason?.trim() ? `（${item.reason.trim()}）` : "";
+        return typeof item.not_before_chapter === "number"
+          ? `  · 「${item.item}」须第${item.not_before_chapter}章及之后${note}`
+          : `  · 「${item.item}」延后${note}`;
       })
       .filter(Boolean);
     if (parts.length) lines.push(`延后解锁：\n${parts.join("\n")}`);
   }
-  if (
-    typeof b.goal === "string" ||
-    typeof b.conflict === "string" ||
-    typeof b.turn === "string" ||
-    typeof b.hook === "string"
-  ) {
+  if (b.execution_card.style_guardrails.length) {
     lines.push(
-      `目标：${typeof b.goal === "string" ? b.goal : ""}\n冲突：${typeof b.conflict === "string" ? b.conflict : ""}\n转折：${typeof b.turn === "string" ? b.turn : ""}\n钩子：${typeof b.hook === "string" ? b.hook : ""}`
+      `风格护栏：\n${b.execution_card.style_guardrails.map((x) => `  · ${x}`).join("\n")}`
     );
   }
-  if (!lines.length) return JSON.stringify(beats);
+  if (b.execution_card.ending_hook) lines.push(`章末钩子：${b.execution_card.ending_hook}`);
+  if (!lines.length) return typeof beats === "string" ? beats : JSON.stringify(beats);
   return lines.join("\n\n");
+}
+
+function cleanPlanText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function toPlanTextList(value: unknown): string[] {
+  if (typeof value === "string") {
+    const text = value.trim();
+    return text ? [text] : [];
+  }
+  if (!Array.isArray(value)) return [];
+  return value
+    .map((item) => (typeof item === "string" ? item.trim() : ""))
+    .filter(Boolean);
+}
+
+function toReservedItems(value: unknown): ChapterPlanReservedItem[] {
+  if (!Array.isArray(value)) return [];
+  const out: ChapterPlanReservedItem[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object" || Array.isArray(item)) continue;
+    const row = item as Record<string, unknown>;
+    const name = cleanPlanText(row.item);
+    if (!name) continue;
+    const chapter =
+      typeof row.not_before_chapter === "number"
+        ? row.not_before_chapter
+        : typeof row.not_before_chapter === "string" &&
+            row.not_before_chapter.trim() &&
+            Number.isFinite(Number(row.not_before_chapter))
+          ? Number(row.not_before_chapter)
+          : undefined;
+    const reason = cleanPlanText(row.reason);
+    out.push({
+      item: name,
+      not_before_chapter: chapter,
+      reason: reason || undefined,
+    });
+  }
+  return out;
+}
+
+function normalizePlanBeats(beats: unknown): NormalizedPlanBeats {
+  const raw =
+    beats && typeof beats === "object" && !Array.isArray(beats)
+      ? (beats as Record<string, unknown>)
+      : {};
+  const meta =
+    raw.meta && typeof raw.meta === "object" && !Array.isArray(raw.meta)
+      ? (raw.meta as Record<string, unknown>)
+      : {};
+  const display =
+    raw.display_summary &&
+    typeof raw.display_summary === "object" &&
+    !Array.isArray(raw.display_summary)
+      ? (raw.display_summary as Record<string, unknown>)
+      : {};
+  const card =
+    raw.execution_card &&
+    typeof raw.execution_card === "object" &&
+    !Array.isArray(raw.execution_card)
+      ? (raw.execution_card as Record<string, unknown>)
+      : {};
+  const reservedFromCard = toReservedItems(card.reserved_for_later);
+  const reservedFromLegacy = toReservedItems(raw.reserved_for_later);
+  return {
+    schema_version:
+      typeof raw.schema_version === "number" ? raw.schema_version : 2,
+    meta: {
+      edited_by_user: Boolean(meta.edited_by_user),
+      last_editor_id: cleanPlanText(meta.last_editor_id) || null,
+      last_edited_at: cleanPlanText(meta.last_edited_at) || null,
+    },
+    display_summary: {
+      plot_summary:
+        cleanPlanText(display.plot_summary) ||
+        (typeof raw.plot_summary === "string" ? raw.plot_summary.trim() : ""),
+      stage_position:
+        cleanPlanText(display.stage_position) ||
+        cleanPlanText(raw.stage_position),
+      pacing_justification:
+        cleanPlanText(display.pacing_justification) ||
+        cleanPlanText(raw.pacing_justification),
+    },
+    execution_card: {
+      chapter_goal:
+        cleanPlanText(card.chapter_goal) || cleanPlanText(raw.goal),
+      core_conflict:
+        cleanPlanText(card.core_conflict) || cleanPlanText(raw.conflict),
+      key_turn: cleanPlanText(card.key_turn) || cleanPlanText(raw.turn),
+      must_happen: toPlanTextList(card.must_happen),
+      required_callbacks: toPlanTextList(card.required_callbacks),
+      scene_cards: Array.isArray(card.scene_cards) ? card.scene_cards : [],
+      allowed_progress:
+        toPlanTextList(card.allowed_progress).length > 0
+          ? toPlanTextList(card.allowed_progress)
+          : toPlanTextList(raw.progress_allowed),
+      must_not:
+        toPlanTextList(card.must_not).length > 0
+          ? toPlanTextList(card.must_not)
+          : toPlanTextList(raw.must_not),
+      reserved_for_later:
+        reservedFromCard.length > 0 ? reservedFromCard : reservedFromLegacy,
+      end_state_targets:
+        card.end_state_targets &&
+        typeof card.end_state_targets === "object" &&
+        !Array.isArray(card.end_state_targets)
+          ? {
+              characters: toPlanTextList(
+                (card.end_state_targets as Record<string, unknown>).characters
+              ),
+              relations: toPlanTextList(
+                (card.end_state_targets as Record<string, unknown>).relations
+              ),
+              items: toPlanTextList(
+                (card.end_state_targets as Record<string, unknown>).items
+              ),
+              plots: toPlanTextList(
+                (card.end_state_targets as Record<string, unknown>).plots
+              ),
+            }
+          : { characters: [], relations: [], items: [], plots: [] },
+      ending_hook:
+        cleanPlanText(card.ending_hook) || cleanPlanText(raw.hook),
+      style_guardrails: toPlanTextList(card.style_guardrails),
+    },
+  };
+}
+
+function linesToEditorText(items: string[]): string {
+  return items.join("\n");
+}
+
+function editorTextToLines(value: string): string[] {
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean);
+}
+
+function reservedItemsToEditorText(items: ChapterPlanReservedItem[]): string {
+  return items
+    .map((item) => {
+      const chapter =
+        typeof item.not_before_chapter === "number"
+          ? String(item.not_before_chapter)
+          : "";
+      const reason = item.reason?.trim() ?? "";
+      return [item.item.trim(), chapter, reason].filter(Boolean).join(" | ");
+    })
+    .join("\n");
+}
+
+function editorTextToReservedItems(value: string): ChapterPlanReservedItem[] {
+  return value
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => {
+      const [itemRaw, chapterRaw = "", reasonRaw = ""] = line
+        .split("|")
+        .map((part) => part.trim());
+      const chapterNo =
+        chapterRaw && Number.isFinite(Number(chapterRaw))
+          ? Number(chapterRaw)
+          : undefined;
+      return {
+        item: itemRaw,
+        not_before_chapter: chapterNo,
+        reason: reasonRaw || undefined,
+      };
+    })
+    .filter((item) => item.item);
 }
 
 function fmtMetaValue(v: unknown): string {
@@ -364,6 +570,23 @@ export function NovelWorkspace() {
   } | null>(null);
   /** 为 false 时隐藏「已有正文/待审稿」的章计划卡片，便于往下续写 */
   const [showVolumePlanWithBody, setShowVolumePlanWithBody] = useState(false);
+  const [planEditorOpen, setPlanEditorOpen] = useState(false);
+  const [planEditorSaving, setPlanEditorSaving] = useState(false);
+  const [planEditorChapterNo, setPlanEditorChapterNo] = useState<number | null>(null);
+  const [planEditorTitle, setPlanEditorTitle] = useState("");
+  const [planEditorGoal, setPlanEditorGoal] = useState("");
+  const [planEditorConflict, setPlanEditorConflict] = useState("");
+  const [planEditorTurn, setPlanEditorTurn] = useState("");
+  const [planEditorPlotSummary, setPlanEditorPlotSummary] = useState("");
+  const [planEditorStagePosition, setPlanEditorStagePosition] = useState("");
+  const [planEditorPacing, setPlanEditorPacing] = useState("");
+  const [planEditorMustHappen, setPlanEditorMustHappen] = useState("");
+  const [planEditorCallbacks, setPlanEditorCallbacks] = useState("");
+  const [planEditorAllowedProgress, setPlanEditorAllowedProgress] = useState("");
+  const [planEditorMustNot, setPlanEditorMustNot] = useState("");
+  const [planEditorReserved, setPlanEditorReserved] = useState("");
+  const [planEditorEndingHook, setPlanEditorEndingHook] = useState("");
+  const [planEditorStyleGuardrails, setPlanEditorStyleGuardrails] = useState("");
   const [memoryHistory, setMemoryHistory] = useState<
     {
       version: number;
@@ -1452,6 +1675,71 @@ export function NovelWorkspace() {
     }
   }
 
+  function openPlanEditor(plan: Awaited<ReturnType<typeof listVolumeChapterPlan>>[number]) {
+    const beats = normalizePlanBeats(plan.beats);
+    setPlanEditorChapterNo(plan.chapter_no);
+    setPlanEditorTitle(plan.chapter_title || `第${plan.chapter_no}章`);
+    setPlanEditorGoal(beats.execution_card?.chapter_goal ?? "");
+    setPlanEditorConflict(beats.execution_card?.core_conflict ?? "");
+    setPlanEditorTurn(beats.execution_card?.key_turn ?? "");
+    setPlanEditorPlotSummary(beats.display_summary?.plot_summary ?? "");
+    setPlanEditorStagePosition(beats.display_summary?.stage_position ?? "");
+    setPlanEditorPacing(beats.display_summary?.pacing_justification ?? "");
+    setPlanEditorMustHappen(linesToEditorText(beats.execution_card?.must_happen ?? []));
+    setPlanEditorCallbacks(linesToEditorText(beats.execution_card?.required_callbacks ?? []));
+    setPlanEditorAllowedProgress(
+      linesToEditorText(beats.execution_card?.allowed_progress ?? [])
+    );
+    setPlanEditorMustNot(linesToEditorText(beats.execution_card?.must_not ?? []));
+    setPlanEditorReserved(
+      reservedItemsToEditorText(beats.execution_card?.reserved_for_later ?? [])
+    );
+    setPlanEditorEndingHook(beats.execution_card?.ending_hook ?? "");
+    setPlanEditorStyleGuardrails(
+      linesToEditorText(beats.execution_card?.style_guardrails ?? [])
+    );
+    setPlanEditorOpen(true);
+  }
+
+  async function savePlanEditor() {
+    if (!id || !selectedVolumeId || planEditorChapterNo == null) return;
+    setErr(null);
+    setNotice(null);
+    setPlanEditorSaving(true);
+    try {
+      await patchChapterPlan(id, selectedVolumeId, planEditorChapterNo, {
+        chapter_title: planEditorTitle.trim(),
+        beats: {
+          display_summary: {
+            plot_summary: planEditorPlotSummary.trim(),
+            stage_position: planEditorStagePosition.trim(),
+            pacing_justification: planEditorPacing.trim(),
+          },
+          execution_card: {
+            chapter_goal: planEditorGoal.trim(),
+            core_conflict: planEditorConflict.trim(),
+            key_turn: planEditorTurn.trim(),
+            must_happen: editorTextToLines(planEditorMustHappen),
+            required_callbacks: editorTextToLines(planEditorCallbacks),
+            allowed_progress: editorTextToLines(planEditorAllowedProgress),
+            must_not: editorTextToLines(planEditorMustNot),
+            reserved_for_later: editorTextToReservedItems(planEditorReserved),
+            ending_hook: planEditorEndingHook.trim(),
+            style_guardrails: editorTextToLines(planEditorStyleGuardrails),
+          },
+        },
+      });
+      const plan = await listVolumeChapterPlan(id, selectedVolumeId);
+      setVolumePlan(plan);
+      setPlanEditorOpen(false);
+      setNotice(`第${planEditorChapterNo}章执行卡已保存。`);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "保存执行卡失败");
+    } finally {
+      setPlanEditorSaving(false);
+    }
+  }
+
   async function runClearVolumePlans() {
     if (!id || !selectedVolumeId) return;
     if (
@@ -2463,20 +2751,38 @@ export function NovelWorkspace() {
                       ) : (
                         <div className="space-y-2">
                           {volumePlanView.visible.map((p) => (
+                            (() => {
+                              const normalized = normalizePlanBeats(p.beats);
+                              return (
                             <div
                               key={p.id}
                               className="list-card p-3.5 text-xs"
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <div className="space-y-1">
-                                  <div className="font-bold text-foreground">
+                                  <div className="flex flex-wrap items-center gap-2 font-bold text-foreground">
                                     第{p.chapter_no}章 · {p.chapter_title}
+                                    {normalized.meta?.edited_by_user ? (
+                                      <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
+                                        已手动编辑
+                                      </span>
+                                    ) : null}
                                   </div>
                                   <div className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
                                     {p.status === "locked" ? "当前计划已锁定" : "可继续调整或直接生成正文"}
                                   </div>
                                 </div>
                                 <div className="flex gap-2">
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="secondary"
+                                    className="font-semibold"
+                                    disabled={busy || volumeBusy || p.status === "locked"}
+                                    onClick={() => openPlanEditor(p)}
+                                  >
+                                    编辑执行卡
+                                  </Button>
                                   <Button
                                     type="button"
                                     size="sm"
@@ -2502,6 +2808,8 @@ export function NovelWorkspace() {
                                 {formatVolumePlanBeatsText(p.beats)}
                               </div>
                             </div>
+                              );
+                            })()
                           ))}
                         </div>
                       )}
@@ -4294,6 +4602,174 @@ export function NovelWorkspace() {
               disabled={busy}
             >
               开始刷新
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={planEditorOpen} onOpenChange={setPlanEditorOpen}>
+        <DialogContent className="max-h-[90vh] max-w-3xl overflow-hidden text-foreground">
+          <DialogHeader>
+            <DialogTitle>
+              编辑执行卡
+              {planEditorChapterNo != null ? ` · 第${planEditorChapterNo}章` : ""}
+            </DialogTitle>
+            <DialogDescription>
+              这里修改的是当前章计划的执行卡。保存后会覆盖本章计划内容，但仍兼容旧版计划结构和正文生成链路。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="soft-scroll max-h-[62vh] space-y-4 overflow-y-auto pr-1">
+            <div className="space-y-2">
+              <Label>章节标题</Label>
+              <Input
+                value={planEditorTitle}
+                onChange={(e) => setPlanEditorTitle(e.target.value)}
+                placeholder="例如：暗潮初显"
+              />
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>本章目标</Label>
+                <textarea
+                  value={planEditorGoal}
+                  onChange={(e) => setPlanEditorGoal(e.target.value)}
+                  className="field-shell-textarea min-h-[110px] text-sm"
+                  placeholder="这一章必须完成的核心目标"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>核心冲突</Label>
+                <textarea
+                  value={planEditorConflict}
+                  onChange={(e) => setPlanEditorConflict(e.target.value)}
+                  className="field-shell-textarea min-h-[110px] text-sm"
+                  placeholder="这一章最主要的对抗、阻碍或张力"
+                />
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>关键转折</Label>
+                <textarea
+                  value={planEditorTurn}
+                  onChange={(e) => setPlanEditorTurn(e.target.value)}
+                  className="field-shell-textarea min-h-[104px] text-sm"
+                  placeholder="本章中段或后段发生的关键变化"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>章末钩子</Label>
+                <textarea
+                  value={planEditorEndingHook}
+                  onChange={(e) => setPlanEditorEndingHook(e.target.value)}
+                  className="field-shell-textarea min-h-[104px] text-sm"
+                  placeholder="下一章必须自然承接的钩子"
+                />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>剧情梗概</Label>
+              <textarea
+                value={planEditorPlotSummary}
+                onChange={(e) => setPlanEditorPlotSummary(e.target.value)}
+                className="field-shell-textarea min-h-[140px] text-sm"
+                placeholder="用 5-12 句写清楚本章实际会发生什么"
+              />
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>阶段位置</Label>
+                <textarea
+                  value={planEditorStagePosition}
+                  onChange={(e) => setPlanEditorStagePosition(e.target.value)}
+                  className="field-shell-textarea min-h-[96px] text-sm"
+                  placeholder="例如：第一弧 35%，本卷仍在蓄势"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>节奏说明</Label>
+                <textarea
+                  value={planEditorPacing}
+                  onChange={(e) => setPlanEditorPacing(e.target.value)}
+                  className="field-shell-textarea min-h-[96px] text-sm"
+                  placeholder="说明为什么这一章不应越级推进"
+                />
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>必须发生</Label>
+                <textarea
+                  value={planEditorMustHappen}
+                  onChange={(e) => setPlanEditorMustHappen(e.target.value)}
+                  className="field-shell-textarea min-h-[120px] text-sm"
+                  placeholder={"每行一条\n例如：主角确认账册中的异常签名"}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>必须承接</Label>
+                <textarea
+                  value={planEditorCallbacks}
+                  onChange={(e) => setPlanEditorCallbacks(e.target.value)}
+                  className="field-shell-textarea min-h-[120px] text-sm"
+                  placeholder={"每行一条\n例如：承接上一章雨夜仓库的未解释异响"}
+                />
+              </div>
+            </div>
+            <div className="grid gap-4 md:grid-cols-2">
+              <div className="space-y-2">
+                <Label>允许推进</Label>
+                <textarea
+                  value={planEditorAllowedProgress}
+                  onChange={(e) => setPlanEditorAllowedProgress(e.target.value)}
+                  className="field-shell-textarea min-h-[120px] text-sm"
+                  placeholder={"每行一条\n例如：只允许确认身份可疑，不允许直接揭穿"}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label>绝对禁止</Label>
+                <textarea
+                  value={planEditorMustNot}
+                  onChange={(e) => setPlanEditorMustNot(e.target.value)}
+                  className="field-shell-textarea min-h-[120px] text-sm"
+                  placeholder={"每行一条\n例如：不能让配角知道主角真实能力"}
+                />
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label>延后解锁</Label>
+              <textarea
+                value={planEditorReserved}
+                onChange={(e) => setPlanEditorReserved(e.target.value)}
+                className="field-shell-textarea min-h-[120px] text-sm"
+                placeholder={"每行一条，格式：条目 | 最早章节 | 原因\n例如：玉佩真名 | 18 | 需要等祠堂线揭开"}
+              />
+            </div>
+            <div className="space-y-2">
+              <Label>风格护栏</Label>
+              <textarea
+                value={planEditorStyleGuardrails}
+                onChange={(e) => setPlanEditorStyleGuardrails(e.target.value)}
+                className="field-shell-textarea min-h-[120px] text-sm"
+                placeholder={"每行一条\n例如：减少解释腔，改为动作和对话落地"}
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button
+              type="button"
+              variant="outline"
+              onClick={() => setPlanEditorOpen(false)}
+              disabled={planEditorSaving}
+            >
+              取消
+            </Button>
+            <Button
+              type="button"
+              onClick={() => void savePlanEditor()}
+              disabled={planEditorSaving || planEditorChapterNo == null}
+            >
+              {planEditorSaving ? "保存中..." : "保存执行卡"}
             </Button>
           </DialogFooter>
         </DialogContent>

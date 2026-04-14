@@ -210,6 +210,64 @@ export async function clearVolumeChapterPlans(novelId: string, volumeId: string)
   return r.json() as Promise<{ status: string; deleted?: number }>;
 }
 
+export type ChapterPlanReservedItem = {
+  item: string;
+  not_before_chapter?: number;
+  reason?: string;
+};
+
+export type ChapterPlanSceneCard = {
+  label?: string;
+  goal?: string;
+  conflict?: string;
+  content?: string;
+  outcome?: string;
+  words?: number;
+};
+
+export type ChapterPlanV2Beats = {
+  schema_version?: number;
+  meta?: {
+    edited_by_user?: boolean;
+    last_editor_id?: string | null;
+    last_edited_at?: string | null;
+  };
+  display_summary?: {
+    plot_summary?: string;
+    stage_position?: string;
+    pacing_justification?: string;
+  };
+  execution_card?: {
+    chapter_goal?: string;
+    core_conflict?: string;
+    key_turn?: string;
+    must_happen?: string[];
+    required_callbacks?: string[];
+    scene_cards?: ChapterPlanSceneCard[];
+    allowed_progress?: string[];
+    must_not?: string[];
+    reserved_for_later?: ChapterPlanReservedItem[];
+    end_state_targets?: {
+      characters?: string[];
+      relations?: string[];
+      items?: string[];
+      plots?: string[];
+    };
+    ending_hook?: string;
+    style_guardrails?: string[];
+  };
+  goal?: string;
+  conflict?: string;
+  turn?: string;
+  hook?: string;
+  plot_summary?: string | ChapterPlanSceneCard[];
+  stage_position?: string;
+  pacing_justification?: string;
+  progress_allowed?: string | string[];
+  must_not?: string[];
+  reserved_for_later?: ChapterPlanReservedItem[];
+};
+
 export async function listVolumeChapterPlan(novelId: string, volumeId: string) {
   const r = await apiFetch(`${BASE}/${novelId}/volumes/${volumeId}/chapter-plan`);
   if (!r.ok) throw new Error(await r.text());
@@ -218,10 +276,35 @@ export async function listVolumeChapterPlan(novelId: string, volumeId: string) {
       id: string;
       chapter_no: number;
       chapter_title: string;
-      beats: Record<string, unknown>;
+      beats: ChapterPlanV2Beats;
       status: string;
     }[]
   >;
+}
+
+export async function patchChapterPlan(
+  novelId: string,
+  volumeId: string,
+  chapterNo: number,
+  payload: {
+    chapter_title?: string;
+    beats?: Partial<ChapterPlanV2Beats>;
+  }
+) {
+  const r = await apiFetch(
+    `${BASE}/${novelId}/volumes/${volumeId}/chapter-plan/${chapterNo}`,
+    {
+      method: "PATCH",
+      body: JSON.stringify(payload),
+    }
+  );
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    chapter_no: number;
+    chapter_title: string;
+    beats: ChapterPlanV2Beats;
+  }>;
 }
 
 type StreamHandlers = {
