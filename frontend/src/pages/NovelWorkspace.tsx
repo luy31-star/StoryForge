@@ -2068,7 +2068,7 @@ export function NovelWorkspace() {
           frameworkConfirmed={frameworkConfirmed}
           frameworkMarkdown={fwMd}
           frameworkJson={fwJson}
-          status={novel?.status || ""}
+          status={String(novel?.status || "")}
           onReload={reload}
           onConfirmFramework={async () => {
             await confirmFramework(id, fwMd, fwJson);
