@@ -288,7 +288,7 @@ def build_chapter_plan_hint(
 def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
     """
     是否存在未结束的章节生成批次（已入队 batch_start 或 chapter_generation_queued，
-    但尚无 batch_done / batch_failed）。
+    但尚无 batch_done / batch_failed / batch_blocked）。
     """
     rows = (
         db.query(NovelGenerationLog.batch_id)
@@ -309,7 +309,12 @@ def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
             .filter(
                 NovelGenerationLog.batch_id == bid,
                 NovelGenerationLog.event.in_(
-                    ["batch_done", "batch_failed", "chapter_generation_enqueue_failed"]
+                    [
+                        "batch_done",
+                        "batch_failed",
+                        "batch_blocked",
+                        "chapter_generation_enqueue_failed",
+                    ]
                 ),
             )
             .first()

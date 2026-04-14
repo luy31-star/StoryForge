@@ -42,6 +42,8 @@ class Novel(Base):
     daily_auto_time: Mapped[str] = mapped_column(String(16), default="14:30")
     # 每章目标字数（如 2000, 3000, 5000）
     chapter_target_words: Mapped[int] = mapped_column(Integer, default=3000)
+    # 生成前是否追加一次一致性修订
+    auto_consistency_check: Mapped[bool] = mapped_column(Boolean, default=False)
     # 记录最后一次执行每日自动撰写的日期（YYYY-MM-DD），防止重复执行
     last_auto_date: Mapped[str] = mapped_column(String(10), default="")
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")

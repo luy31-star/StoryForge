@@ -434,3 +434,61 @@ def chapter_plan_turn(beats: Any) -> str:
 def chapter_plan_hook(beats: Any) -> str:
     card = chapter_plan_execution_card(beats)
     return _clean_text(card.get("ending_hook"))
+
+
+def chapter_plan_guard_payload(
+    beats: Any,
+    *,
+    chapter_no: int | None = None,
+    plan_title: str = "",
+) -> dict[str, Any]:
+    normalized = normalize_beats_to_v2(beats)
+    card = normalized.get("execution_card", {})
+    summary = normalized.get("display_summary", {})
+    payload: dict[str, Any] = {
+        "plan_title": _clean_text(plan_title),
+        "display_summary": {
+            "plot_summary": _clean_text(summary.get("plot_summary")),
+            "stage_position": _clean_text(summary.get("stage_position")),
+            "pacing_justification": _clean_text(summary.get("pacing_justification")),
+        },
+        "hard_requirements": {
+            "chapter_goal": _clean_text(card.get("chapter_goal")),
+            "core_conflict": _clean_text(card.get("core_conflict")),
+            "key_turn": _clean_text(card.get("key_turn")),
+            "must_happen": _clean_text_list(card.get("must_happen")),
+            "required_callbacks": _clean_text_list(card.get("required_callbacks")),
+            "allowed_progress": _clean_text_list(card.get("allowed_progress")),
+            "must_not": _clean_text_list(card.get("must_not")),
+            "reserved_for_later": _clean_reserved_list(card.get("reserved_for_later")),
+        },
+        "repair_targets": {
+            "ending_hook": _clean_text(card.get("ending_hook")),
+            "end_state_targets": _clean_end_state_targets(card.get("end_state_targets")),
+            "style_guardrails": _clean_text_list(card.get("style_guardrails")),
+        },
+    }
+    if isinstance(chapter_no, int):
+        payload["chapter_no"] = chapter_no
+    return payload
+
+
+def chapter_plan_has_guardrails(beats: Any) -> bool:
+    payload = chapter_plan_guard_payload(beats)
+    hard = payload.get("hard_requirements", {})
+    repair = payload.get("repair_targets", {})
+    if not isinstance(hard, dict) or not isinstance(repair, dict):
+        return False
+    return any(
+        [
+            _clean_text(hard.get("chapter_goal")),
+            _clean_text(hard.get("core_conflict")),
+            _clean_text(hard.get("key_turn")),
+            bool(_clean_text_list(hard.get("must_happen"))),
+            bool(_clean_text_list(hard.get("required_callbacks"))),
+            bool(_clean_text_list(hard.get("allowed_progress"))),
+            bool(_clean_text_list(hard.get("must_not"))),
+            bool(_clean_reserved_list(hard.get("reserved_for_later"))),
+            _clean_text(repair.get("ending_hook")),
+        ]
+    )

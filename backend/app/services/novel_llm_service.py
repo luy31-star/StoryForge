@@ -31,6 +31,8 @@ from app.models.novel_memory_norm import (
 from app.services.memory_normalize_sync import sync_json_snapshot_from_normalized
 from app.services.ai302_client import AI302Client
 from app.services.chapter_plan_schema import (
+    chapter_plan_guard_payload,
+    chapter_plan_has_guardrails,
     chapter_plan_hook,
     chapter_plan_plot_summary,
     normalize_beats_to_v2,
@@ -365,10 +367,11 @@ def _chapter_messages(
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
         "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
         "3) 第二行留空一行，再开始正文。\n"
-        f"4) 正文（不含标题行）目标体量约 {target_words} 汉字左右（建议在 {words_min}～{words_max} 汉字之间）；明显偏短视为不合格；"
-        "用场景、对白与细节描写支撑篇幅，避免用一两段概括带过。\n"
-        "5) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
-        "6) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
+        f"4) 正文（不含标题行）目标体量约 {target_words} 汉字左右，建议控制在 {words_min}～{words_max} 汉字之间；"
+        f"严格硬上限：正文不得超过 {target_words + 500} 汉字。超过即视为不合格，你必须在一次输出内自行压缩到上限内。\n"
+        "5) 用场景、对白与细节描写支撑篇幅，避免用一两段概括带过，也不要为了凑字数重复心理、环境或解释。\n"
+        "6) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
+        "7) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
     )
     user = "\n\n".join(user_parts)
     return [
@@ -445,6 +448,143 @@ def _check_and_fix_chapter_messages(
     return [
         {"role": "system", "content": sys},
         {"role": "user", "content": user},
+    ]
+
+
+def _audit_chapter_against_plan_messages(
+    *,
+    chapter_no: int,
+    plan_title: str,
+    beats: dict[str, Any],
+    chapter_text: str,
+) -> list[dict[str, str]]:
+    plan_payload = chapter_plan_guard_payload(
+        beats,
+        chapter_no=chapter_no,
+        plan_title=plan_title,
+    )
+    sys = (
+        "你是小说章计划执行审计员。只输出一个 JSON 对象，不要 Markdown、不要解释。"
+        '格式：{"ok":boolean,"violations":["..."],"warnings":["..."]}。'
+        "仅在正文明显违反执行卡硬约束时写入 violations："
+        "必须发生却缺失、必须承接却完全失联、写出了 must_not、提前写出了 reserved_for_later、"
+        "实质推进明显超过 allowed_progress。"
+        "ending_hook 与 style_guardrails 只作为 warnings，不作为 violations。"
+    )
+    user = (
+        "【执行卡硬约束】\n"
+        f"{json.dumps(plan_payload, ensure_ascii=False)}\n\n"
+        "【待审正文】\n"
+        f"{(chapter_text or '')[:18000]}"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def _fix_chapter_to_plan_messages(
+    novel: Novel,
+    *,
+    chapter_no: int,
+    plan_title: str,
+    beats: dict[str, Any],
+    memory_json: str,
+    continuity_excerpt: str,
+    chapter_text: str,
+    violations: list[str],
+) -> list[dict[str, str]]:
+    bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
+    fj_block = truncate_framework_json(novel.framework_json or "", 6000)
+    plan_payload = chapter_plan_guard_payload(
+        beats,
+        chapter_no=chapter_no,
+        plan_title=plan_title,
+    )
+    sys = (
+        "你是小说执行卡纠偏编辑。你的任务是对正文做最小必要改写，使其重新满足本章执行卡。"
+        "必须补齐 must_happen / required_callbacks，删除或改写 must_not 与 reserved_for_later 的越界内容，"
+        "并把剧情收回 allowed_progress 允许的边界内。"
+        "不得破坏既有世界观、人物逻辑与前后承接。只输出修订后的正文，不要解释。"
+    )
+    user = (
+        f"【框架 Markdown】\n{bible}\n\n"
+        f"【框架 JSON（锚点，截断）】\n{fj_block}\n\n"
+        f"【结构化记忆 JSON】\n{memory_json}\n\n"
+        f"【前文衔接摘录】\n{continuity_excerpt or '（首章）'}\n\n"
+        "【执行卡】\n"
+        f"{json.dumps(plan_payload, ensure_ascii=False)}\n\n"
+        "【当前正文】\n"
+        f"{chapter_text}\n\n"
+        "【已发现问题】\n"
+        f"{json.dumps(violations or [], ensure_ascii=False)}\n\n"
+        "【修正要求】\n"
+        "1) 优先解决硬约束 violations；\n"
+        "2) 保持本章标题行格式与章号正确；\n"
+        "3) 尽量保留已有可用段落，只改冲突处；\n"
+        "4) 章末尽量贴近 ending_hook，但不要额外越级推进；\n"
+        "5) 只输出最终正文。"
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": user},
+    ]
+
+
+def _de_ai_chapter_messages(
+    novel: Novel,
+    *,
+    chapter_no: int,
+    plan_title: str,
+    beats: dict[str, Any],
+    chapter_text: str,
+) -> list[dict[str, str]]:
+    bible = novel.framework_markdown[:8000] if novel.framework_markdown else novel.background
+    fj_block = truncate_framework_json(novel.framework_json or "", 4000)
+    style_block = _writing_style_block(getattr(novel, "writing_style", None))
+    plan_payload = chapter_plan_guard_payload(
+        beats,
+        chapter_no=chapter_no,
+        plan_title=plan_title,
+    )
+    target_words = int(getattr(novel, "chapter_target_words", 3000) or 3000)
+    max_allowed = target_words + 500
+    original_body_chars = int(
+        chapter_content_metrics(chapter_text).get("body_chars", 0) or 0
+    )
+    min_allowed = max(0, original_body_chars - 500)
+    sys = (
+        "你是中文网文润色编辑。你的任务是去除正文中的 AI 味，但不得改动剧情事实。"
+        "你只能改写表达方式，不能改事件顺序、人物决定、信息边界、伏笔状态、章末结果。"
+        "必须保留第一行章节标题，且章号与章名不得改。"
+        "允许做的事：删解释腔、删总结腔、删空泛心理描写、删套路化比喻、删重复修饰，"
+        "把'告诉读者'改成动作/对白/观察里自然呈现。"
+        "禁止新增设定、禁止补新剧情、禁止改变执行卡中的必须发生项和章末钩子。"
+        "只输出润色后的正文，不要解释。"
+    )
+    parts = [
+        f"【框架 Markdown】\n{bible}",
+        f"【框架 JSON（锚点，截断）】\n{fj_block}",
+    ]
+    if style_block:
+        parts.append(style_block)
+    parts.extend(
+        [
+            "【执行卡（仅作边界，不可改剧情事实）】\n"
+            + json.dumps(plan_payload, ensure_ascii=False),
+            "【润色要求】\n"
+            "1) 只改描述，不改剧情；\n"
+            "2) 禁止把概述性句子改成新的剧情发展；\n"
+            "3) 可以缩短、拆句、换更自然的表达，但不要扩写，也不要大幅删减有效情节与描写；\n"
+            f"4) 正文（不含标题行）仍不得超过 {max_allowed} 汉字；\n"
+            f"5) 当前正文约 {original_body_chars} 字，润色后正文不得少于 {min_allowed} 字，最多只允许缩减 500 字；\n"
+            "6) 优先处理解释腔、总结腔、空泛心理句、重复修饰和机械比喻。",
+            f"【当前正文】\n{chapter_text}",
+        ]
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": "\n\n".join(parts)},
     ]
 
 
@@ -2006,6 +2146,121 @@ class NovelLLMService:
                 )
             ),
             temperature=settings.novel_consistency_check_temperature,
+            web_search=False,
+            timeout=settings.novel_consistency_check_timeout,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+
+    def audit_chapter_against_plan_sync(
+        self,
+        *,
+        chapter_no: int,
+        plan_title: str,
+        beats: dict[str, Any],
+        chapter_text: str,
+        db: Any = None,
+    ) -> dict[str, Any]:
+        if not chapter_plan_has_guardrails(beats):
+            return {"ok": True, "violations": [], "warnings": [], "skipped": True}
+        router = self._router(db=db)
+        raw = self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="audit_chapter_against_plan",
+            novel_id="-",
+            chapter_no=chapter_no,
+            messages=self._budget_chapter_messages(
+                _audit_chapter_against_plan_messages(
+                    chapter_no=chapter_no,
+                    plan_title=plan_title,
+                    beats=beats,
+                    chapter_text=chapter_text,
+                )
+            ),
+            temperature=0.15,
+            web_search=False,
+            timeout=180.0,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+        parsed = _safe_json_dict(raw)
+        if not parsed:
+            try:
+                repaired = json_repair_loads(raw or "{}")
+                parsed = repaired if isinstance(repaired, dict) else {}
+            except Exception:
+                parsed = {}
+        violations = _dedupe_str_list(parsed.get("violations") or [], max_items=12)
+        warnings = _dedupe_str_list(parsed.get("warnings") or [], max_items=12)
+        ok = bool(parsed.get("ok")) if "ok" in parsed else (len(violations) == 0)
+        return {
+            "ok": ok and len(violations) == 0,
+            "violations": violations,
+            "warnings": warnings,
+            "skipped": False,
+        }
+
+    def fix_chapter_to_plan_sync(
+        self,
+        novel: Novel,
+        *,
+        chapter_no: int,
+        plan_title: str,
+        beats: dict[str, Any],
+        memory_json: str,
+        continuity_excerpt: str,
+        chapter_text: str,
+        violations: list[str],
+        db: Any = None,
+    ) -> str:
+        router = self._router(db=db)
+        return self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="fix_chapter_to_plan",
+            novel_id=novel.id,
+            chapter_no=chapter_no,
+            messages=self._budget_chapter_messages(
+                _fix_chapter_to_plan_messages(
+                    novel,
+                    chapter_no=chapter_no,
+                    plan_title=plan_title,
+                    beats=beats,
+                    memory_json=memory_json,
+                    continuity_excerpt=continuity_excerpt,
+                    chapter_text=chapter_text,
+                    violations=violations,
+                )
+            ),
+            temperature=settings.novel_consistency_check_temperature,
+            web_search=False,
+            timeout=settings.novel_consistency_check_timeout,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+
+    def polish_chapter_style_sync(
+        self,
+        novel: Novel,
+        *,
+        chapter_no: int,
+        plan_title: str,
+        beats: dict[str, Any],
+        chapter_text: str,
+        db: Any = None,
+    ) -> str:
+        router = self._router(db=db)
+        return self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="polish_chapter_style",
+            novel_id=novel.id,
+            chapter_no=chapter_no,
+            messages=self._budget_chapter_messages(
+                _de_ai_chapter_messages(
+                    novel,
+                    chapter_no=chapter_no,
+                    plan_title=plan_title,
+                    beats=beats,
+                    chapter_text=chapter_text,
+                )
+            ),
+            temperature=0.25,
             web_search=False,
             timeout=settings.novel_consistency_check_timeout,
             **self._bill_kw(db, self._billing_user_id),

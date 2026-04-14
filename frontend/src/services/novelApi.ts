@@ -410,6 +410,7 @@ export async function createNovel(body: {
   daily_auto_chapters?: number;
   daily_auto_time?: string;
   chapter_target_words?: number;
+  auto_consistency_check?: boolean;
 }) {
   const r = await apiFetch(BASE, {
     method: "POST",
@@ -432,6 +433,7 @@ export async function aiCreateAndStartNovel(body: {
   daily_auto_chapters?: number;
   daily_auto_time?: string;
   chapter_target_words?: number;
+  auto_consistency_check?: boolean;
   writing_style_id?: string;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
@@ -477,6 +479,7 @@ export async function getNovel(id: string) {
     daily_auto_chapters: number;
     daily_auto_time: string;
     chapter_target_words: number;
+    auto_consistency_check: boolean;
     framework_confirmed: boolean;
     status: string;
     [key: string]: any;
@@ -581,17 +584,20 @@ export async function generateChapters(
     source?: string;
   }
 ) {
+  const payload: Record<string, unknown> = {
+    count,
+    title_hint,
+    use_cold_recall: Boolean(options?.use_cold_recall),
+    cold_recall_items: options?.cold_recall_items ?? 5,
+    chapter_no: options?.chapter_no,
+    source: options?.source,
+  };
+  if (typeof options?.auto_consistency_check === "boolean") {
+    payload.auto_consistency_check = options.auto_consistency_check;
+  }
   const r = await apiFetch(`${BASE}/${novelId}/chapters/generate`, {
     method: "POST",
-    body: JSON.stringify({
-      count,
-      title_hint,
-      use_cold_recall: Boolean(options?.use_cold_recall),
-      cold_recall_items: options?.cold_recall_items ?? 5,
-      auto_consistency_check: Boolean(options?.auto_consistency_check),
-      chapter_no: options?.chapter_no,
-      source: options?.source,
-    }),
+    body: JSON.stringify(payload),
   });
   if (!r.ok) {
     let detail = "";
@@ -890,14 +896,58 @@ export async function addChapterFeedback(chapterId: string, body: string) {
   return r.json();
 }
 
-export async function approveChapter(chapterId: string) {
+export async function approveChapter(
+  chapterId: string,
+  payload?: { force_pass?: boolean }
+) {
   const r = await apiFetch(`${BASE}/chapters/${chapterId}/approve`, {
     method: "POST",
+    body: JSON.stringify({
+      force_pass: Boolean(payload?.force_pass),
+    }),
   });
-  if (!r.ok) throw new Error(await r.text());
+  if (!r.ok) {
+    let message = "";
+    let parsed: any = null;
+    try {
+      parsed = await r.clone().json();
+      const detail = parsed?.detail ?? parsed;
+      if (typeof detail === "string") {
+        message = detail;
+      } else if (detail && typeof detail === "object") {
+        if (Array.isArray(detail.issues) && detail.issues.length) {
+          message = detail.issues.join("；");
+        } else if (typeof detail.message === "string") {
+          message = detail.message;
+        } else {
+          message = JSON.stringify(detail);
+        }
+      }
+    } catch {
+      message = "";
+    }
+    if (!message) message = (await r.text()).trim();
+    const err = new Error(message || "审定失败") as Error & {
+      code?: string;
+      issues?: string[];
+      canForce?: boolean;
+      status?: number;
+    };
+    const detail = parsed?.detail ?? parsed;
+    if (detail && typeof detail === "object") {
+      err.code = typeof detail.code === "string" ? detail.code : undefined;
+      err.issues = Array.isArray(detail.issues)
+        ? detail.issues.map((x: unknown) => String(x).trim()).filter(Boolean)
+        : [];
+      err.canForce = Boolean(detail.can_force);
+    }
+    err.status = r.status;
+    throw err;
+  }
   return r.json() as Promise<{
     status: "ok";
     already_approved?: boolean;
+    forced_pass?: boolean;
     incremental_memory_status?:
       | "applied"
       | "failed"

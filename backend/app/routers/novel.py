@@ -27,6 +27,7 @@ from app.models.novel import (
 )
 from app.models.task import UserTask
 from app.models.volume import NovelVolume, NovelChapterPlan
+from app.services.chapter_approval_guard import collect_chapter_approval_issues
 from app.services.memory_readable import (
     memory_payload_readable_zh_auto,
     memory_payload_to_readable_zh,
@@ -163,6 +164,7 @@ class AiCreateAndStartBody(BaseModel):
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    auto_consistency_check: bool = False
     writing_style_id: str | None = Field(default=None, max_length=36)
     
 class NovelCreate(BaseModel):
@@ -175,6 +177,7 @@ class NovelCreate(BaseModel):
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    auto_consistency_check: bool = False
 
 class NovelPatch(BaseModel):
     title: str | None = None
@@ -186,6 +189,7 @@ class NovelPatch(BaseModel):
     daily_auto_chapters: int | None = None
     daily_auto_time: str | None = None
     chapter_target_words: int | None = Field(default=None, ge=500, le=10000)
+    auto_consistency_check: bool | None = None
     status: str | None = None
 
 
@@ -223,7 +227,7 @@ class GenerateChapterBody(BaseModel):
     count: int = Field(default=1, ge=1, le=5)
     use_cold_recall: bool = False
     cold_recall_items: int = Field(default=5, ge=1, le=12)
-    auto_consistency_check: bool = False
+    auto_consistency_check: bool | None = None
     # 按卷驱动：允许生成指定章（用于点击章计划条目生成正文）
     chapter_no: int | None = Field(default=None, ge=1, le=20000)
     source: str | None = Field(default=None, description="章节来源，如 manual 或 batch_auto")
@@ -236,6 +240,10 @@ class ChapterReviseBody(BaseModel):
 class ChapterUpdateBody(BaseModel):
     title: str | None = None
     content: str = Field(..., min_length=1)
+
+
+class ApproveChapterBody(BaseModel):
+    force_pass: bool = False
 
 
 class ManualFixMemoryCanonicalLast(BaseModel):
@@ -583,6 +591,7 @@ def ai_create_and_start(
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
         chapter_target_words=body.chapter_target_words,
+        auto_consistency_check=body.auto_consistency_check,
         writing_style_id=body.writing_style_id,
         user_id=user.id,
         status="draft",
@@ -688,6 +697,7 @@ def create_novel(
         daily_auto_chapters=body.daily_auto_chapters,
         daily_auto_time=body.daily_auto_time,
         chapter_target_words=body.chapter_target_words,
+        auto_consistency_check=body.auto_consistency_check,
         user_id=user.id,
     )
     db.add(n)
@@ -712,6 +722,7 @@ def get_novel(
         "writing_style_id": n.writing_style_id,
         "target_chapters": n.target_chapters,
         "chapter_target_words": n.chapter_target_words,
+        "auto_consistency_check": bool(getattr(n, "auto_consistency_check", False)),
         "length_tag": _get_length_tag(n.target_chapters),
         "daily_auto_chapters": n.daily_auto_chapters,
         "daily_auto_time": n.daily_auto_time,
@@ -1248,13 +1259,19 @@ async def generate_chapters(
     if not source:
         source = "manual" if body.chapter_no is not None else "batch_auto"
 
+    resolved_auto_consistency_check = (
+        body.auto_consistency_check
+        if body.auto_consistency_check is not None
+        else bool(getattr(n, "auto_consistency_check", False))
+    )
+
     payload: dict[str, Any] = {
         "title_hint": body.title_hint,
         "chapter_nos": chapter_nos,
         "requested_count": requested_cap,
         "use_cold_recall": body.use_cold_recall,
         "cold_recall_items": body.cold_recall_items,
-        "auto_consistency_check": body.auto_consistency_check,
+        "auto_consistency_check": bool(resolved_auto_consistency_check),
         "source": source,
     }
     logger.info(
@@ -1595,7 +1612,7 @@ def list_generation_logs(
             .all()
         )
         ev_cg = {x.event for x in cg}
-        if "batch_failed" in ev_cg:
+        if "batch_failed" in ev_cg or "batch_blocked" in ev_cg:
             chapter_generation_status = "failed"
         elif "batch_done" in ev_cg:
             chapter_generation_status = "done"
@@ -1829,15 +1846,19 @@ def add_feedback(
 @router.post("/chapters/{chapter_id}/approve")
 async def approve_chapter(
     chapter_id: str,
+    body: ApproveChapterBody | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     c = require_chapter_access(db, chapter_id, user)
     n = require_novel_access(db, c.novel_id, user)
+    force_pass = bool(body.force_pass) if body else False
+    llm = _novel_llm(user)
     if c.status == "approved":
         return {
             "status": "ok",
             "already_approved": True,
+            "forced_pass": False,
             "incremental_memory_status": "none",
             "incremental_memory_version": None,
             "incremental_memory_batch_id": None,
@@ -1847,17 +1868,22 @@ async def approve_chapter(
             "memory_refresh_batch_id": None,
             "consolidate_memory_task_id": None,
         }
-    if settings.novel_setting_audit_on_approve:
-        llm_audit = _novel_llm(user)
-        audit = llm_audit.audit_chapter_against_constraints_sync(
-            n, c.content or "", db
+    approval_issues = collect_chapter_approval_issues(
+        novel=n,
+        chapter_no=int(c.chapter_no or 0),
+        chapter_text=c.content or "",
+        llm=llm,
+        db=db,
+    )
+    if approval_issues and not force_pass:
+        raise HTTPException(
+            409,
+            {
+                "code": "approve_guard_failed",
+                "issues": approval_issues,
+                "can_force": True,
+            },
         )
-        if not audit.get("ok") and settings.novel_setting_audit_block_on_violation:
-            raise HTTPException(
-                400,
-                "设定审计未通过："
-                + "；".join(audit.get("violations") or [])[:2000],
-            )
     c.status = "approved"
     c.pending_content = ""
     c.pending_revision_prompt = ""
@@ -1876,6 +1902,21 @@ async def approve_chapter(
     approve_batch_id = f"chapter-approve-{int(time.time())}-{c.novel_id[:8]}"
     # 先提交审定状态，再由 Celery 后台执行单章增量记忆，避免阻塞 HTTP。
     db.commit()
+    if approval_issues and force_pass:
+        try:
+            _append_generation_log(
+                db,
+                novel_id=c.novel_id,
+                batch_id=approve_batch_id,
+                event="chapter_approve_forced",
+                chapter_no=c.chapter_no,
+                level="warning",
+                message="本章已由用户强行审定通过",
+                meta={"issues": approval_issues},
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
     incremental_memory_task_id: str | None = None
     incremental_memory_status: Literal["queued", "enqueue_failed"] = "enqueue_failed"
     try:
@@ -1930,6 +1971,7 @@ async def approve_chapter(
     # 审定后增量记忆在后台完成；周期性归档合并由后台任务在成功写入后触发。
     return {
         "status": "ok",
+        "forced_pass": force_pass,
         "incremental_memory_status": incremental_memory_status,
         "incremental_memory_version": None,
         "incremental_memory_batch_id": approve_batch_id,

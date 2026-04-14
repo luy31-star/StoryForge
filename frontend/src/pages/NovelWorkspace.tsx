@@ -629,6 +629,7 @@ export function NovelWorkspace() {
     daily_auto_chapters: 0,
     daily_auto_time: "14:30",
     chapter_target_words: 3000,
+    auto_consistency_check: false,
     style: "",
     writing_style_id: "",
   });
@@ -666,6 +667,7 @@ export function NovelWorkspace() {
       daily_auto_chapters: Number(novel.daily_auto_chapters || 0),
       daily_auto_time: String(novel.daily_auto_time || "14:30"),
       chapter_target_words: Number(novel.chapter_target_words || 3000),
+      auto_consistency_check: Boolean(novel.auto_consistency_check),
       style: String(novel.style || ""),
       writing_style_id: String(novel.writing_style_id || ""),
     });
@@ -1871,7 +1873,6 @@ export function NovelWorkspace() {
       const resp = await generateChapters(id, 1, "", {
         use_cold_recall: useColdRecall,
         cold_recall_items: coldRecallItems,
-        auto_consistency_check: false,
         chapter_no: chapterNo,
         source: "manual",
       });
@@ -1954,12 +1955,12 @@ export function NovelWorkspace() {
     );
   }
 
-  async function runApproveChapter(chapterId: string) {
+  async function runApproveChapter(chapterId: string, forcePass = false) {
     setErr(null);
     setNotice(null);
     setBusy(true);
     try {
-      const resp = await approveChapter(chapterId);
+      const resp = await approveChapter(chapterId, { force_pass: forcePass });
       if (resp.already_approved) {
         setNotice("本章节已是审定状态，无需重复审定。");
         await reload();
@@ -1997,15 +1998,44 @@ export function NovelWorkspace() {
           }
         }
         setNotice(
-          `已审定通过，${incrementalNotice}；后台全局记忆刷新已排队（task_id: ${resp.memory_refresh_task_id ?? "未知"}）。`
+          `${forcePass ? "已强行审定通过" : "已审定通过"}，${incrementalNotice}；后台全局记忆刷新已排队（task_id: ${resp.memory_refresh_task_id ?? "未知"}）。`
         );
       } else if (resp.memory_refresh_status === "skipped") {
-        setNotice(`已审定通过，${incrementalNotice}；但后台全局记忆刷新入队失败，请稍后在记忆页手动刷新。`);
+        setNotice(`${forcePass ? "已强行审定通过" : "已审定通过"}，${incrementalNotice}；但后台全局记忆刷新入队失败，请稍后在记忆页手动刷新。`);
       } else {
-        setNotice(`已审定通过，${incrementalNotice}。`);
+        setNotice(`${forcePass ? "已强行审定通过" : "已审定通过"}，${incrementalNotice}。`);
       }
       await reload();
     } catch (e: unknown) {
+      const guardErr = e as Error & {
+        code?: string;
+        issues?: string[];
+        canForce?: boolean;
+      };
+      if (
+        !forcePass &&
+        guardErr?.code === "approve_guard_failed" &&
+        guardErr.canForce &&
+        Array.isArray(guardErr.issues) &&
+        guardErr.issues.length
+      ) {
+        const issues = guardErr.issues;
+        setTimeout(() => {
+          void openLlmConfirm(
+            {
+              title: "检测到硬条件未满足，是否强行通过？",
+              description:
+                "当前章节未满足执行卡或字数硬条件。你仍可强行审定通过，但后果需要自行承担。",
+              confirmLabel: "强行审定通过",
+              details: issues.map((item) => `· ${item}`),
+            },
+            async () => {
+              await runApproveChapter(chapterId, true);
+            }
+          );
+        }, 0);
+        return;
+      }
       setErr(e instanceof Error ? e.message : "审定失败");
     } finally {
       setBusy(false);
@@ -5012,14 +5042,14 @@ export function NovelWorkspace() {
 
       {/* 小说设置弹窗 */}
       <Dialog open={novelSettingsOpen} onOpenChange={setNovelSettingsOpen}>
-        <DialogContent className="max-w-md">
+        <DialogContent className="max-h-[85vh] max-w-md overflow-hidden">
           <DialogHeader>
             <DialogTitle className="text-xl font-bold">小说设置</DialogTitle>
             <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
               配置当前小说的总章节数和每日自动撰写计划。
             </DialogDescription>
           </DialogHeader>
-          <div className="space-y-4 py-4">
+          <div className="max-h-[calc(85vh-9rem)] space-y-4 overflow-y-auto py-4 pr-2">
             <div className="space-y-2">
               <Label htmlFor="target_chapters" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">目标总章节数</Label>
               <Input
@@ -5070,6 +5100,34 @@ export function NovelWorkspace() {
                 className="field-shell text-foreground font-bold"
               />
               <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 在写正文时将以此为强约束。建议 2000-5000。</p>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="auto_consistency_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                生成前一致性修订
+              </Label>
+              <label
+                htmlFor="auto_consistency_check"
+                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
+              >
+                <input
+                  id="auto_consistency_check"
+                  type="checkbox"
+                  checked={novelSettingsDraft.auto_consistency_check}
+                  onChange={(e) =>
+                    setNovelSettingsDraft({
+                      ...novelSettingsDraft,
+                      auto_consistency_check: e.target.checked,
+                    })
+                  }
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">生成正文后，追加一次一致性修订</p>
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                    默认关闭。开启后会多一次 LLM 调用，速度更慢，但会先做一轮通顺性与设定衔接修订。
+                  </p>
+                </div>
+              </label>
             </div>
             <div className="space-y-2">
               <Label htmlFor="novel_style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风描述 (简要)</Label>

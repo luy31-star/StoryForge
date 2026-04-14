@@ -39,7 +39,7 @@ def _has_column_mysql(conn, table: str, column: str) -> bool:
 
 def ensure_novel_target_chapters(engine: Engine) -> None:
     """
-    轻量自动迁移：给 novels 表补 target_chapters 列。
+    轻量自动迁移：给 novels 表补小说写作设置相关列。
     说明：项目未引入 Alembic；create_all 不会给已有表加列，所以需要这段兜底。
     """
     try:
@@ -77,6 +77,18 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
                     )
                     logger.info("db migrate: added novels.chapter_target_words (sqlite)")
+                if _has_column_sqlite(conn, "novels", "auto_consistency_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN auto_consistency_check BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.auto_consistency_check (sqlite)")
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, 0)"
+                    )
+                )
                 return
             if dialect in ("postgresql", "postgres"):
                 if _has_column_postgres(conn, "novels", "target_chapters"):
@@ -116,6 +128,20 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
                     )
                     logger.info("db migrate: added novels.chapter_target_words (postgres)")
+                if _has_column_postgres(conn, "novels", "auto_consistency_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_consistency_check BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_consistency_check (postgres)")
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
+                    )
+                )
                 return
             if dialect == "mysql":
                 if _has_column_mysql(conn, "novels", "target_chapters"):
@@ -149,6 +175,20 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN chapter_target_words INTEGER DEFAULT 3000")
                     )
                     logger.info("db migrate: added novels.chapter_target_words (mysql)")
+                if _has_column_mysql(conn, "novels", "auto_consistency_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_consistency_check BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_consistency_check (mysql)")
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
+                    )
+                )
                 return
             logger.warning("db migrate: unsupported dialect=%s, skip", dialect)
     except Exception:

@@ -934,8 +934,16 @@ def novel_generate_chapters_for_novel(
             batch_id=batch_id,
             source=str(body.get("source") or "batch_auto"),
         )
-        if str(result.get("status") or "") == "cancelled":
+        result_status = str(result.get("status") or "")
+        if result_status == "cancelled":
             _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        elif result_status == "blocked":
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"已停止：第{int(result.get('blocked_chapter_no') or 0)}章未通过自动审定门禁",
+            )
         else:
             _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
         return result
@@ -1807,11 +1815,31 @@ def novel_auto_pipeline_task(
             batch_id=batch_id,
             use_cold_recall=False,
             cold_recall_items=5,
-            auto_consistency_check=False,
+            auto_consistency_check=None,
         )
-        if str(result.get("status") or "") == "cancelled":
+        result_status = str(result.get("status") or "")
+        if result_status == "cancelled":
             db.commit()
             _task_set_terminal(db, batch_id=batch_id, status="cancelled", message="已取消")
+        elif result_status == "blocked":
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="auto_pipeline_failed",
+                level="warning",
+                message=(
+                    f"全自动生成已停止：第{int(result.get('blocked_chapter_no') or 0)}章未通过自动审定门禁"
+                ),
+                meta={"issues": result.get("blocked_issues") or []},
+            )
+            db.commit()
+            _task_set_terminal(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                message=f"已停止：第{int(result.get('blocked_chapter_no') or 0)}章未通过自动审定门禁",
+            )
         else:
             append_generation_log(
                 db,

@@ -568,7 +568,7 @@ def run_full_auto_generation_sync(
     batch_id: str,
     use_cold_recall: bool = False,
     cold_recall_items: int = 5,
-    auto_consistency_check: bool = False,
+    auto_consistency_check: bool | None = None,
 ) -> dict[str, Any]:
     """
     全自动 Pipeline：补齐卷 -> 补齐章计划 -> 串行生成正文。
@@ -578,6 +578,11 @@ def run_full_auto_generation_sync(
         raise ValueError("小说不存在")
     if not n.framework_confirmed:
         raise ValueError("框架未确认，无法全自动生成")
+    resolved_auto_consistency_check = (
+        bool(getattr(n, "auto_consistency_check", False))
+        if auto_consistency_check is None
+        else bool(auto_consistency_check)
+    )
 
     next_no = next_chapter_no_from_approved(db, novel_id)
     end_no = min(next_no + target_count - 1, n.target_chapters)
@@ -664,11 +669,20 @@ def run_full_auto_generation_sync(
                 chapter_nos=planned_body_chunk,
                 use_cold_recall=use_cold_recall,
                 cold_recall_items=cold_recall_items,
-                auto_consistency_check=auto_consistency_check,
+                auto_consistency_check=resolved_auto_consistency_check,
                 batch_id=batch_id,
                 source="auto_pipeline",
             )
             created_ids.extend(res.get("chapter_ids", []))
+            if str(res.get("status") or "") == "blocked":
+                return {
+                    "status": "blocked",
+                    "batch_id": batch_id,
+                    "chapter_ids": created_ids,
+                    "chapters_generated": len(created_ids),
+                    "blocked_chapter_no": res.get("blocked_chapter_no"),
+                    "blocked_issues": res.get("blocked_issues") or [],
+                }
             current_no = planned_body_chunk[-1] + 1
             continue
 

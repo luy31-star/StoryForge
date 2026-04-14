@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.novel import Chapter, Novel
 from app.models.volume import NovelChapterPlan
+from app.services.chapter_approval_guard import collect_chapter_approval_issues
 from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.novel_generation_common import (
     append_generation_log,
@@ -146,6 +147,7 @@ def run_generate_chapters_batch_sync(
         chapter_plan_hint = build_chapter_plan_hint(
             no, plan.chapter_title, beats, added, resolved
         )
+        effective_title_hint = (plan.chapter_title or title_hint or "").strip()
         append_generation_log(
             db,
             novel_id=novel_id,
@@ -160,7 +162,7 @@ def run_generate_chapters_batch_sync(
         raw_content = llm.generate_chapter_sync(
             n,
             no,
-            (plan.chapter_title if plan and plan.chapter_title else title_hint),
+            effective_title_hint,
             mem,
             continuity,
             full_context,
@@ -223,12 +225,156 @@ def run_generate_chapters_batch_sync(
                 content = raw_content
 
         normalized_title, normalized_content = ensure_chapter_heading(
-            no, content, title_hint=title_hint
+            no, content, title_hint=effective_title_hint
         )
         content = normalized_content
 
+        plan_audit = llm.audit_chapter_against_plan_sync(
+            chapter_no=no,
+            plan_title=plan.chapter_title,
+            beats=beats,
+            chapter_text=content,
+            db=db,
+        )
+        if not plan_audit.get("ok"):
+            violations = plan_audit.get("violations") or []
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_plan_guard_failed",
+                chapter_no=no,
+                level="warning",
+                message=f"第 {no} 章未通过执行卡校验，开始自动纠偏",
+                meta={
+                    "violations": violations,
+                    "warnings": plan_audit.get("warnings") or [],
+                },
+            )
+            db.commit()
+            content = llm.fix_chapter_to_plan_sync(
+                n,
+                chapter_no=no,
+                plan_title=plan.chapter_title,
+                beats=beats,
+                memory_json=mem,
+                continuity_excerpt=continuity,
+                chapter_text=content,
+                violations=violations,
+                db=db,
+            )
+            normalized_title, normalized_content = ensure_chapter_heading(
+                no, content, title_hint=effective_title_hint
+            )
+            content = normalized_content
+            re_audit = llm.audit_chapter_against_plan_sync(
+                chapter_no=no,
+                plan_title=plan.chapter_title,
+                beats=beats,
+                chapter_text=content,
+                db=db,
+            )
+            if not re_audit.get("ok"):
+                raise RuntimeError(
+                    "执行卡校验仍未通过："
+                    + "；".join(re_audit.get("violations") or [])[:1000]
+                )
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_plan_guard_fixed",
+                chapter_no=no,
+                message=f"第 {no} 章已按执行卡完成自动纠偏",
+                meta={"warnings": re_audit.get("warnings") or []},
+            )
+            db.commit()
+        elif plan_audit.get("warnings"):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_plan_guard_warn",
+                chapter_no=no,
+                level="info",
+                message=f"第 {no} 章通过执行卡硬校验，但存在可优化项",
+                meta={"warnings": plan_audit.get("warnings") or []},
+            )
+            db.commit()
+
+        pre_polish_metrics = chapter_content_metrics(content)
+        pre_polish_body_chars = int(pre_polish_metrics.get("body_chars", 0) or 0)
+        try:
+            polished = llm.polish_chapter_style_sync(
+                n,
+                chapter_no=no,
+                plan_title=plan.chapter_title,
+                beats=beats,
+                chapter_text=content,
+                db=db,
+            )
+            normalized_title, normalized_content = ensure_chapter_heading(
+                no, polished, title_hint=effective_title_hint
+            )
+            polished_metrics = chapter_content_metrics(normalized_content)
+            polished_body_chars = int(polished_metrics.get("body_chars", 0) or 0)
+            content = normalized_content
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_style_polish_done",
+                chapter_no=no,
+                message=f"第 {no} 章已完成去 AI 味润色",
+                meta={
+                    "body_chars": polished_body_chars,
+                    "reduced_body_chars": max(0, pre_polish_body_chars - polished_body_chars),
+                },
+            )
+            db.commit()
+        except Exception:
+            logger.exception(
+                "generate_chapters style polish failed, fallback original | novel_id=%s chapter_no=%s",
+                novel_id,
+                no,
+            )
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="chapter_style_polish_failed",
+                chapter_no=no,
+                level="warning",
+                message=f"第 {no} 章去 AI 味润色失败，已保留纠偏后的正文",
+            )
+            db.commit()
+
         # 仅 batch_auto 或非 manual 来源才自动更新工作记忆并审定
-        auto_approve = source != "manual"
+        auto_approve_requested = source != "manual"
+        auto_approval_issues: list[str] = []
+        if auto_approve_requested:
+            auto_approval_issues = collect_chapter_approval_issues(
+                novel=n,
+                chapter_no=no,
+                chapter_text=content,
+                llm=llm,
+                db=db,
+                plan=plan,
+                include_plan_audit=False,
+            )
+            if auto_approval_issues:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="chapter_auto_approve_blocked",
+                    chapter_no=no,
+                    level="warning",
+                    message=f"第 {no} 章未通过自动审定门禁，已转为待审定",
+                    meta={"issues": auto_approval_issues},
+                )
+                db.commit()
+        auto_approve = auto_approve_requested and not auto_approval_issues
         try:
             memory_delta_result: dict[str, Any] | None = None
             if auto_approve:
@@ -299,6 +445,28 @@ def run_generate_chapters_batch_sync(
                 },
             )
             db.commit()
+            if auto_approval_issues:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="batch_blocked",
+                    chapter_no=no,
+                    level="warning",
+                    message=f"第 {no} 章未通过自动审定门禁，已停止后续生成",
+                    meta={
+                        "chapter_id": ch.id,
+                        "issues": auto_approval_issues,
+                    },
+                )
+                db.commit()
+                return {
+                    "status": "blocked",
+                    "chapter_ids": created,
+                    "batch_id": batch_id,
+                    "blocked_chapter_no": no,
+                    "blocked_issues": auto_approval_issues,
+                }
         except Exception as e:
             db.rollback()
             logger.exception(
