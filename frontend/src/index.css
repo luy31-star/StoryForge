@@ -119,4 +119,122 @@
   .status-badge {
     @apply inline-flex items-center gap-1.5 rounded-full border border-border/70 bg-background/65 px-2.5 py-1 text-[11px] font-medium text-muted-foreground backdrop-blur-md;
   }
+
+  .signal-surface {
+    position: relative;
+    overflow: hidden;
+    border-radius: 1.75rem;
+    border: 1px solid hsl(var(--border) / 0.64);
+    background:
+      linear-gradient(180deg, hsl(var(--background) / 0.9), hsl(var(--background) / 0.62)),
+      linear-gradient(140deg, hsl(var(--primary) / 0.025), transparent 58%);
+    box-shadow: 0 16px 48px rgba(15, 23, 42, 0.08);
+    backdrop-filter: blur(24px);
+  }
+
+  .signal-surface::before {
+    content: "";
+    position: absolute;
+    inset: 0;
+    background-image:
+      linear-gradient(hsl(var(--foreground) / 0.05) 1px, transparent 1px),
+      linear-gradient(90deg, hsl(var(--foreground) / 0.05) 1px, transparent 1px);
+    background-size: 28px 28px;
+    opacity: 0.18;
+    mask-image: linear-gradient(180deg, rgba(255, 255, 255, 0.92), transparent 84%);
+    pointer-events: none;
+  }
+
+  .signal-surface::after {
+    content: "";
+    position: absolute;
+    left: 24%;
+    top: -12%;
+    height: 10rem;
+    width: 10rem;
+    border-radius: 999px;
+    background: radial-gradient(circle, hsl(var(--primary) / 0.12), transparent 70%);
+    filter: blur(22px);
+    pointer-events: none;
+  }
+
+  .story-dot-grid {
+    background-image: radial-gradient(circle, hsl(var(--foreground) / 0.1) 1px, transparent 1.4px);
+    background-size: 18px 18px;
+  }
+
+  .story-mesh {
+    background-image:
+      radial-gradient(circle at 16% 18%, hsl(var(--primary) / 0.1), transparent 26%),
+      radial-gradient(circle at 84% 10%, hsl(var(--accent) / 0.08), transparent 24%),
+      linear-gradient(180deg, hsl(var(--background) / 0.96), hsl(var(--background) / 0.78));
+  }
+
+  .story-float-slow {
+    animation: story-float 9s ease-in-out infinite;
+  }
+
+  .story-float-fast {
+    animation: story-float 6.4s ease-in-out infinite reverse;
+  }
+
+  .story-pulse-soft {
+    animation: story-pulse 2.8s ease-in-out infinite;
+  }
+
+  .story-shimmer {
+    position: relative;
+    overflow: hidden;
+  }
+
+  .story-shimmer::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    transform: translateX(-130%);
+    background: linear-gradient(
+      102deg,
+      transparent 20%,
+      rgba(255, 255, 255, 0.1) 46%,
+      rgba(255, 255, 255, 0.26) 50%,
+      rgba(255, 255, 255, 0.08) 56%,
+      transparent 80%
+    );
+    animation: story-scan 6.5s linear infinite;
+    pointer-events: none;
+  }
+}
+
+@keyframes story-float {
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes story-pulse {
+  0%,
+  100% {
+    opacity: 0.48;
+    transform: scale(0.96);
+  }
+
+  50% {
+    opacity: 1;
+    transform: scale(1.12);
+  }
+}
+
+@keyframes story-scan {
+  0% {
+    transform: translateX(-130%);
+  }
+
+  100% {
+    transform: translateX(130%);
+  }
 }

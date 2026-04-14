@@ -1,13 +1,18 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { BookOpen, Plus } from "lucide-react";
+import {
+  ArrowRight,
+  BookOpen,
+  Clock3,
+  Plus,
+  Sparkles,
+} from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import {
   Card,
   CardContent,
   CardDescription,
-  CardHeader,
   CardTitle,
 } from "@/components/ui/card";
 import {
@@ -22,6 +27,136 @@ import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
 import { deleteNovel, listNovels, aiCreateAndStartNovel } from "@/services/novelApi";
 import { ensureLlmReady } from "@/services/llmReady";
+
+type ShelfNovel = Awaited<ReturnType<typeof listNovels>>[number];
+
+const shelfThemes = [
+  {
+    cover: "from-sky-500/24 via-cyan-400/10 to-transparent",
+    chip: "border-sky-500/28 bg-sky-500/12 text-sky-700 dark:text-sky-200",
+    stripe: "from-sky-400 via-cyan-300 to-sky-200",
+    glow: "bg-sky-400/16",
+  },
+  {
+    cover: "from-emerald-500/22 via-teal-400/10 to-transparent",
+    chip: "border-emerald-500/28 bg-emerald-500/12 text-emerald-700 dark:text-emerald-200",
+    stripe: "from-emerald-400 via-teal-300 to-cyan-200",
+    glow: "bg-emerald-400/16",
+  },
+  {
+    cover: "from-fuchsia-500/20 via-violet-400/10 to-transparent",
+    chip: "border-fuchsia-500/25 bg-fuchsia-500/12 text-fuchsia-700 dark:text-fuchsia-200",
+    stripe: "from-fuchsia-400 via-violet-300 to-indigo-200",
+    glow: "bg-fuchsia-400/16",
+  },
+  {
+    cover: "from-amber-500/20 via-orange-400/10 to-transparent",
+    chip: "border-amber-500/28 bg-amber-500/12 text-amber-700 dark:text-amber-200",
+    stripe: "from-amber-400 via-orange-300 to-yellow-200",
+    glow: "bg-amber-400/16",
+  },
+] as const;
+
+const stageLabels = ["构思", "框架", "创作", "自动"] as const;
+
+function hashText(value: string) {
+  let hash = 0;
+  for (let i = 0; i < value.length; i += 1) {
+    hash = (hash << 5) - hash + value.charCodeAt(i);
+    hash |= 0;
+  }
+  return Math.abs(hash);
+}
+
+function themeForNovel(key: string) {
+  return shelfThemes[hashText(key) % shelfThemes.length];
+}
+
+function relativeUpdatedAt(value: string | null) {
+  if (!value) return "未记录更新时间";
+  const ts = Date.parse(value);
+  if (Number.isNaN(ts)) return value;
+  const diff = Date.now() - ts;
+  const minute = 60 * 1000;
+  const hour = 60 * minute;
+  const day = 24 * hour;
+  if (diff < hour) return `${Math.max(1, Math.round(diff / minute))} 分钟前`;
+  if (diff < day) return `${Math.max(1, Math.round(diff / hour))} 小时前`;
+  if (diff < 7 * day) return `${Math.max(1, Math.round(diff / day))} 天前`;
+  return value.slice(0, 10);
+}
+
+function stageForNovel(novel: ShelfNovel) {
+  if (novel.status === "failed") {
+    return {
+      index: novel.framework_confirmed ? 2 : 1,
+      label: novel.framework_confirmed ? "续写链路待修复" : "大纲构思受阻",
+      hint: novel.framework_confirmed ? "正文或记忆同步中断" : "先回到向导确认大纲",
+    };
+  }
+  if (!novel.framework_confirmed) {
+    return {
+      index: 1,
+      label: "框架待确认",
+      hint: "建议先锁定世界观、人物与节拍",
+    };
+  }
+  if (novel.daily_auto_chapters > 0) {
+    return {
+      index: 3,
+      label: "自动推进中",
+      hint: `当前每日自动 ${novel.daily_auto_chapters} 章`,
+    };
+  }
+  return {
+    index: 2,
+    label: "手动创作中",
+    hint: "适合集中修订正文、节奏与记忆",
+  };
+}
+
+function NovelStageRail({
+  activeIndex,
+  stripe,
+  hint,
+  compact = false,
+}: {
+  activeIndex: number;
+  stripe: string;
+  hint?: string;
+  compact?: boolean;
+}) {
+  return (
+    <div className={`rounded-[1.4rem] border border-border/60 bg-background/58 ${compact ? "p-3.5" : "p-4"}`}>
+      <div className="flex items-center justify-between gap-2">
+        <p className="text-sm font-semibold text-foreground">创作路径</p>
+        {hint ? <span className="text-xs text-foreground/58">{hint}</span> : null}
+      </div>
+
+      <div className={`mt-3 grid gap-2 ${compact ? "grid-cols-4" : "grid-cols-4"}`}>
+        {stageLabels.map((label, index) => (
+          <div
+            key={`${label}-${index}`}
+            className={`rounded-[1rem] border px-3 py-3 ${
+              index <= activeIndex
+                ? "border-primary/25 bg-background/80"
+                : "border-border/50 bg-background/42"
+            }`}
+          >
+            <div
+              className={`h-1.5 rounded-full ${
+                index <= activeIndex ? `bg-gradient-to-r ${stripe}` : "bg-border/60"
+              }`}
+            />
+            <p className="mt-2 text-[11px] font-semibold uppercase tracking-[0.14em] text-foreground/55">
+              {label}
+            </p>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
 
 export function NovelShelf() {
   const [items, setItems] = useState<
@@ -80,7 +215,29 @@ export function NovelShelf() {
   }
 
   const confirmedCount = items.filter((item) => item.framework_confirmed).length;
-  const draftingCount = items.filter((item) => item.status !== "archived").length;
+  const activeAutomationCount = useMemo(
+    () => items.filter((item) => item.daily_auto_chapters > 0).length,
+    [items]
+  );
+  const totalAutoChapters = useMemo(
+    () => items.reduce((sum, item) => sum + Math.max(0, item.daily_auto_chapters || 0), 0),
+    [items]
+  );
+  const failedCount = useMemo(
+    () => items.filter((item) => item.status === "failed").length,
+    [items]
+  );
+  const spotlightNovel = useMemo(() => {
+    return [...items].sort((a, b) => {
+      const aTime = a.updated_at ? Date.parse(a.updated_at) : 0;
+      const bTime = b.updated_at ? Date.parse(b.updated_at) : 0;
+      return bTime - aTime;
+    })[0] ?? null;
+  }, [items]);
+  const spotlightTheme = spotlightNovel
+    ? themeForNovel(`${spotlightNovel.id}${spotlightNovel.title}`)
+    : shelfThemes[0];
+  const spotlightStage = spotlightNovel ? stageForNovel(spotlightNovel) : null;
 
   async function handleAiCreate() {
     const ready = await ensureLlmReady();
@@ -230,21 +387,32 @@ export function NovelShelf() {
   return (
     <div className="novel-shell">
       <div className="novel-container space-y-6">
-        <section className="glass-panel overflow-hidden p-6 md:p-8">
-          <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
-            <div className="max-w-2xl space-y-4">
-              <span className="glass-chip">
-                <BookOpen className="size-3.5 text-primary" />
-                <span className="text-foreground/80 dark:text-inherit font-medium">小说工作区</span>
-              </span>
-              <div className="space-y-2">
-                <h1 className="text-3xl font-semibold tracking-tight text-foreground md:text-4xl">
-                  把书架当作创作入口，而不是文件列表。
+        <section className="glass-panel relative overflow-hidden p-6 md:p-8">
+          <div className="pointer-events-none absolute inset-0 bg-gradient-to-br from-primary/10 via-transparent to-accent/10" />
+          <div className="grid gap-6 xl:grid-cols-[1.02fr_0.98fr]">
+            <div className="relative space-y-5">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
+                  <Sparkles className="size-3.5" />
+                  小说书架 / Story Shelf
+                </span>
+                <span className="glass-chip">作品态势板</span>
+              </div>
+
+              <div className="space-y-3">
+                <h1 className="max-w-3xl text-3xl font-semibold tracking-[-0.03em] text-foreground md:text-5xl">
+                  把书架做成
+                  <span className="bg-gradient-to-r from-primary via-accent to-cyan-400 bg-clip-text text-transparent">
+                    创作控制台
+                  </span>
+                  ，而不是文件列表。
                 </h1>
-                <p className="max-w-xl text-sm leading-6 text-foreground/70 dark:text-muted-foreground md:text-base font-medium">
-                  在这里管理你的世界观、创作节奏和日更任务。每本书都保留独立的框架、章节与记忆，适合持续推进长篇。
+                <p className="max-w-2xl text-sm leading-7 text-foreground/70 md:text-base">
+                  在这里一眼看出每本书处在哪个阶段、有没有自动推进、哪本书最近最活跃。
+                  进入工作台之前，先把整座书架的节奏和异常看清楚。
                 </p>
               </div>
+
               <div className="flex flex-wrap gap-3">
                 <Button asChild size="lg" className="min-w-36 font-semibold">
                   <Link to="/novels/new">
@@ -252,27 +420,118 @@ export function NovelShelf() {
                     新建小说
                   </Link>
                 </Button>
-                <Button size="lg" variant="secondary" onClick={() => setAiCreateOpen(true)} className="font-semibold text-foreground/90">
+                <Button
+                  size="lg"
+                  variant="secondary"
+                  onClick={() => setAiCreateOpen(true)}
+                  className="font-semibold text-foreground/90"
+                >
                   一键AI建书
                 </Button>
                 <Button asChild size="lg" variant="glass" className="font-semibold">
                   <Link to="/">返回首页</Link>
                 </Button>
               </div>
-            </div>
-            <div className="grid w-full flex-1 gap-3 sm:grid-cols-3 lg:max-w-xl">
-              {[
-                ["作品数", `${items.length}`],
-                ["框架已确认", `${confirmedCount}`],
-                ["创作中", `${draftingCount}`],
-              ].map(([label, value]) => (
-                <div key={label} className="glass-panel-subtle p-4">
-                  <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">{label}</p>
-                  <p className="mt-2 text-2xl font-bold tracking-tight text-foreground">
-                    {value}
-                  </p>
+
+              <div className="grid gap-3 sm:grid-cols-3">
+                {[
+                  ["作品总数", `${items.length}`, "当前书架中的全部项目"],
+                  ["可继续推进", `${confirmedCount}`, "框架已确认，可直接进入卷规划与正文"],
+                  ["自动推进", `${activeAutomationCount}`, `累计每日 ${totalAutoChapters} 章`],
+                ].map(([label, value, hint]) => (
+                  <div key={label} className="glass-panel-subtle p-4">
+                    <p className="text-xs font-semibold uppercase tracking-[0.22em] text-foreground/55">
+                      {label}
+                    </p>
+                    <p className="mt-2 text-2xl font-semibold tracking-tight text-foreground">
+                      {value}
+                    </p>
+                    <p className="mt-1 text-sm leading-6 text-foreground/60">{hint}</p>
+                  </div>
+                ))}
+              </div>
+              {failedCount > 0 ? (
+                <div className="status-badge border-amber-500/30 bg-amber-500/8 text-amber-700 dark:text-amber-300">
+                  当前有 {failedCount} 本作品需要排障，建议优先查看焦点作品或失败任务。
                 </div>
-              ))}
+              ) : null}
+            </div>
+
+            <div className="relative">
+              {spotlightNovel ? (
+                <div className="signal-surface story-mesh overflow-hidden p-5 sm:p-6">
+                  <div
+                    className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${spotlightTheme.cover}`}
+                  />
+                  <div className="relative z-10 flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-semibold uppercase tracking-[0.3em] text-foreground/55">
+                        焦点作品
+                      </p>
+                      <h2 className="mt-3 text-2xl font-semibold tracking-tight text-foreground sm:text-3xl">
+                        《{spotlightNovel.title}》
+                      </h2>
+                    </div>
+                    <span className={`rounded-full border px-3 py-1 text-xs font-semibold ${spotlightTheme.chip}`}>
+                      {spotlightStage?.label}
+                    </span>
+                  </div>
+
+                  <p className="relative z-10 mt-4 max-w-2xl text-sm leading-7 text-foreground/70">
+                    {spotlightNovel.intro || "还没有简介。你可以进入工作台先补全主线、人物和核心冲突。"}
+                  </p>
+
+                  <div className="relative z-10 mt-6">
+                    <NovelStageRail
+                      activeIndex={spotlightStage?.index ?? 0}
+                      stripe={spotlightTheme.stripe}
+                      hint={spotlightStage?.hint}
+                    />
+                  </div>
+
+                  <div className="relative z-10 mt-5 flex flex-wrap gap-2 text-sm text-foreground/70">
+                    <span className="status-badge">
+                      目标 {spotlightNovel.target_chapters} 章 · {spotlightNovel.length_tag}
+                    </span>
+                    <span className="status-badge">
+                      {spotlightNovel.daily_auto_chapters > 0
+                        ? `自动 ${spotlightNovel.daily_auto_chapters} 章 / 天`
+                        : "手动推进"}
+                    </span>
+                    <span className="status-badge">
+                      最近活动 {relativeUpdatedAt(spotlightNovel.updated_at)}
+                    </span>
+                  </div>
+
+                  <div className="relative z-10 mt-5 flex flex-wrap items-center gap-3">
+                    <Button asChild>
+                      <Link to={`/novels/${spotlightNovel.id}`}>
+                        进入工作台
+                        <ArrowRight className="size-4" />
+                      </Link>
+                    </Button>
+                    {!spotlightNovel.framework_confirmed ? (
+                      <Button asChild variant="outline">
+                        <Link to={`/novels/${spotlightNovel.id}?wizard=1`}>确认框架</Link>
+                      </Button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : (
+                <Card className="h-full">
+                  <CardContent className="flex h-full flex-col items-center justify-center gap-4 py-16 text-center">
+                    <div className="flex size-16 items-center justify-center rounded-3xl bg-primary/10 text-primary">
+                      <BookOpen className="size-7" />
+                    </div>
+                    <div className="space-y-2">
+                      <p className="text-xl font-semibold text-foreground">书架还没有作品</p>
+                      <p className="text-sm leading-6 text-muted-foreground">
+                        新建一本书后，这里会出现最近最活跃的作品和整座书架的节奏概览。
+                      </p>
+                    </div>
+                  </CardContent>
+                </Card>
+              )}
             </div>
           </div>
         </section>
@@ -287,7 +546,7 @@ export function NovelShelf() {
             <div>
               <p className="section-heading text-foreground font-bold">你的作品</p>
               <p className="mt-1 text-sm text-foreground/60 dark:text-muted-foreground font-medium">
-                在这里管理您的所有创作项目。
+                每张卡片只保留阶段、最近活动和下一步入口。
               </p>
             </div>
             <div className="glass-chip font-bold text-foreground/80">
@@ -318,107 +577,121 @@ export function NovelShelf() {
             </Card>
           ) : null}
           <div className="grid gap-4 lg:grid-cols-2">
-            {items.map((n) => (
-              <Card
-                key={n.id}
-                className={`group overflow-hidden border-border/70 hover:-translate-y-1 hover:border-primary/25 hover:shadow-[0_20px_60px_rgba(15,23,42,0.12)] ${
-                  n.status === 'failed' ? 'opacity-90 border-destructive/20' : ''
-                }`}
-              >
-                <CardHeader className="pb-3">
-                  <div className="flex items-start gap-4">
-                    <div className={`flex size-11 shrink-0 items-center justify-center rounded-2xl shadow-[inset_0_1px_0_rgba(255,255,255,0.5)] ${
-                      n.status === 'failed' ? 'bg-destructive/10 text-destructive' : 'bg-primary/10 text-primary'
-                    }`}>
-                      <BookOpen className="size-5" />
-                    </div>
-                    <div className="min-w-0 flex-1 space-y-2">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="glass-chip px-2.5 py-1 text-[11px] text-primary font-bold">
-                          {n.length_tag}
-                        </span>
-                        <span className={`glass-chip px-2.5 py-1 text-[11px] font-bold ${
-                          n.status === 'failed' ? 'text-destructive bg-destructive/10' : 'text-foreground/70 dark:text-inherit'
-                        }`}>
-                          {n.status === 'failed' 
-                            ? (n.framework_confirmed ? '续写/同步中失败' : '建书构思失败') 
-                            : n.status}
-                        </span>
-                        <span className="glass-chip px-2.5 py-1 text-[11px] text-foreground/70 dark:text-inherit font-medium">
-                          框架{n.framework_confirmed ? "已确认" : "未确认"}
-                        </span>
+            {items.map((n) => {
+              const theme = themeForNovel(`${n.id}${n.title}`);
+              const stage = stageForNovel(n);
+              const statusLabel =
+                n.status === "failed"
+                  ? n.framework_confirmed
+                    ? "续写 / 同步失败"
+                    : "建书构思失败"
+                  : n.status;
+
+              return (
+                <div
+                  key={n.id}
+                  className={`group glass-panel-subtle overflow-hidden p-0 transition-all duration-300 hover:-translate-y-1 hover:border-primary/25 hover:shadow-[0_20px_60px_rgba(15,23,42,0.12)] ${
+                    n.status === "failed" ? "border-destructive/25" : ""
+                  }`}
+                >
+                  <div className="relative overflow-hidden border-b border-border/50 px-5 py-5">
+                    <div className={`pointer-events-none absolute inset-0 bg-gradient-to-br ${theme.cover}`} />
+                    <div className={`pointer-events-none absolute right-[-18%] top-[-28%] h-44 w-44 rounded-full blur-3xl ${theme.glow}`} />
+
+                    <div className="relative z-10 flex items-start justify-between gap-4">
+                      <div className="min-w-0 flex-1 space-y-3">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className={`rounded-full border px-3 py-1 text-[11px] font-semibold ${theme.chip}`}>
+                            {n.length_tag}
+                          </span>
+                          <span
+                            className={`rounded-full border px-3 py-1 text-[11px] font-semibold ${
+                              n.status === "failed"
+                                ? "border-destructive/30 bg-destructive/10 text-destructive"
+                                : "border-border/70 bg-background/70 text-foreground/65"
+                            }`}
+                          >
+                            {statusLabel}
+                          </span>
+                        </div>
+
+                        <div className="space-y-2">
+                          <CardTitle className="text-2xl font-semibold tracking-tight">
+                            <Link
+                              to={`/novels/${n.id}`}
+                              className="transition-colors group-hover:text-primary"
+                            >
+                              {n.title}
+                            </Link>
+                          </CardTitle>
+                          <CardDescription className="line-clamp-3 text-[15px] text-foreground/68">
+                            {n.intro || "还没有简介，可以先进入工作台补充世界观、人物与主线冲突。"}
+                          </CardDescription>
+                        </div>
                       </div>
-                      <CardTitle className="text-xl font-bold">
-                        <Link
-                          to={`/novels/${n.id}`}
-                          className="transition-colors group-hover:text-primary"
-                        >
-                          {n.title}
-                        </Link>
-                      </CardTitle>
-                      <CardDescription className="line-clamp-3 text-foreground/70 dark:text-muted-foreground font-medium">
-                        {n.intro || "还没有简介，可以先进入工作台补充世界观、人物与基调。"}
-                      </CardDescription>
+
+                      <div className="shrink-0 rounded-[1.4rem] border border-border/60 bg-background/70 px-4 py-3 text-right shadow-[0_14px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
+                          最近活动
+                        </p>
+                        <p className="mt-2 inline-flex items-center gap-2 text-sm font-semibold text-foreground/78">
+                          <Clock3 className="size-3.5" />
+                          {relativeUpdatedAt(n.updated_at)}
+                        </p>
+                      </div>
                     </div>
                   </div>
-                </CardHeader>
-                <CardContent className="space-y-4">
-                  <div className="grid gap-2 sm:grid-cols-3">
-                    <div className="rounded-2xl border border-border/60 bg-background/55 px-3 py-2">
-                      <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">创作状态</p>
-                      <p className="mt-1 text-sm font-bold text-foreground">{n.status}</p>
+
+                  <div className="space-y-4 p-5">
+                    <div className="flex flex-wrap gap-2 text-xs text-foreground/62">
+                      <span className="status-badge">目标 {n.target_chapters} 章</span>
+                      <span className="status-badge">
+                        {n.daily_auto_chapters > 0 ? `自动 ${n.daily_auto_chapters} 章 / 天` : "手动推进"}
+                      </span>
+                      <span className="status-badge">{stage.label}</span>
                     </div>
-                    <div className="rounded-2xl border border-border/60 bg-background/55 px-3 py-2">
-                      <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">每日自动</p>
-                      <p className="mt-1 text-sm font-bold text-foreground">
-                        {n.daily_auto_chapters} 章
-                      </p>
-                    </div>
-                    <div className="rounded-2xl border border-border/60 bg-background/55 px-3 py-2">
-                      <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">入口</p>
-                      <p className="mt-1 text-sm font-bold text-foreground">
-                        工作台 / 章节 / 记忆
-                      </p>
-                    </div>
-                  </div>
-                  <div className="flex flex-wrap items-center justify-between gap-3">
-                    <div className="flex flex-wrap gap-2">
-                      <Button asChild variant="glass">
-                        <Link to={`/novels/${n.id}`}>
-                          {n.status === 'failed' ? "查看失败详情" : "进入工作台"}
-                        </Link>
+                    <NovelStageRail activeIndex={stage.index} stripe={theme.stripe} hint={stage.hint} compact />
+
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <div className="flex flex-wrap gap-2">
+                        <Button asChild variant="glass">
+                          <Link to={`/novels/${n.id}`}>
+                            {n.status === "failed" ? "查看失败详情" : "进入工作台"}
+                            <ArrowRight className="size-4" />
+                          </Link>
+                        </Button>
+                        {!n.framework_confirmed && (
+                          <Button asChild variant="outline" className="font-bold">
+                            <Link to={`/novels/${n.id}?wizard=1`}>修改框架</Link>
+                          </Button>
+                        )}
+                        {n.status === "failed" && (
+                          <Button
+                            variant="secondary"
+                            className="font-bold"
+                            onClick={() => {
+                              setAiCreateOpen(true);
+                            }}
+                          >
+                            重新建书
+                          </Button>
+                        )}
+                      </div>
+
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="destructive"
+                        disabled={busyId === n.id}
+                        onClick={() => void onDeleteNovel(n.id, n.title)}
+                      >
+                        {busyId === n.id ? "删除中…" : "删除作品"}
                       </Button>
-                      {!n.framework_confirmed && (
-                        <Button asChild variant="outline" className="font-bold">
-                          <Link to={`/novels/${n.id}?wizard=1`}>修改框架</Link>
-                        </Button>
-                      )}
-                      {n.status === 'failed' && (
-                        <Button 
-                          variant="secondary" 
-                          className="font-bold"
-                          onClick={() => {
-                            // 重新打开建书对话框（这里由于是新小说，简单起见引导回一键建书）
-                            setAiCreateOpen(true);
-                          }}
-                        >
-                          重新建书
-                        </Button>
-                      )}
                     </div>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="destructive"
-                      disabled={busyId === n.id}
-                      onClick={() => void onDeleteNovel(n.id, n.title)}
-                    >
-                      {busyId === n.id ? "删除中…" : "删除作品"}
-                    </Button>
                   </div>
-                </CardContent>
-              </Card>
-            ))}
+                </div>
+              );
+            })}
           </div>
         </section>
       </div>

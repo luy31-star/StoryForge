@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
-import { X } from "lucide-react";
+import { BookOpen, Brain, GitBranch, Sparkles, X } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
 import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
 import { WritingStyleSelect } from "@/components/WritingStyleSelect";
@@ -72,6 +72,17 @@ const CONTINUITY_LINE_PAGE = 8;
 const CHAPTER_PAGE_SIZE = 3;
 type WorkspaceTab = "framework" | "volumes" | "chapters" | "memory";
 
+const MEMORY_ATLAS_POINTS = [
+  { left: "10%", top: "18%" },
+  { left: "34%", top: "10%" },
+  { left: "62%", top: "14%" },
+  { left: "78%", top: "32%" },
+  { left: "66%", top: "58%" },
+  { left: "42%", top: "70%" },
+  { left: "16%", top: "62%" },
+  { left: "26%", top: "38%" },
+] as const;
+
 function totalPages(n: number, pageSize: number): number {
   return Math.max(1, Math.ceil(Math.max(0, n) / pageSize));
 }
@@ -87,6 +98,17 @@ function safeJsonStringify(data: unknown): string {
   } catch {
     return String(data);
   }
+}
+
+function clamp01(value: number) {
+  if (Number.isNaN(value)) return 0;
+  return Math.max(0, Math.min(1, value));
+}
+
+function shortenText(value: string, max = 88) {
+  const trimmed = value.trim();
+  if (trimmed.length <= max) return trimmed;
+  return `${trimmed.slice(0, max - 1)}…`;
 }
 
 type NormalizedPlanBeats = {
@@ -946,6 +968,81 @@ export function NovelWorkspace() {
       : volumePlan.filter((p) => !hasGeneratedBody(p.chapter_no));
     return { visible, withBodyCount };
   }, [volumePlan, chapters, showVolumePlanWithBody]);
+
+  const selectedVolume = useMemo(
+    () => volumes.find((v) => v.id === selectedVolumeId) ?? null,
+    [volumes, selectedVolumeId]
+  );
+
+  const selectedVolumeTotalChapters = selectedVolume
+    ? selectedVolume.to_chapter - selectedVolume.from_chapter + 1
+    : 0;
+
+  const selectedVolumeCoverage = selectedVolumeTotalChapters
+    ? clamp01(volumePlan.length / selectedVolumeTotalChapters)
+    : 0;
+
+  const selectedVolumeSlots = useMemo(() => {
+    if (!selectedVolume || selectedVolumeTotalChapters <= 0) return [];
+    const planSet = new Set(volumePlan.map((plan) => plan.chapter_no));
+    const bodySet = new Set(
+      chapters
+        .filter(
+          (chapter) =>
+            chapter.chapter_no >= selectedVolume.from_chapter &&
+            chapter.chapter_no <= selectedVolume.to_chapter &&
+            (chapter.content || chapter.pending_content || "").trim().length > 0
+        )
+        .map((chapter) => chapter.chapter_no)
+    );
+
+    return Array.from({ length: selectedVolumeTotalChapters }, (_, index) => {
+      const chapterNo = selectedVolume.from_chapter + index;
+      return {
+        chapterNo,
+        hasPlan: planSet.has(chapterNo),
+        hasBody: bodySet.has(chapterNo),
+      };
+    });
+  }, [chapters, selectedVolume, selectedVolumeTotalChapters, volumePlan]);
+
+  const volumePlanMetrics = useMemo(() => {
+    const normalizedPlans = volumePlan.map((plan) => normalizePlanBeats(plan.beats));
+    return {
+      editedCount: normalizedPlans.filter((plan) => plan.meta.edited_by_user).length,
+      pendingWriteCount: volumePlanView.visible.length,
+    };
+  }, [volumePlan, volumePlanView.visible.length]);
+
+  const memoryVisuals = useMemo(() => {
+    if (!memoryNorm) return null;
+
+    const topCharacters = [...memoryNorm.characters]
+      .sort((a, b) => b.influence_score - a.influence_score)
+      .slice(0, MEMORY_ATLAS_POINTS.length);
+    const maxInfluence = Math.max(
+      1,
+      ...topCharacters.map((character) => character.influence_score || 0)
+    );
+    const topOpenPlots = [...memoryNorm.open_plots]
+      .sort((a, b) => {
+        const priority = (b.priority || 0) - (a.priority || 0);
+        if (priority !== 0) return priority;
+        return (b.last_touched_chapter || 0) - (a.last_touched_chapter || 0);
+      })
+      .slice(0, 6);
+
+    return {
+      topCharacters,
+      maxInfluence,
+      topOpenPlots,
+      topRelations: memoryNorm.relations.slice(0, 6),
+      activeCharacters: memoryNorm.characters.filter((character) => character.is_active).length,
+      activeInventory: memoryNorm.inventory.filter((item) => item.is_active).length,
+      staleCount: memoryHealth?.stale_plots.length ?? 0,
+      overdueCount: memoryHealth?.overdue_plots.length ?? 0,
+    };
+  }, [memoryNorm, memoryHealth]);
 
   function normalizeLines(lines: string[]): string[] {
     return lines.map((x) => x.trim()).filter(Boolean);
@@ -2641,6 +2738,114 @@ export function NovelWorkspace() {
                 一键清除本卷计划
               </Button>
             </div>
+
+            {selectedVolume ? (
+              <div className="grid gap-4 xl:grid-cols-[1.08fr_0.92fr]">
+                <div className="signal-surface story-mesh p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
+                        <Sparkles className="size-3.5" />
+                        Volume Atlas
+                      </span>
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                        第{selectedVolume.volume_no}卷 · {selectedVolume.title}
+                      </h3>
+                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
+                        {selectedVolume.summary ||
+                          "为当前卷生成章节轨道后，这里会显示本卷的节奏分布、缺口与正文覆盖情况。"}
+                      </p>
+                    </div>
+                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
+                        轨道覆盖
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold text-foreground">
+                        {Math.round(selectedVolumeCoverage * 100)}%
+                      </p>
+                      <p className="mt-1 text-sm text-foreground/60">
+                        第{selectedVolume.from_chapter}—{selectedVolume.to_chapter}章
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                    {[
+                      ["计划章节", `${volumePlan.length}`, "已生成执行卡"],
+                      ["待写正文", `${volumePlanMetrics.pendingWriteCount}`, "默认隐藏已有正文章节"],
+                      ["已人工调整", `${volumePlanMetrics.editedCount}`, "说明本卷已经进入精修阶段"],
+                    ].map(([label, value, hint]) => (
+                      <div key={label} className="rounded-[1.2rem] border border-border/60 bg-background/65 px-4 py-3">
+                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
+                          {label}
+                        </p>
+                        <p className="mt-2 text-xl font-semibold text-foreground">{value}</p>
+                        <p className="mt-1 text-sm text-foreground/60">{hint}</p>
+                      </div>
+                    ))}
+                  </div>
+
+                  <div className="mt-5 rounded-[1.6rem] border border-border/60 bg-background/58 p-4">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <GitBranch className="size-4 text-primary" />
+                        <p className="text-sm font-semibold text-foreground">章节轨道</p>
+                      </div>
+                      <span className="status-badge">覆盖 {Math.round(selectedVolumeCoverage * 100)}%</span>
+                    </div>
+
+                    <div className="mt-4 grid grid-cols-5 gap-2 sm:grid-cols-8 lg:grid-cols-10">
+                      {selectedVolumeSlots.map((slot) => (
+                        <div
+                          key={`slot-${slot.chapterNo}`}
+                          className={`rounded-[1rem] border px-2 py-2 text-center ${
+                            slot.hasBody
+                              ? "border-accent/30 bg-accent/12"
+                              : slot.hasPlan
+                                ? "border-primary/25 bg-primary/10"
+                                : "border-border/50 bg-background/44"
+                          }`}
+                        >
+                          <div
+                            className={`mx-auto h-1.5 w-full rounded-full ${
+                              slot.hasBody
+                                ? "bg-gradient-to-r from-accent via-primary to-cyan-200"
+                                : slot.hasPlan
+                                  ? "bg-gradient-to-r from-primary via-accent to-cyan-300"
+                                  : "bg-border/60"
+                            }`}
+                          />
+                          <p className="mt-2 text-[11px] font-semibold text-foreground/62">
+                            {slot.chapterNo}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-4 flex flex-wrap gap-2 text-xs text-foreground/60">
+                      <span className="status-badge">亮色已写正文</span>
+                      <span className="status-badge">主色仅有计划</span>
+                      <span className="status-badge">暗色尚未生成</span>
+                    </div>
+                  </div>
+
+                  <div className="glass-panel-subtle mt-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm text-foreground/68">
+                    <span>
+                      {volumePlan.length === 0
+                        ? "先生成本卷章计划，让每章目标、冲突和转折先被看见。"
+                        : volumePlanView.visible.length === 0
+                          ? "当前视图下没有待写章节，可以切换显示已有正文的章节继续复盘。"
+                          : `下一步优先处理第 ${volumePlanView.visible[0]?.chapter_no ?? "?"} 章。`}
+                    </span>
+                    <span className="text-xs text-foreground/56">
+                      {selectedVolumeCoverage >= 1
+                        ? "本卷计划已铺满"
+                        : `还差 ${Math.max(0, selectedVolumeTotalChapters - volumePlan.length)} 章执行卡`}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <div className="grid gap-4 lg:grid-cols-12">
               <aside className="glass-panel-subtle soft-scroll order-1 lg:col-span-4 p-4">
                 <p className="mb-2 text-xs font-bold text-foreground/60 dark:text-muted-foreground">卷列表</p>
@@ -2672,6 +2877,40 @@ export function NovelWorkspace() {
                           {v.summary}
                         </div>
                       ) : null}
+                      <div className="mt-3">
+                        <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground/50">
+                          <span>轨道覆盖</span>
+                          <span>
+                            {Math.round(
+                              clamp01(
+                                v.chapter_plan_count /
+                                  Math.max(1, v.to_chapter - v.from_chapter + 1)
+                              ) * 100
+                            )}
+                            %
+                          </span>
+                        </div>
+                        <div className="mt-1 h-1.5 rounded-full bg-background/70">
+                          <div
+                            className={`h-full rounded-full ${
+                              selectedVolumeId === v.id
+                                ? "bg-gradient-to-r from-primary via-accent to-cyan-300"
+                                : "bg-gradient-to-r from-foreground/40 via-foreground/20 to-transparent"
+                            }`}
+                            style={{
+                              width: `${Math.max(
+                                10,
+                                Math.round(
+                                  clamp01(
+                                    v.chapter_plan_count /
+                                      Math.max(1, v.to_chapter - v.from_chapter + 1)
+                                  ) * 100
+                                )
+                              )}%`,
+                            }}
+                          />
+                        </div>
+                      </div>
                     </button>
                   ))}
                   {volumes.length === 0 ? (
@@ -2756,56 +2995,289 @@ export function NovelWorkspace() {
                               return (
                             <div
                               key={p.id}
-                              className="list-card p-3.5 text-xs"
+                              className="list-card overflow-hidden p-0 text-xs"
                             >
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="space-y-1">
-                                  <div className="flex flex-wrap items-center gap-2 font-bold text-foreground">
-                                    第{p.chapter_no}章 · {p.chapter_title}
-                                    {normalized.meta?.edited_by_user ? (
-                                      <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                                        已手动编辑
+                              <div className="relative border-b border-border/50 px-4 py-4">
+                                <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-primary/10 via-accent/6 to-transparent" />
+                                <div className="relative flex flex-wrap items-start justify-between gap-3">
+                                  <div className="space-y-2">
+                                    <div className="flex flex-wrap items-center gap-2 font-bold text-foreground">
+                                      第{p.chapter_no}章 · {p.chapter_title}
+                                      {normalized.meta?.edited_by_user ? (
+                                        <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
+                                          已手动编辑
+                                        </span>
+                                      ) : null}
+                                      <span className="rounded-full border border-border/70 bg-background/70 px-2 py-0.5 text-[10px] font-semibold text-foreground/55">
+                                        {p.status === "locked" ? "Locked" : "Editable"}
                                       </span>
-                                    ) : null}
+                                    </div>
+                                    <div className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
+                                      {p.status === "locked"
+                                        ? "当前计划已锁定，适合直接生成正文或复盘节拍。"
+                                        : "执行卡可继续微调，也可以直接把这一章推进为正文。"}
+                                    </div>
                                   </div>
-                                  <div className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
-                                    {p.status === "locked" ? "当前计划已锁定" : "可继续调整或直接生成正文"}
+                                  <div className="flex flex-wrap gap-2">
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="secondary"
+                                      className="font-semibold"
+                                      disabled={busy || volumeBusy || p.status === "locked"}
+                                      onClick={() => openPlanEditor(p)}
+                                    >
+                                      编辑执行卡
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      variant="outline"
+                                      className="font-semibold"
+                                      disabled={busy || p.status === "locked"}
+                                      onClick={() => confirmRegenerateChapterPlan(p.chapter_no)}
+                                    >
+                                      重生成计划
+                                    </Button>
+                                    <Button
+                                      type="button"
+                                      size="sm"
+                                      className="font-bold"
+                                      disabled={busy}
+                                      onClick={() => confirmGenerateChapterFromPlan(p.chapter_no)}
+                                    >
+                                      生成正文
+                                    </Button>
                                   </div>
-                                </div>
-                                <div className="flex gap-2">
-                                  <Button
-                                    type="button"
-                                    size="sm"
-                                    variant="secondary"
-                                    className="font-semibold"
-                                    disabled={busy || volumeBusy || p.status === "locked"}
-                                    onClick={() => openPlanEditor(p)}
-                                  >
-                                    编辑执行卡
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    size="sm"
-                                    variant="outline"
-                                    className="font-semibold"
-                                    disabled={busy || p.status === "locked"}
-                                    onClick={() => confirmRegenerateChapterPlan(p.chapter_no)}
-                                  >
-                                    重生成计划
-                                  </Button>
-                                  <Button
-                                    type="button"
-                                    size="sm"
-                                    className="font-bold"
-                                    disabled={busy}
-                                    onClick={() => confirmGenerateChapterFromPlan(p.chapter_no)}
-                                  >
-                                    生成正文
-                                  </Button>
                                 </div>
                               </div>
-                              <div className="mt-3 rounded-2xl border border-border/60 bg-background/50 px-3 py-2.5 whitespace-pre-wrap text-foreground/80 dark:text-muted-foreground font-medium">
-                                {formatVolumePlanBeatsText(p.beats)}
+
+                              <div className="grid gap-4 p-4 xl:grid-cols-[1.12fr_0.88fr]">
+                                <div className="space-y-3">
+                                  <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <BookOpen className="size-4 text-primary" />
+                                        <p className="text-sm font-semibold text-foreground">执行摘要</p>
+                                      </div>
+                                      {normalized.display_summary.stage_position ? (
+                                        <span className="rounded-full border border-border/70 bg-background/74 px-3 py-1 text-[11px] font-semibold text-foreground/58">
+                                          {normalized.display_summary.stage_position}
+                                        </span>
+                                      ) : (
+                                        <span className="text-[11px] text-foreground/52">
+                                          完整版本见线性摘要
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="mt-4 space-y-3">
+                                      {[
+                                        ["本章目标", normalized.execution_card.chapter_goal || "待补充目标"],
+                                        ["核心冲突", normalized.execution_card.core_conflict || "待补充冲突"],
+                                        ["关键转折", normalized.execution_card.key_turn || "待补充转折"],
+                                      ].map(([label, value]) => (
+                                        <div
+                                          key={`${p.id}-${label}`}
+                                          className="grid gap-2 rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3 md:grid-cols-[92px_1fr]"
+                                        >
+                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                            {label}
+                                          </p>
+                                          <p
+                                            className="text-sm leading-6 text-foreground/82 line-clamp-3"
+                                            title={String(value)}
+                                          >
+                                            {shortenText(String(value), 78)}
+                                          </p>
+                                        </div>
+                                      ))}
+                                    </div>
+
+                                    <div className="mt-4 rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
+                                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                        剧情推进
+                                      </p>
+                                      <p
+                                        className="mt-2 text-sm leading-6 text-foreground/72 line-clamp-4"
+                                        title={normalized.display_summary.plot_summary || "暂未生成剧情摘要。"}
+                                      >
+                                        {normalized.display_summary.plot_summary || "暂未生成剧情摘要。"}
+                                      </p>
+                                      {normalized.display_summary.pacing_justification ? (
+                                        <p
+                                          className="mt-2 text-[12px] leading-6 text-foreground/58 line-clamp-3"
+                                          title={normalized.display_summary.pacing_justification}
+                                        >
+                                          {normalized.display_summary.pacing_justification}
+                                        </p>
+                                      ) : null}
+                                    </div>
+
+                                    {normalized.display_summary.pacing_justification ? (
+                                      <div className="mt-3 flex flex-wrap gap-2 text-xs text-foreground/60">
+                                        <span className="status-badge">已压缩长文本</span>
+                                        <span className="status-badge">优先看目标 / 冲突 / 转折</span>
+                                      </div>
+                                    ) : null}
+                                  </div>
+
+                                  {[
+                                    ["必须发生", normalized.execution_card.must_happen],
+                                    ["必须承接", normalized.execution_card.required_callbacks],
+                                    ["允许推进", normalized.execution_card.allowed_progress],
+                                  ].map(([label, items]) => {
+                                    if (!Array.isArray(items) || items.length === 0) return null;
+                                    return (
+                                      <div
+                                        key={`${p.id}-${label}`}
+                                        className="rounded-[1.3rem] border border-border/60 bg-background/55 p-4"
+                                      >
+                                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                          {label}
+                                        </p>
+                                        <div className="mt-3 flex flex-wrap gap-2">
+                                          {items.map((item, index) => (
+                                            <span
+                                              key={`${p.id}-${label}-${index}`}
+                                              className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
+                                            >
+                                              {item}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      </div>
+                                    );
+                                  })}
+                                </div>
+
+                                <div className="space-y-3">
+                                  <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
+                                    <div className="flex flex-wrap items-center justify-between gap-2">
+                                      <div className="flex items-center gap-2">
+                                        <Sparkles className="size-4 text-primary" />
+                                        <p className="text-sm font-semibold text-foreground">章末与护栏</p>
+                                      </div>
+                                      {normalized.execution_card.scene_cards.length > 0 ? (
+                                        <span className="status-badge">
+                                          Scene {normalized.execution_card.scene_cards.length}
+                                        </span>
+                                      ) : null}
+                                    </div>
+                                    <div className="mt-3 space-y-3">
+                                      <div className="rounded-[1rem] border border-primary/15 bg-primary/6 px-3 py-3">
+                                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                          Ending Hook
+                                        </p>
+                                        <p className="mt-2 text-sm leading-6 text-foreground/82">
+                                          {normalized.execution_card.ending_hook || "暂无章末钩子。"}
+                                        </p>
+                                      </div>
+
+                                      {normalized.execution_card.style_guardrails.length > 0 ? (
+                                        <div>
+                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                            风格护栏
+                                          </p>
+                                          <div className="mt-2 flex flex-wrap gap-2">
+                                            {normalized.execution_card.style_guardrails.map((item, index) => (
+                                              <span
+                                                key={`${p.id}-guardrail-${index}`}
+                                                className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
+                                              >
+                                                {item}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      ) : null}
+
+                                      {normalized.execution_card.scene_cards.length > 0 ? (
+                                        <div>
+                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                            场景锚点
+                                          </p>
+                                          <div className="mt-2 flex flex-wrap gap-2">
+                                            {normalized.execution_card.scene_cards.slice(0, 3).map((scene, index) => (
+                                              <span
+                                                key={`${p.id}-scene-chip-${index}`}
+                                                className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
+                                              >
+                                                {scene.label || scene.goal || `Scene ${index + 1}`}
+                                              </span>
+                                            ))}
+                                          </div>
+                                        </div>
+                                      ) : null}
+
+                                      {normalized.execution_card.reserved_for_later.length > 0 ||
+                                      normalized.execution_card.must_not.length > 0 ? (
+                                        <details className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
+                                          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/52">
+                                            更多约束
+                                          </summary>
+                                          <div className="mt-3 space-y-3">
+                                            {normalized.execution_card.reserved_for_later.length > 0 ? (
+                                              <div>
+                                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                                  延后解锁
+                                                </p>
+                                                <div className="mt-2 grid gap-2">
+                                                  {normalized.execution_card.reserved_for_later.map((item, index) => (
+                                                    <div
+                                                      key={`${p.id}-reserved-${index}`}
+                                                      className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-2 text-sm text-foreground/72"
+                                                    >
+                                                      <span className="font-semibold text-foreground/84">
+                                                        {item.item}
+                                                      </span>
+                                                      {item.not_before_chapter != null ? (
+                                                        <span className="ml-2 text-foreground/56">
+                                                          第 {item.not_before_chapter} 章后
+                                                        </span>
+                                                      ) : null}
+                                                      {item.reason ? (
+                                                        <p className="mt-1 text-sm leading-6 text-foreground/62">
+                                                          {item.reason}
+                                                        </p>
+                                                      ) : null}
+                                                    </div>
+                                                  ))}
+                                                </div>
+                                              </div>
+                                            ) : null}
+
+                                            {normalized.execution_card.must_not.length > 0 ? (
+                                              <div>
+                                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                                                  禁止项
+                                                </p>
+                                                <div className="mt-2 flex flex-wrap gap-2">
+                                                  {normalized.execution_card.must_not.map((item, index) => (
+                                                    <span
+                                                      key={`${p.id}-must-not-${index}`}
+                                                      className="rounded-full border border-rose-500/25 bg-rose-500/10 px-3 py-1 text-[11px] font-medium text-rose-700 dark:text-rose-300"
+                                                    >
+                                                      {item}
+                                                    </span>
+                                                  ))}
+                                                </div>
+                                              </div>
+                                            ) : null}
+                                          </div>
+                                        </details>
+                                      ) : null}
+
+                                      <details className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
+                                        <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/52">
+                                          线性摘要
+                                        </summary>
+                                        <pre className="mt-3 whitespace-pre-wrap text-[11px] leading-6 text-foreground/64">
+                                          {formatVolumePlanBeatsText(p.beats)}
+                                        </pre>
+                                      </details>
+                                    </div>
+                                  </div>
+                                </div>
                               </div>
                             </div>
                               );
@@ -3319,7 +3791,9 @@ export function NovelWorkspace() {
                   {memory?.version != null && memory.version > 0 ? `v${memory.version}` : "未生成"}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {memory?.created_at ? memory.created_at : "刷新后会写入最新快照"}
+                  {memoryHealth?.latest_chapter_no
+                    ? `最近入账第 ${memoryHealth.latest_chapter_no} 章`
+                    : memory?.created_at || "刷新后会写入最新快照"}
                 </p>
               </div>
               <div className="glass-panel-subtle p-4">
@@ -3328,13 +3802,213 @@ export function NovelWorkspace() {
                 <p className="mt-1 text-xs text-muted-foreground">跟踪跨章节持续生效的问题</p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">最近入账章节</p>
+                <p className="text-xs text-muted-foreground">风险信号</p>
                 <p className="mt-2 text-xl font-semibold text-foreground">
-                  {memoryHealth?.latest_chapter_no ? `第 ${memoryHealth.latest_chapter_no} 章` : "-"}
+                  {memoryHealth ? `${memoryHealth.stale_plots.length} / ${memoryHealth.overdue_plots.length}` : "-"}
                 </p>
-                <p className="mt-1 text-xs text-muted-foreground">便于判断记忆是否跟上创作进度</p>
+                <p className="mt-1 text-xs text-muted-foreground">stale / overdue 线索数量</p>
               </div>
             </div>
+
+            {memoryNorm && memoryVisuals ? (
+              <div className="grid gap-4 xl:grid-cols-[1.06fr_0.94fr]">
+                <div className="signal-surface story-mesh p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
+                        <Sparkles className="size-3.5" />
+                        Memory Atlas
+                      </span>
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                        把角色、关系和线索放回同一张记忆星图。
+                      </h3>
+                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
+                        先看谁最活跃、哪条线最危险，再决定要不要往下钻进结构化明细。
+                      </p>
+                    </div>
+                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
+                        实体总览
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold text-foreground">
+                        {memoryNorm.characters.length + memoryNorm.inventory.length + memoryNorm.skills.length}
+                      </p>
+                      <p className="mt-1 text-sm text-foreground/60">
+                        人物 + 物品 + 技能
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-4 lg:grid-cols-[0.98fr_1.02fr]">
+                    <div className="relative min-h-[320px] rounded-[1.7rem] border border-border/60 bg-background/58 p-4">
+                      <svg
+                        viewBox="0 0 100 100"
+                        className="pointer-events-none absolute inset-0 h-full w-full"
+                        aria-hidden="true"
+                      >
+                        {MEMORY_ATLAS_POINTS.slice(0, 6).map((point, index) => {
+                          const next = MEMORY_ATLAS_POINTS[(index + 1) % 6];
+                          return (
+                            <line
+                              key={`atlas-line-${index}`}
+                              x1={point.left}
+                              y1={point.top}
+                              x2={next.left}
+                              y2={next.top}
+                              stroke="hsl(var(--primary) / 0.16)"
+                              strokeWidth="0.6"
+                            />
+                          );
+                        })}
+                        <circle cx="50" cy="50" r="28" fill="none" stroke="hsl(var(--primary) / 0.15)" />
+                        <circle cx="50" cy="50" r="18" fill="none" stroke="hsl(var(--accent) / 0.15)" />
+                      </svg>
+
+                      {memoryVisuals.topCharacters.map((character, index) => {
+                        const point = MEMORY_ATLAS_POINTS[index];
+                        const size =
+                          62 +
+                          Math.round(
+                            clamp01(character.influence_score / memoryVisuals.maxInfluence) * 30
+                          );
+
+                        return (
+                          <div
+                            key={`atlas-character-${character.name}-${index}`}
+                            className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-border/60 bg-background/82 shadow-[0_18px_40px_rgba(15,23,42,0.14)] backdrop-blur-xl"
+                            style={{
+                              left: point.left,
+                              top: point.top,
+                              width: `${size}px`,
+                              height: `${size}px`,
+                            }}
+                          >
+                            <div className="flex h-full flex-col items-center justify-center px-3 text-center">
+                              <p className="text-xs font-semibold text-foreground">
+                                {shortenText(character.name, 9)}
+                              </p>
+                              <p className="mt-1 text-[10px] text-foreground/58">
+                                影响力 {character.influence_score}
+                              </p>
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                      <div className="absolute bottom-4 left-4 rounded-[1.1rem] border border-border/60 bg-background/76 px-3 py-2 text-xs text-foreground/62 backdrop-blur-xl">
+                        活跃人物 {memoryVisuals.activeCharacters} · 活跃物品 {memoryVisuals.activeInventory}
+                      </div>
+                    </div>
+
+                    <div className="space-y-3">
+                      <div className="grid gap-3 sm:grid-cols-3">
+                        {[
+                          ["人物", `${memoryNorm.characters.length}`, `${memoryVisuals.activeCharacters} 名活跃中`],
+                          ["关系", `${memoryNorm.relations.length}`, memoryVisuals.topRelations.length > 0 ? "已提炼人物脉络" : "等待关系沉淀"],
+                          ["线索风险", `${memoryVisuals.staleCount + memoryVisuals.overdueCount}`, `${memoryVisuals.staleCount} stale / ${memoryVisuals.overdueCount} overdue`],
+                        ].map(([label, value, hint]) => (
+                          <div key={label} className="rounded-[1.2rem] border border-border/60 bg-background/64 px-4 py-3">
+                            <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
+                              {label}
+                            </p>
+                            <p className="mt-2 text-xl font-semibold text-foreground">{value}</p>
+                            <p className="mt-1 text-sm text-foreground/60">{hint}</p>
+                          </div>
+                        ))}
+                      </div>
+
+                      <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
+                        <div className="flex items-center gap-2">
+                          <GitBranch className="size-4 text-primary" />
+                          <p className="text-sm font-semibold text-foreground">关系脉络</p>
+                        </div>
+                        {memoryVisuals.topRelations.length > 0 ? (
+                          <div className="mt-4 space-y-2">
+                            {memoryVisuals.topRelations.map((relation, index) => (
+                              <div
+                                key={`relation-atlas-${index}-${relation.from}-${relation.to}`}
+                                className="rounded-[1.1rem] border border-border/55 bg-background/68 px-3 py-3"
+                              >
+                                <div className="flex items-center gap-3">
+                                  <span className="min-w-0 shrink text-sm font-semibold text-foreground/84">
+                                    {relation.from}
+                                  </span>
+                                  <div className="h-[1px] flex-1 bg-gradient-to-r from-primary via-accent to-cyan-300" />
+                                  <span className="min-w-0 shrink text-sm font-semibold text-foreground/84">
+                                    {relation.to}
+                                  </span>
+                                </div>
+                                <p className="mt-2 text-sm text-foreground/62">{relation.relation}</p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-3 text-sm text-foreground/60">还没有提炼出人物关系。</p>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="grid gap-3">
+                  <div className="signal-surface p-4">
+                    <div className="flex items-center gap-2">
+                      <Brain className="size-4 text-primary" />
+                      <p className="text-sm font-semibold text-foreground">待收束线雷达</p>
+                    </div>
+                    {memoryVisuals.topOpenPlots.length > 0 ? (
+                      <div className="mt-4 space-y-3">
+                        {memoryVisuals.topOpenPlots.map((plot, index) => {
+                          const progress =
+                            plot.estimated_duration && plot.introduced_chapter != null && plot.last_touched_chapter != null
+                              ? clamp01(
+                                  (plot.last_touched_chapter - plot.introduced_chapter + 1) /
+                                    Math.max(1, plot.estimated_duration)
+                                )
+                              : clamp01((plot.priority || 0) / 5);
+                          return (
+                            <div
+                              key={`plot-radar-${index}-${plot.body}`}
+                              className="rounded-[1.3rem] border border-border/60 bg-background/62 p-4"
+                            >
+                              <div className="flex flex-wrap items-center justify-between gap-2">
+                                <span className="rounded-full border border-border/70 bg-background/74 px-3 py-1 text-[11px] font-semibold text-foreground/58">
+                                  {plot.plot_type || "Open Plot"}
+                                </span>
+                                <span className="text-[11px] font-semibold text-foreground/56">
+                                  Priority {plot.priority ?? 0}
+                                </span>
+                              </div>
+                              <p className="mt-3 text-sm leading-7 text-foreground/72">
+                                {shortenText(formatMemoryPlotLine(plot), 92)}
+                              </p>
+                              <div className="mt-3 h-2 rounded-full bg-background/70">
+                                <div
+                                  className="h-full rounded-full bg-gradient-to-r from-primary via-accent to-cyan-300"
+                                  style={{ width: `${Math.max(14, Math.round(progress * 100))}%` }}
+                                />
+                              </div>
+                              <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
+                                {plot.introduced_chapter != null ? (
+                                  <span>引入于第 {plot.introduced_chapter} 章</span>
+                                ) : null}
+                                {plot.last_touched_chapter != null ? (
+                                  <span>最近触达第 {plot.last_touched_chapter} 章</span>
+                                ) : null}
+                                {plot.resolve_when ? <span>{plot.resolve_when}</span> : null}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    ) : (
+                      <p className="mt-4 text-sm text-foreground/60">当前没有待收束线。</p>
+                    )}
+                  </div>
+                </div>
+              </div>
+            ) : null}
+
             <div className="glass-panel-subtle space-y-3 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-sm font-medium">结构化记忆（分表）</p>
@@ -3343,7 +4017,7 @@ export function NovelWorkspace() {
                 </span>
               </div>
               <p className="text-[11px] text-muted-foreground">
-                真源为结构化表；审定与刷新会写入表并派生快照。仅在表空或需用快照救场时使用导入。
+                审定与刷新会写入结构化表，再派生快照；这里只保留便于排查和人工修正的入口。
               </p>
               {!memoryNorm ? (
                 <p className="text-xs text-muted-foreground">
@@ -3358,9 +4032,11 @@ export function NovelWorkspace() {
                     </span>
                   </p>
                   {memorySchemaGuide ? (
-                    <div className="space-y-3 rounded-[1.4rem] border border-sky-500/30 bg-sky-500/5 p-4">
-                      <p className="font-medium text-foreground">结构化记忆录入规范</p>
-                      <div className="grid gap-3 md:grid-cols-2">
+                    <details className="rounded-[1.4rem] border border-sky-500/30 bg-sky-500/5 p-4">
+                      <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/62">
+                        结构化记忆录入规范
+                      </summary>
+                      <div className="mt-3 grid gap-3 md:grid-cols-2">
                         {[
                           ["全书待收束线", memorySchemaGuide.open_plots],
                           ["关键事实", memorySchemaGuide.key_facts],
@@ -3400,29 +4076,26 @@ export function NovelWorkspace() {
                           );
                         })}
                       </div>
-                    </div>
+                    </details>
                   ) : null}
                   {memoryHealth ? (
                     <div className="space-y-3 rounded-[1.4rem] border border-amber-500/30 bg-amber-500/5 p-4">
-                      <p className="font-medium text-foreground">记忆健康检查</p>
-                      <p className="text-[11px] text-muted-foreground">
-                        最近已进入记忆账本的章节：第 {memoryHealth.latest_chapter_no || 0} 章
-                      </p>
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <p className="font-medium text-foreground">记忆健康检查</p>
+                        <span className="text-[11px] text-muted-foreground">
+                          最近入账第 {memoryHealth.latest_chapter_no || 0} 章
+                        </span>
+                      </div>
                       <p className="text-[11px] text-muted-foreground">
                         超期线索 {memoryHealth.overdue_plots.length} 条，已 stale 线索{" "}
                         {memoryHealth.stale_plots.length} 条。
                       </p>
                       {memoryHealth.stale_plots.length > 0 ? (
-                        <div className="list-card p-3">
-                          <p className="mb-1 text-[11px] font-medium text-foreground/90">
-                            建议优先人工确认的线索
-                          </p>
-                          <ul className="space-y-1 text-[11px] text-muted-foreground">
-                            {memoryHealth.stale_plots.slice(0, 5).map((plot, idx) => (
-                              <li key={`stale-${idx}`}>- {formatMemoryPlotLine(plot)}</li>
-                            ))}
-                          </ul>
-                        </div>
+                        <ul className="space-y-1 text-[11px] text-muted-foreground">
+                          {memoryHealth.stale_plots.slice(0, 3).map((plot, idx) => (
+                            <li key={`stale-${idx}`}>- {formatMemoryPlotLine(plot)}</li>
+                          ))}
+                        </ul>
                       ) : null}
                     </div>
                   ) : null}
