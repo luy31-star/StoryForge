@@ -2587,7 +2587,12 @@ class NovelLLMService:
         """
         if isinstance(entry, dict):
             lab = str(
-                entry.get("name") or entry.get("item") or entry.get("label") or ""
+                entry.get("item_name")
+                or entry.get("name")
+                or entry.get("item")
+                or entry.get("label")
+                or entry.get("title")
+                or ""
             ).strip()
             if not lab:
                 lab = json.dumps(entry, ensure_ascii=False)[:512]

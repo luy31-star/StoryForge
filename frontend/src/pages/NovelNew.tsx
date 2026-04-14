@@ -176,7 +176,7 @@ export function NovelNew() {
                 </Button>
               </div>
             </div>
-            <div className="grid min-w-[280px] flex-1 gap-3 sm:grid-cols-3">
+            <div className="grid w-full flex-1 gap-3 sm:grid-cols-3 lg:max-w-xl">
               {[
                 ["推荐流程", "先聊灵感"],
                 ["再做什么", "补简介与设定"],
@@ -206,7 +206,7 @@ export function NovelNew() {
             <Button
               type="button"
               variant="glass"
-              className="shrink-0 gap-2 sm:min-w-[200px] font-bold"
+              className="w-full gap-2 sm:w-auto sm:min-w-[200px] font-bold"
               onClick={() => setInspireOpen(true)}
             >
               <Sparkles className="h-4 w-4" />
@@ -493,12 +493,37 @@ export function NovelNew() {
                   {err}
                 </div>
               ) : null}
-              <div className="flex flex-wrap gap-2">
+              <div className="hidden flex-wrap gap-2 md:flex">
                 <Button type="submit" disabled={loading}>
                   {loading ? "创建中…" : "创建小说"}
                 </Button>
                 <Button type="button" variant="secondary" asChild>
                   <Link to="/novels">取消</Link>
+                </Button>
+              </div>
+            </div>
+          </div>
+
+          <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
+            <div className="novel-container space-y-2 px-4">
+              <p className="text-[11px] font-medium text-foreground/60">
+                {err
+                  ? err
+                  : title.trim()
+                    ? `准备创建《${title.trim()}》`
+                    : "先填写书名，再一键创建"}
+              </p>
+              <div className="grid grid-cols-[0.9fr_1.1fr] gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="font-semibold"
+                  onClick={() => setInspireOpen(true)}
+                >
+                  灵感对话
+                </Button>
+                <Button type="submit" disabled={loading} className="font-bold">
+                  {loading ? "创建中…" : "创建小说"}
                 </Button>
               </div>
             </div>

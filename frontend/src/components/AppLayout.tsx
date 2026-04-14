@@ -1,5 +1,5 @@
 import { Link, Outlet, useNavigate } from "react-router-dom";
-import { LogOut, Settings, Shield, User, Sun, Moon, Monitor, Check, HelpCircle } from "lucide-react";
+import { LogOut, Settings, Shield, User, Sun, Moon, Monitor, Check, HelpCircle, Menu } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { useAuthStore } from "@/stores/authStore";
 import { useEffect, useState } from "react";
@@ -16,6 +16,7 @@ export function AppLayout() {
   const nav = useNavigate();
 
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
   const [theme, setTheme] = useState<"light" | "dark" | "system">(
     (localStorage.getItem("vocalflow-theme") as "light" | "dark" | "system") || "system"
   );
@@ -99,98 +100,188 @@ export function AppLayout() {
     }
   }
 
+  const navItems = [
+    { to: "/novels", label: "小说书架" },
+    { to: "/tasks", label: "我的任务" },
+    { to: "/writing-styles", label: "文风管理" },
+    ...(user?.is_admin
+      ? [
+          { to: "/editor", label: "工作流" },
+          { to: "/projects", label: "项目" },
+          { to: "/admin", label: "管理后台", icon: Shield },
+        ]
+      : []),
+  ];
+
   return (
     <div className="min-h-screen bg-transparent">
       <header className="sticky top-0 z-20 px-4 pt-4 md:px-6">
         <div className="novel-container">
-          <div className="glass-panel-subtle flex flex-col gap-3 px-4 py-3 md:flex-row md:items-center md:gap-4">
-            <Link to="/" className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-primary/12 text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.45)]">
-                <img src="/favicon.svg" className="h-5 w-5" alt="" aria-hidden="true" />
+          <div className="glass-panel-subtle px-4 py-3">
+            <div className="flex items-center justify-between gap-3">
+              <Link to="/" className="min-w-0 flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/12 text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.45)]">
+                  <img src="/favicon.svg" className="h-5 w-5" alt="" aria-hidden="true" />
+                </div>
+                <div className="min-w-0">
+                  <p className="truncate text-sm font-semibold tracking-tight text-foreground">
+                    StoryForge
+                  </p>
+                  <p className="truncate text-[11px] text-muted-foreground">
+                    Creative workspace
+                  </p>
+                </div>
+              </Link>
+              <div className="flex items-center gap-2 md:hidden">
+                <Button variant="ghost" size="icon" onClick={() => setSettingsOpen(true)}>
+                  <Settings className="h-4 w-4" />
+                </Button>
+                <Button variant="ghost" size="icon" onClick={() => setMobileNavOpen(true)}>
+                  <Menu className="h-4 w-4" />
+                </Button>
               </div>
-              <div>
-                <p className="text-sm font-semibold tracking-tight text-foreground">
-                  StoryForge
-                </p>
-                <p className="text-[11px] text-muted-foreground">
-                  Creative workspace
-                </p>
-              </div>
-            </Link>
-            <nav className="flex flex-1 flex-wrap items-center gap-1 text-sm">
-            <Button variant="ghost" size="sm" asChild>
-              <Link to="/novels">小说书架</Link>
-            </Button>
-            <Button variant="ghost" size="sm" asChild>
-              <Link to="/tasks">我的任务</Link>
-            </Button>
-            <Button variant="ghost" size="sm" asChild>
-              <Link to="/writing-styles">文风管理</Link>
-            </Button>
-            {user?.is_admin ? (
-              <>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/editor">工作流</Link>
-                </Button>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/projects">项目</Link>
-                </Button>
-                <Button variant="ghost" size="sm" asChild>
-                  <Link to="/admin">
-                    <Shield className="mr-1 size-3.5" />
-                    管理后台
-                  </Link>
-                </Button>
-              </>
-            ) : null}
-            </nav>
-            <div className="flex items-center gap-2 self-end md:self-auto">
-              <div className="glass-chip hidden sm:inline-flex">
-                积分
+            </div>
+
+            <div className="mt-3 flex items-center justify-between gap-2 md:hidden">
+              <div className="glass-chip min-w-0 flex-1 justify-between">
+                <span className="truncate">积分</span>
                 <span className="font-medium text-foreground tabular-nums">
                   {user?.points_balance ?? 0}
                 </span>
               </div>
-              <Button variant="glass" size="sm" asChild>
+              <Button variant="glass" size="sm" asChild className="shrink-0">
                 <Link to="/recharge">
                   <HelpCircle className="mr-1 size-3.5" />
-                  积分获取
+                  获取积分
                 </Link>
               </Button>
-              <div className="flex h-9 items-center gap-2 rounded-full border border-border/40 bg-card/40 pl-3 pr-1 shadow-sm backdrop-blur-xl ml-2">
-                <div className="flex items-center gap-2 border-r border-border/40 pr-3">
-                  <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary">
-                    <User className="h-3 w-3" />
-                  </div>
-                  <span className="text-xs font-semibold text-foreground/90 max-w-[100px] truncate">
-                    {user?.username || (user?.is_admin ? "管理员" : "用户")}
+            </div>
+
+            <div className="mt-3 hidden items-center gap-4 md:flex">
+              <nav className="flex flex-1 flex-wrap items-center gap-1 text-sm">
+                {navItems.map((item) => {
+                  const Icon = item.icon;
+                  return (
+                    <Button key={item.to} variant="ghost" size="sm" asChild>
+                      <Link to={item.to}>
+                        {Icon ? <Icon className="mr-1 size-3.5" /> : null}
+                        {item.label}
+                      </Link>
+                    </Button>
+                  );
+                })}
+              </nav>
+              <div className="flex items-center gap-2">
+                <div className="glass-chip hidden lg:inline-flex">
+                  积分
+                  <span className="font-medium text-foreground tabular-nums">
+                    {user?.points_balance ?? 0}
                   </span>
+                </div>
+                <Button variant="glass" size="sm" asChild>
+                  <Link to="/recharge">
+                    <HelpCircle className="mr-1 size-3.5" />
+                    积分获取
+                  </Link>
+                </Button>
+                <div className="ml-2 flex h-9 items-center gap-2 rounded-full border border-border/40 bg-card/40 pl-3 pr-1 shadow-sm backdrop-blur-xl">
+                  <div className="flex items-center gap-2 border-r border-border/40 pr-3">
+                    <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary">
+                      <User className="h-3 w-3" />
+                    </div>
+                    <span className="max-w-[100px] truncate text-xs font-semibold text-foreground/90">
+                      {user?.username || (user?.is_admin ? "管理员" : "用户")}
+                    </span>
+                  </div>
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="h-7 w-7 rounded-full text-muted-foreground hover:bg-primary/10 hover:text-primary"
+                    onClick={() => setSettingsOpen(true)}
+                  >
+                    <Settings className="h-4 w-4" />
+                  </Button>
                 </div>
                 <Button
                   variant="ghost"
                   size="icon"
-                  className="h-7 w-7 rounded-full text-muted-foreground hover:bg-primary/10 hover:text-primary"
-                  onClick={() => setSettingsOpen(true)}
+                  className="ml-2"
+                  onClick={() => {
+                    logout();
+                    nav("/login", { replace: true });
+                  }}
                 >
-                  <Settings className="h-4 w-4" />
+                  <LogOut className="size-3.5" />
                 </Button>
               </div>
-              <Button
-                variant="ghost"
-                size="icon"
-                className="ml-2"
-                onClick={() => {
-                  logout();
-                  nav("/login", { replace: true });
-                }}
-              >
-                <LogOut className="size-3.5" />
-              </Button>
             </div>
           </div>
         </div>
       </header>
       <Outlet />
+
+      <Dialog open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
+        <DialogContent className="left-3 right-3 top-auto bottom-3 w-auto max-w-none translate-x-0 translate-y-0 overflow-y-auto rounded-[1.8rem] p-5 md:hidden">
+          <DialogHeader className="text-left">
+            <DialogTitle>快捷导航</DialogTitle>
+            <DialogDescription>
+              在手机上把常用入口收进这里，减少顶部拥挤。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-4">
+            <div className="grid gap-2">
+              {navItems.map((item) => {
+                const Icon = item.icon;
+                return (
+                  <Button key={item.to} variant="outline" className="justify-start" asChild>
+                    <Link to={item.to} onClick={() => setMobileNavOpen(false)}>
+                      {Icon ? <Icon className="mr-2 size-4" /> : null}
+                      {item.label}
+                    </Link>
+                  </Button>
+                );
+              })}
+            </div>
+            <div className="glass-panel-subtle flex items-center justify-between gap-3 p-4">
+              <div className="min-w-0">
+                <p className="text-xs font-bold text-foreground/60">当前账号</p>
+                <p className="truncate text-sm font-semibold text-foreground">
+                  {user?.username || (user?.is_admin ? "管理员" : "用户")}
+                </p>
+              </div>
+              <div className="glass-chip shrink-0">
+                积分
+                <span className="font-medium text-foreground tabular-nums">
+                  {user?.points_balance ?? 0}
+                </span>
+              </div>
+            </div>
+            <div className="grid gap-2 sm:grid-cols-2">
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  setSettingsOpen(true);
+                }}
+              >
+                <Settings className="mr-2 size-4" />
+                用户设置
+              </Button>
+              <Button
+                variant="destructive"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  logout();
+                  nav("/login", { replace: true });
+                }}
+              >
+                <LogOut className="mr-2 size-4" />
+                退出登录
+              </Button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       <Dialog
         open={settingsOpen}
@@ -220,7 +311,7 @@ export function AppLayout() {
               <Label className="text-sm font-bold uppercase tracking-wider text-foreground dark:text-foreground/70">
                 界面风格
               </Label>
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid gap-3 sm:grid-cols-3">
                 {[
                   { id: "light", label: "浅色", icon: Sun },
                   { id: "dark", label: "深色", icon: Moon },

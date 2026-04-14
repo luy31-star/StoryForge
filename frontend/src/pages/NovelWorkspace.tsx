@@ -67,6 +67,7 @@ const STRUCTURED_LIST_PAGE = 8;
 /** 剧情承接与微调区：每类行列表分页，避免单屏过长 */
 const CONTINUITY_LINE_PAGE = 8;
 const CHAPTER_PAGE_SIZE = 3;
+type WorkspaceTab = "framework" | "volumes" | "chapters" | "memory";
 
 function totalPages(n: number, pageSize: number): number {
   return Math.max(1, Math.ceil(Math.max(0, n) / pageSize));
@@ -83,6 +84,45 @@ function safeJsonStringify(data: unknown): string {
   } catch {
     return String(data);
   }
+}
+
+function isJsonLikeText(value: string): boolean {
+  const trimmed = value.trim();
+  return trimmed.startsWith("{") || trimmed.startsWith("[");
+}
+
+function inventoryDisplayLabel(
+  item: NormalizedMemoryPayload["inventory"][number]
+): string {
+  const candidates = [
+    item.label,
+    typeof item.detail.item_name === "string" ? item.detail.item_name : "",
+    typeof item.detail.name === "string" ? item.detail.name : "",
+    typeof item.detail.item === "string" ? item.detail.item : "",
+    typeof item.detail.title === "string" ? item.detail.title : "",
+  ];
+  for (const candidate of candidates) {
+    const text = String(candidate || "").trim();
+    if (!text) continue;
+    if (candidate === item.label && isJsonLikeText(text)) continue;
+    return text;
+  }
+  return "未命名物品";
+}
+
+function inventoryDisplaySummary(
+  item: NormalizedMemoryPayload["inventory"][number]
+): string {
+  const owner =
+    typeof item.detail.owner === "string" ? item.detail.owner.trim() : "";
+  const description =
+    typeof item.detail.description === "string"
+      ? item.detail.description.trim()
+      : "";
+  if (owner && description) return `${owner} · ${description}`;
+  if (description) return description;
+  if (owner) return `持有人：${owner}`;
+  return "";
 }
 
 function formatVolumePlanBeatsText(beats: unknown): string {
@@ -237,6 +277,7 @@ export function NovelWorkspace() {
   const [fwMd, setFwMd] = useState("");
   const [fwJson, setFwJson] = useState("{}");
   const [frameworkWizardOpen, setFrameworkWizardOpen] = useState(false);
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>("framework");
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
@@ -1330,6 +1371,16 @@ export function NovelWorkspace() {
     }
   }
 
+  async function runSaveSelectedChapter() {
+    if (!selectedChapter) return;
+    await run(() =>
+      patchChapter(selectedChapter.id, {
+        title: editTitle,
+        content: editContent,
+      })
+    );
+  }
+
   async function runGenerateVolumePlan(force = false) {
     if (!id || !selectedVolumeId) return;
     setErr(null);
@@ -2132,8 +2183,8 @@ export function NovelWorkspace() {
           </div>
         )}
 
-        <Tabs defaultValue="framework" className="w-full">
-          <TabsList className="w-full flex-wrap justify-start">
+        <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as WorkspaceTab)} className="w-full">
+          <TabsList className="w-full">
             <TabsTrigger value="framework">设定与框架</TabsTrigger>
             <TabsTrigger value="volumes">卷与章计划</TabsTrigger>
             <TabsTrigger value="chapters">章节</TabsTrigger>
@@ -2303,9 +2354,9 @@ export function NovelWorkspace() {
               </Button>
             </div>
             <div className="grid gap-4 lg:grid-cols-12">
-              <aside className="glass-panel-subtle soft-scroll lg:col-span-4 p-4">
+              <aside className="glass-panel-subtle soft-scroll order-1 lg:col-span-4 p-4">
                 <p className="mb-2 text-xs font-bold text-foreground/60 dark:text-muted-foreground">卷列表</p>
-                <div className="max-h-[70vh] space-y-2 overflow-auto pr-1">
+                <div className="max-h-[38vh] space-y-2 overflow-auto pr-1 sm:max-h-[48vh] lg:max-h-[70vh]">
                   {volumes.map((v) => (
                     <button
                       key={v.id}
@@ -2340,7 +2391,7 @@ export function NovelWorkspace() {
                   ) : null}
                 </div>
               </aside>
-              <section className="glass-panel-subtle lg:col-span-8 p-5">
+              <section className="glass-panel-subtle order-2 lg:col-span-8 p-5">
                 {!selectedVolumeId ? (
                   <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧卷。</p>
                 ) : (
@@ -2559,11 +2610,11 @@ export function NovelWorkspace() {
             ) : null}
             
             <div className="grid gap-4 lg:grid-cols-12">
-              <aside className="glass-panel-subtle lg:col-span-4 p-4 flex flex-col overflow-hidden max-h-[85vh]">
+              <aside className={`glass-panel-subtle lg:col-span-4 p-4 flex flex-col overflow-hidden ${selectedChapter ? "order-2" : "order-1"} max-h-[45vh] sm:max-h-[52vh] lg:order-1 lg:max-h-[85vh]`}>
                 <div className="mb-4 shrink-0 space-y-2">
                   <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">按卷浏览</p>
                   {volumes.length > 0 ? (
-                    <div className="flex flex-wrap gap-1.5">
+                    <div className="no-scrollbar flex gap-1.5 overflow-x-auto pb-1">
                       {volumes.map((v, i) => (
                         <button
                           key={v.id}
@@ -2658,7 +2709,7 @@ export function NovelWorkspace() {
                 </div>
               </aside>
 
-              <section className="glass-panel-subtle lg:col-span-8 p-5">
+              <section className={`glass-panel-subtle lg:col-span-8 p-5 ${selectedChapter ? "order-1" : "order-2"} lg:order-2`}>
                 {!selectedChapter ? (
                   <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧章节。</p>
                 ) : (
@@ -2732,14 +2783,7 @@ export function NovelWorkspace() {
                             size="sm"
                             className="font-bold"
                             disabled={busy || !editContent.trim()}
-                            onClick={() =>
-                              run(() =>
-                                patchChapter(selectedChapter.id, {
-                                  title: editTitle,
-                                  content: editContent,
-                                })
-                              )
-                            }
+                            onClick={() => void runSaveSelectedChapter()}
                           >
                             保存章节修改
                           </Button>
@@ -3201,7 +3245,14 @@ export function NovelWorkspace() {
                             className="list-card flex items-center justify-between gap-2 px-3 py-2.5"
                           >
                             <div className="min-w-0 flex-1">
-                              <span className="font-medium text-foreground">{it.label}</span>
+                              <span className="font-medium text-foreground">
+                                {inventoryDisplayLabel(it)}
+                              </span>
+                              {inventoryDisplaySummary(it) ? (
+                                <p className="mt-0.5 line-clamp-2 text-[11px] text-foreground/70 dark:text-muted-foreground">
+                                  {inventoryDisplaySummary(it)}
+                                </p>
+                              ) : null}
                               <p className="text-[10px] text-muted-foreground">
                                 影响力 {it.influence_score} · {it.is_active ? "活跃" : "已退场"}
                                 {it.aliases.length ? ` · 别名 ${it.aliases.slice(0, 3).join(" / ")}` : ""}
@@ -3212,7 +3263,7 @@ export function NovelWorkspace() {
                               size="sm"
                               variant="outline"
                               className="h-7 text-xs"
-                              onClick={() => openNormDetail(`物品 · ${it.label}`, it)}
+                              onClick={() => openNormDetail(`物品 · ${inventoryDisplayLabel(it)}`, it)}
                             >
                               详情
                             </Button>
@@ -3678,6 +3729,145 @@ export function NovelWorkspace() {
             </div>
           </TabsContent>
         </Tabs>
+      </div>
+
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
+        <div className="novel-container space-y-2 px-4">
+          <p className="text-[11px] font-medium text-foreground/60">
+            {activeTab === "framework"
+              ? frameworkConfirmed
+                ? "框架已确认，可继续微调或查看全局设置"
+                : "先确认框架，再进入卷计划和正文创作"
+              : activeTab === "volumes"
+                ? selectedVolumeId
+                  ? "已选中当前卷，可继续按批次推进章计划"
+                  : "先生成卷列表，再逐卷推进章计划"
+                : activeTab === "chapters"
+                  ? selectedChapter
+                    ? `正在编辑第 ${selectedChapter.chapter_no} 章`
+                    : "先选章节，或直接启动自动续写"
+                  : approvedChapterCount > 0
+                    ? "章节审定后建议及时刷新记忆"
+                    : "尚无已审定章节，记忆刷新暂不可用"}
+          </p>
+
+          {activeTab === "framework" ? (
+            <div className="grid grid-cols-2 gap-2">
+              <Button type="button" variant="outline" className="font-semibold" onClick={() => setFrameworkWizardOpen(true)}>
+                修改向导
+              </Button>
+              <Button type="button" className="font-bold" onClick={openNovelSettings}>
+                小说设置
+              </Button>
+            </div>
+          ) : null}
+
+          {activeTab === "volumes" ? (
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="font-semibold"
+                disabled={busy || volumeBusy}
+                onClick={() => confirmGenerateVolumes()}
+              >
+                生成卷列表
+              </Button>
+              <Button
+                type="button"
+                className="font-bold"
+                disabled={busy || volumeBusy || !selectedVolumeId}
+                onClick={() => confirmGenerateVolumePlan(false)}
+              >
+                下一批计划
+              </Button>
+            </div>
+          ) : null}
+
+          {activeTab === "chapters" ? (
+            selectedChapter ? (
+              <div className="grid grid-cols-3 gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="font-semibold"
+                  disabled={busy || !editContent.trim()}
+                  onClick={() => void runSaveSelectedChapter()}
+                >
+                  保存
+                </Button>
+                {selectedChapter.pending_content ? (
+                  <Button
+                    type="button"
+                    className="font-bold"
+                    disabled={busy}
+                    onClick={() => run(() => applyChapterRevision(selectedChapter.id))}
+                  >
+                    确认修订
+                  </Button>
+                ) : (
+                  <Button
+                    type="button"
+                    className="font-bold"
+                    disabled={busy || !selectedChapter.content?.trim()}
+                    onClick={() => confirmApproveChapter(selectedChapter.id)}
+                  >
+                    审定通过
+                  </Button>
+                )}
+                <Button
+                  type="button"
+                  variant="ghost"
+                  className="font-semibold"
+                  onClick={() => setSelectedChapterId("")}
+                >
+                  章节目录
+                </Button>
+              </div>
+            ) : (
+              <div className="grid grid-cols-2 gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="font-semibold"
+                  disabled={busy || !frameworkConfirmed}
+                  onClick={() => confirmGenerateChapters()}
+                >
+                  自动续写
+                </Button>
+                <Button
+                  type="button"
+                  className="font-bold"
+                  onClick={() => setChapterChatOpen(true)}
+                >
+                  章节助手
+                </Button>
+              </div>
+            )
+          ) : null}
+
+          {activeTab === "memory" ? (
+            <div className="grid grid-cols-2 gap-2">
+              <Button
+                type="button"
+                variant="outline"
+                className="font-semibold"
+                disabled={busy || approvedChapterCount === 0}
+                onClick={() => confirmRefreshMemory()}
+              >
+                刷新记忆
+              </Button>
+              <Button
+                type="button"
+                className="font-bold"
+                disabled={busy || memoryNormRebuildBusy}
+                onClick={() => void runGetMemoryHistory()}
+              >
+                版本回退
+              </Button>
+            </div>
+          ) : null}
+        </div>
       </div>
 
       <Dialog open={logDialogOpen} onOpenChange={setLogDialogOpen}>

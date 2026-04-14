@@ -260,7 +260,7 @@ export function NovelShelf() {
                 </Button>
               </div>
             </div>
-            <div className="grid min-w-[280px] flex-1 gap-3 sm:grid-cols-3">
+            <div className="grid w-full flex-1 gap-3 sm:grid-cols-3 lg:max-w-xl">
               {[
                 ["作品数", `${items.length}`],
                 ["框架已确认", `${confirmedCount}`],

@@ -81,6 +81,14 @@ def _parse_influence_active(item: dict[str, Any]) -> tuple[int, bool]:
     return inf, is_active
 
 
+def _inventory_label_from_detail(item: dict[str, Any]) -> str:
+    for key in ("item_name", "name", "item", "label", "title"):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     raw = payload.get("skills")
@@ -126,12 +134,12 @@ def _item_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         return out
     for i, item in enumerate(raw):
         if isinstance(item, dict):
-            name = str(item.get("name") or "").strip()
+            name = _inventory_label_from_detail(item)
             inf, is_active = _parse_influence_active(item)
             rest = {
                 k: v
                 for k, v in item.items()
-                if k not in ("name", "influence_score", "is_active")
+                if k not in ("influence_score", "is_active")
             }
             out.append(
                 {
@@ -521,6 +529,15 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         aliases = extract_aliases(detail)
         return detail, aliases
 
+    def _display_inventory_label(raw_label: str, detail: dict[str, Any]) -> str:
+        label = str(raw_label or "").strip()
+        if label and not label.startswith("{") and not label.startswith("["):
+            return label
+        inferred = _inventory_label_from_detail(detail)
+        if inferred:
+            return inferred
+        return label or "未命名物品"
+
     return {
         "memory_version": outline.memory_version,
         "outline": {
@@ -542,7 +559,7 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         ],
         "inventory": [
             (lambda detail, aliases: {
-                "label": s.label,
+                "label": _display_inventory_label(s.label, detail),
                 "detail": detail,
                 "aliases": aliases,
                 "influence_score": getattr(s, "influence_score", 0) or 0,

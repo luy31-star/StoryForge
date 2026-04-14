@@ -11,7 +11,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -25,6 +25,7 @@ from app.models.novel import (
     NovelGenerationLog,
     NovelMemory,
 )
+from app.models.task import UserTask
 from app.models.volume import NovelVolume, NovelChapterPlan
 from app.services.memory_readable import (
     memory_payload_readable_zh_auto,
@@ -750,6 +751,20 @@ def delete_novel(
     # 注意：部分表（如 novel_generation_logs / novel_volumes / novel_chapter_plans）
     # 通过外键引用 novels，但未配置数据库级联删除；这里按顺序手动清理避免外键错误。
     try:
+        volume_ids = [
+            row[0]
+            for row in db.query(NovelVolume.id)
+            .filter(NovelVolume.novel_id == novel_id)
+            .all()
+        ]
+        task_filters = [UserTask.novel_id == novel_id]
+        if volume_ids:
+            task_filters.append(UserTask.volume_id.in_(volume_ids))
+        deleted_tasks = (
+            db.query(UserTask)
+            .filter(or_(*task_filters))
+            .delete(synchronize_session=False)
+        )
         deleted_plans = (
             db.query(NovelChapterPlan)
             .filter(NovelChapterPlan.novel_id == novel_id)
@@ -774,6 +789,7 @@ def delete_novel(
         raise
     return {
         "status": "ok",
+        "deleted_user_tasks": str(deleted_tasks),
         "deleted_generation_logs": str(deleted_logs),
         "deleted_volumes": str(deleted_vols),
         "deleted_chapter_plans": str(deleted_plans),
