@@ -1024,7 +1024,7 @@ export function NovelShelf() {
                 </div>
                 <div className="space-y-2">
                   <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium pt-7">
-                    AI 在写正文时将以此为强约束。建议 2000-5000。
+                    AI 会尽量按这个目标控制正文篇幅，通常允许上下浮动 1000 字。
                   </p>
                 </div>
               </div>

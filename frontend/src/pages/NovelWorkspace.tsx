@@ -5460,7 +5460,7 @@ export function NovelWorkspace() {
                 onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, chapter_target_words: Number(e.target.value) })}
                 className="field-shell text-foreground font-bold"
               />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 在写正文时将以此为强约束。建议 2000-5000。</p>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 会尽量按这个目标控制正文篇幅，通常允许上下浮动 1000 字。</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="auto_consistency_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">

@@ -360,16 +360,17 @@ def _chapter_messages(
         f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}。"
     )
     target_words = getattr(novel, "chapter_target_words", 3000) or 3000
-    words_min = int(target_words * 0.9)
-    words_max = int(target_words * 1.2)
-    
+    words_min = max(500, int(target_words) - 1000)
+    words_max = int(target_words) + 1000
+
     user_parts.append(
         "【统一输出规则】\n"
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
         "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
         "3) 第二行留空一行，再开始正文。\n"
-        f"4) 正文（不含标题行）目标体量约 {target_words} 汉字左右，建议控制在 {words_min}～{words_max} 汉字之间；"
-        f"严格硬上限：正文不得超过 {target_words + 500} 汉字。超过即视为不合格，你必须在一次输出内自行压缩到上限内。\n"
+        f"4) 正文（不含标题行）目标体量为 {target_words} 汉字左右；你必须尽量把正文控制在 {words_min}～{words_max} 汉字之间，"
+        "也就是与目标字数的上下偏差最多 1000 字。若明显低于下限，说明内容展开不足；若明显高于上限，说明节奏失控，"
+        "你必须优先通过补足场景细节或压缩冗余来在一次输出内贴近该区间。\n"
         "5) 用场景、对白与细节描写支撑篇幅，避免用一两段概括带过，也不要为了凑字数重复心理、环境或解释。\n"
         "6) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
         "7) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
