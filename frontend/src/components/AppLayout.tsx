@@ -115,7 +115,7 @@ export function AppLayout() {
 
   return (
     <div className="min-h-screen bg-transparent">
-      <header className="sticky top-0 z-20 px-4 pt-4 md:px-6">
+      <header className="sticky top-0 z-20 pt-2">
         <div className="novel-container">
           <div className="glass-panel-subtle px-4 py-3">
             <div className="flex items-center justify-between gap-3">

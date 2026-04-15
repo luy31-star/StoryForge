@@ -549,6 +549,7 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         },
         "skills": [
             (lambda detail, aliases: {
+                "id": s.id,
                 "name": s.name,
                 "detail": detail,
                 "aliases": aliases,
@@ -559,6 +560,7 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         ],
         "inventory": [
             (lambda detail, aliases: {
+                "id": s.id,
                 "label": _display_inventory_label(s.label, detail),
                 "detail": detail,
                 "aliases": aliases,

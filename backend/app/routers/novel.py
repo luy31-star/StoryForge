@@ -25,6 +25,11 @@ from app.models.novel import (
     NovelGenerationLog,
     NovelMemory,
 )
+from app.models.novel_memory_norm import (
+    NovelMemoryNormItem,
+    NovelMemoryNormOutline,
+    NovelMemoryNormSkill,
+)
 from app.models.task import UserTask
 from app.models.volume import NovelVolume, NovelChapterPlan
 from app.services.chapter_approval_guard import collect_chapter_approval_issues
@@ -64,6 +69,7 @@ from app.services.novel_generation_common import (
     has_pending_chapter_consistency_batch,
     has_pending_chapter_generation_batch,
     has_pending_chapter_revise_batch,
+    has_pending_chapter_polish_batch,
     has_pending_memory_refresh_batch,
     memory_refresh_confirmation_token,
 )
@@ -71,6 +77,7 @@ from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import (
     novel_chapter_approve_memory_delta,
     novel_chapter_consistency_fix,
+    novel_chapter_polish,
     novel_chapter_revise,
     novel_consolidate_memory,
     novel_generate_chapters_for_novel,
@@ -268,6 +275,34 @@ class MemorySaveBody(BaseModel):
     readable_zh_override: str | None = None
 
 
+class MemorySkillCreateBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=512)
+    detail: dict[str, Any] = Field(default_factory=dict)
+    influence_score: int = Field(default=0, ge=0, le=100)
+    is_active: bool = True
+
+
+class MemorySkillUpdateBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=512)
+    detail: dict[str, Any] | None = None
+    influence_score: int | None = Field(default=None, ge=0, le=100)
+    is_active: bool | None = None
+
+
+class MemoryItemCreateBody(BaseModel):
+    label: str = Field(..., min_length=1, max_length=512)
+    detail: dict[str, Any] = Field(default_factory=dict)
+    influence_score: int = Field(default=0, ge=0, le=100)
+    is_active: bool = True
+
+
+class MemoryItemUpdateBody(BaseModel):
+    label: str | None = Field(default=None, min_length=1, max_length=512)
+    detail: dict[str, Any] | None = None
+    influence_score: int | None = Field(default=None, ge=0, le=100)
+    is_active: bool | None = None
+
+
 class InspirationChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"] = "user"
     content: str = Field(..., min_length=1, max_length=48_000)
@@ -279,6 +314,38 @@ class InspirationChatBody(BaseModel):
 
 class ChapterContextChatBody(BaseModel):
     messages: list[InspirationChatMessage] = Field(..., min_length=1, max_length=40)
+
+
+def _next_memory_version(db: Session, novel_id: str) -> int:
+    return (
+        db.query(func.max(NovelMemory.version))
+        .filter(NovelMemory.novel_id == novel_id)
+        .scalar()
+        or 0
+    ) + 1
+
+
+def _ensure_normalized_outline_row(db: Session, novel_id: str) -> NovelMemoryNormOutline:
+    outline = db.get(NovelMemoryNormOutline, novel_id)
+    if outline:
+        return outline
+    outline = NovelMemoryNormOutline(
+        novel_id=novel_id,
+        memory_version=0,
+        main_plot="",
+        timeline_archive_json="[]",
+        forbidden_constraints_json="[]",
+    )
+    db.add(outline)
+    db.flush()
+    return outline
+
+
+def _clean_required_text(value: str, field_label: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise HTTPException(400, f"{field_label}不能为空")
+    return text
 
 
 def _resolve_chapter_nos_for_generate(
@@ -1399,6 +1466,58 @@ def consistency_fix_chapter(
     }
 
 
+@router.post("/chapters/{chapter_id}/polish")
+def polish_chapter(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    c = require_chapter_access(db, chapter_id, user)
+    n = require_novel_access(db, c.novel_id, user)
+    if not n.framework_confirmed:
+        raise HTTPException(400, "请先确认小说框架")
+
+    chapter_text = (c.content or c.pending_content or "").strip()
+    if not chapter_text:
+        raise HTTPException(400, "当前无正文，无法去AI味润色")
+
+    if has_pending_chapter_polish_batch(db, c.novel_id, chapter_id):
+        raise HTTPException(
+            409,
+            "当前章节去AI味润色任务进行中，请在「生成日志」中查看进度后再试",
+        )
+
+    if n.status == "failed":
+        n.status = "active"
+
+    batch_id = f"polish-{chapter_id}-{int(time.time())}"
+    try:
+        task = novel_chapter_polish.delay(
+            chapter_id, str(user.id), batch_id
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("chapter_polish enqueue failed | chapter_id=%s", chapter_id)
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+
+    _append_generation_log(
+        db,
+        novel_id=c.novel_id,
+        batch_id=batch_id,
+        event="chapter_polish_queued",
+        message="已入队后台去AI味润色",
+        chapter_no=c.chapter_no,
+        meta={"chapter_id": chapter_id, "task_id": task_id},
+    )
+    db.commit()
+    return {
+        "status": "queued",
+        "batch_id": batch_id,
+        "task_id": task_id,
+        "message": "去AI味润色已在后台执行，可在生成日志中查看进度",
+    }
+
+
 class AutoGenerateBody(BaseModel):
     target_count: int = Field(default=10, ge=1, le=50)
 
@@ -2175,6 +2294,214 @@ def get_memory_normalized(
         "schema_guide": build_memory_schema_guide(),
         "health": build_memory_health_summary(db, novel_id),
     }
+
+
+@router.post("/{novel_id}/memory/skills")
+def create_memory_skill(
+    novel_id: str,
+    body: MemorySkillCreateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    skill_name = _clean_required_text(body.name, "技能名称")
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    current_max_order = (
+        db.query(func.max(NovelMemoryNormSkill.sort_order))
+        .filter(NovelMemoryNormSkill.novel_id == novel_id)
+        .scalar()
+    )
+    next_order = int(current_max_order or -1) + 1
+    row = NovelMemoryNormSkill(
+        novel_id=novel_id,
+        memory_version=outline.memory_version or 0,
+        sort_order=next_order,
+        name=skill_name,
+        detail_json=json.dumps(body.detail or {}, ensure_ascii=False),
+        influence_score=int(body.influence_score),
+        is_active=bool(body.is_active),
+    )
+    db.add(row)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：新增技能")
+    db.commit()
+    return {
+        "status": "ok",
+        "item": {
+            "id": row.id,
+            "name": row.name,
+            "detail": body.detail or {},
+            "influence_score": row.influence_score,
+            "is_active": row.is_active,
+        },
+    }
+
+
+@router.patch("/{novel_id}/memory/skills/{skill_id}")
+def patch_memory_skill(
+    novel_id: str,
+    skill_id: str,
+    body: MemorySkillUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "请至少提供一个更新字段")
+    row = (
+        db.query(NovelMemoryNormSkill)
+        .filter(NovelMemoryNormSkill.novel_id == novel_id, NovelMemoryNormSkill.id == skill_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "技能不存在")
+    if "name" in patch and patch["name"] is not None:
+        row.name = _clean_required_text(str(patch["name"]), "技能名称")
+    if "detail" in patch:
+        detail = patch.get("detail") or {}
+        row.detail_json = json.dumps(detail, ensure_ascii=False)
+    if "influence_score" in patch and patch["influence_score"] is not None:
+        row.influence_score = int(patch["influence_score"])
+    if "is_active" in patch and patch["is_active"] is not None:
+        row.is_active = bool(patch["is_active"])
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：更新技能")
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{novel_id}/memory/skills/{skill_id}")
+def delete_memory_skill(
+    novel_id: str,
+    skill_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    row = (
+        db.query(NovelMemoryNormSkill)
+        .filter(NovelMemoryNormSkill.novel_id == novel_id, NovelMemoryNormSkill.id == skill_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "技能不存在")
+    db.delete(row)
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：删除技能")
+    db.commit()
+    return {"status": "ok", "deleted_id": skill_id}
+
+
+@router.post("/{novel_id}/memory/inventory")
+def create_memory_item(
+    novel_id: str,
+    body: MemoryItemCreateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    item_label = _clean_required_text(body.label, "物品名称")
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    current_max_order = (
+        db.query(func.max(NovelMemoryNormItem.sort_order))
+        .filter(NovelMemoryNormItem.novel_id == novel_id)
+        .scalar()
+    )
+    next_order = int(current_max_order or -1) + 1
+    row = NovelMemoryNormItem(
+        novel_id=novel_id,
+        memory_version=outline.memory_version or 0,
+        sort_order=next_order,
+        label=item_label,
+        detail_json=json.dumps(body.detail or {}, ensure_ascii=False),
+        influence_score=int(body.influence_score),
+        is_active=bool(body.is_active),
+    )
+    db.add(row)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：新增物品")
+    db.commit()
+    return {
+        "status": "ok",
+        "item": {
+            "id": row.id,
+            "label": row.label,
+            "detail": body.detail or {},
+            "influence_score": row.influence_score,
+            "is_active": row.is_active,
+        },
+    }
+
+
+@router.patch("/{novel_id}/memory/inventory/{item_id}")
+def patch_memory_item(
+    novel_id: str,
+    item_id: str,
+    body: MemoryItemUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "请至少提供一个更新字段")
+    row = (
+        db.query(NovelMemoryNormItem)
+        .filter(NovelMemoryNormItem.novel_id == novel_id, NovelMemoryNormItem.id == item_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "物品不存在")
+    if "label" in patch and patch["label"] is not None:
+        row.label = _clean_required_text(str(patch["label"]), "物品名称")
+    if "detail" in patch:
+        detail = patch.get("detail") or {}
+        row.detail_json = json.dumps(detail, ensure_ascii=False)
+    if "influence_score" in patch and patch["influence_score"] is not None:
+        row.influence_score = int(patch["influence_score"])
+    if "is_active" in patch and patch["is_active"] is not None:
+        row.is_active = bool(patch["is_active"])
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：更新物品")
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{novel_id}/memory/inventory/{item_id}")
+def delete_memory_item(
+    novel_id: str,
+    item_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    row = (
+        db.query(NovelMemoryNormItem)
+        .filter(NovelMemoryNormItem.novel_id == novel_id, NovelMemoryNormItem.id == item_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "物品不存在")
+    db.delete(row)
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：删除物品")
+    db.commit()
+    return {"status": "ok", "deleted_id": item_id}
 
 
 @router.post("/{novel_id}/memory/rebuild-normalized")

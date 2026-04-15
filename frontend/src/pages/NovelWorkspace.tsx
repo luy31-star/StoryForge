@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { BookOpen, Brain, GitBranch, Sparkles, X } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
 import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
@@ -18,6 +18,8 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   addChapterFeedback,
+  createMemoryItem,
+  createMemorySkill,
   applyRefreshMemoryCandidate,
   applyChapterRevision,
   approveChapter,
@@ -27,6 +29,8 @@ import {
   clearGenerationLogs,
   confirmFramework,
   deleteChapter,
+  deleteMemoryItem,
+  deleteMemorySkill,
   discardChapterRevision,
   exportChapters,
   generateChapters,
@@ -51,7 +55,10 @@ import {
   listChapters,
   patchChapter,
   patchChapterPlan,
+  patchMemoryItem,
+  patchMemorySkill,
   patchNovel,
+  polishChapter,
   refreshMemory,
   regenerateChapterPlan,
   retryChapterMemory,
@@ -60,6 +67,7 @@ import {
   type ChapterPlanV2Beats,
   waitForChapterConsistencyBatch,
   waitForChapterGenerationBatch,
+  waitForChapterPolishBatch,
   waitForChapterReviseBatch,
   waitForMemoryRefreshBatch,
   waitForVolumePlanBatch,
@@ -185,6 +193,19 @@ function inventoryDisplaySummary(
   if (description) return description;
   if (owner) return `持有人：${owner}`;
   return "";
+}
+
+function readPromptNumber(
+  message: string,
+  defaultValue: number,
+  min = 0,
+  max = 100
+): number | null {
+  const raw = window.prompt(message, String(defaultValue));
+  if (raw == null) return null;
+  const parsed = Number(String(raw).trim() || String(defaultValue));
+  if (!Number.isFinite(parsed)) return null;
+  return Math.max(min, Math.min(max, Math.round(parsed)));
 }
 
 function formatVolumePlanBeatsText(beats: unknown): string {
@@ -494,6 +515,7 @@ type LlmConfirmState = {
 
 export function NovelWorkspace() {
   const { id = "" } = useParams();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [novel, setNovel] = useState<Record<string, unknown> | null>(null);
   const [chapters, setChapters] = useState<Awaited<ReturnType<typeof listChapters>>>([]);
@@ -509,7 +531,23 @@ export function NovelWorkspace() {
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
-  const [notice, setNotice] = useState<string | null>(null);
+  const [notice, setNotice] = useState<React.ReactNode | null>(null);
+
+  function setTaskNotice(msg: string) {
+    setNotice(
+      <div className="flex items-center justify-between w-full">
+        <span>{msg}</span>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-auto p-0 text-emerald-600 dark:text-emerald-300 font-bold underline decoration-2 underline-offset-4 ml-2 hover:bg-transparent"
+          onClick={() => navigate("/tasks")}
+        >
+          查看任务状态
+        </Button>
+      </div>
+    );
+  }
   const [busy, setBusy] = useState(false);
   const [generateTrace, setGenerateTrace] = useState<string>("");
   const [generateCount, setGenerateCount] = useState(1);
@@ -1410,7 +1448,7 @@ export function NovelWorkspace() {
       await reloadGenerationLogs(
         logViewMode === "batch" ? resp.batch_id : undefined
       );
-      setNotice("记忆刷新已在后台执行，完成后将更新本页提示。");
+      setTaskNotice("记忆刷新已在后台执行。");
 
       const finalLog = await waitForMemoryRefreshBatch(id, resp.batch_id);
       const outcome = finalLog.refresh_outcome ?? "idle";
@@ -1509,6 +1547,201 @@ export function NovelWorkspace() {
       setErr(e instanceof Error ? e.message : "从快照导入结构化记忆失败");
     } finally {
       setMemoryNormRebuildBusy(false);
+    }
+  }
+
+  async function runCreateSkill() {
+    if (!id) return;
+    const name = (window.prompt("请输入技能名称") || "").trim();
+    if (!name) return;
+    const desc = (window.prompt("技能描述（可选）", "") || "").trim();
+    const influence = readPromptNumber("技能影响力（0-100）", 0, 0, 100);
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm("是否标记为活跃技能？（确定=活跃，取消=已退场）");
+    setErr(null);
+    setBusy(true);
+    try {
+      await createMemorySkill(id, {
+        name,
+        detail: desc ? { description: desc } : {},
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("技能已新增");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "新增技能失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runEditSkill(skill: NormalizedMemoryPayload["skills"][number]) {
+    if (!id) return;
+    if (!skill.id) {
+      setErr("当前技能缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    const name = (window.prompt("技能名称", skill.name) || "").trim();
+    if (!name) return;
+    const currentDesc =
+      typeof skill.detail.description === "string" ? skill.detail.description : "";
+    const desc = (window.prompt("技能描述（可选）", currentDesc) || "").trim();
+    const influence = readPromptNumber(
+      "技能影响力（0-100）",
+      skill.influence_score ?? 0,
+      0,
+      100
+    );
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm(
+      `当前状态：${skill.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
+    );
+    setErr(null);
+    setBusy(true);
+    try {
+      await patchMemorySkill(id, skill.id, {
+        name,
+        detail: { ...skill.detail, description: desc },
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("技能已更新");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "更新技能失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runDeleteSkill(skill: NormalizedMemoryPayload["skills"][number]) {
+    if (!id) return;
+    if (!skill.id) {
+      setErr("当前技能缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    if (!window.confirm(`确认删除技能「${skill.name}」吗？`)) return;
+    setErr(null);
+    setBusy(true);
+    try {
+      await deleteMemorySkill(id, skill.id);
+      setNotice("技能已删除");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "删除技能失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runCreateItem() {
+    if (!id) return;
+    const label = (window.prompt("请输入物品名称") || "").trim();
+    if (!label) return;
+    const owner = (window.prompt("持有人（可选）", "") || "").trim();
+    const description = (window.prompt("物品描述（可选）", "") || "").trim();
+    const influence = readPromptNumber("物品影响力（0-100）", 0, 0, 100);
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm("是否标记为活跃物品？（确定=活跃，取消=已退场）");
+    setErr(null);
+    setBusy(true);
+    try {
+      await createMemoryItem(id, {
+        label,
+        detail: {
+          ...(owner ? { owner } : {}),
+          ...(description ? { description } : {}),
+        },
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("物品已新增");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "新增物品失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runEditItem(item: NormalizedMemoryPayload["inventory"][number]) {
+    if (!id) return;
+    if (!item.id) {
+      setErr("当前物品缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    const currentLabel = inventoryDisplayLabel(item);
+    const label = (window.prompt("物品名称", currentLabel) || "").trim();
+    if (!label) return;
+    const currentOwner =
+      typeof item.detail.owner === "string" ? item.detail.owner : "";
+    const currentDescription =
+      typeof item.detail.description === "string" ? item.detail.description : "";
+    const owner = (window.prompt("持有人（可选）", currentOwner) || "").trim();
+    const description = (window.prompt("物品描述（可选）", currentDescription) || "").trim();
+    const influence = readPromptNumber(
+      "物品影响力（0-100）",
+      item.influence_score ?? 0,
+      0,
+      100
+    );
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm(
+      `当前状态：${item.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
+    );
+    setErr(null);
+    setBusy(true);
+    try {
+      await patchMemoryItem(id, item.id, {
+        label,
+        detail: {
+          ...item.detail,
+          ...(owner ? { owner } : { owner: "" }),
+          ...(description ? { description } : { description: "" }),
+        },
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("物品已更新");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "更新物品失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runDeleteItem(item: NormalizedMemoryPayload["inventory"][number]) {
+    if (!id) return;
+    if (!item.id) {
+      setErr("当前物品缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    const label = inventoryDisplayLabel(item);
+    if (!window.confirm(`确认删除物品「${label}」吗？`)) return;
+    setErr(null);
+    setBusy(true);
+    try {
+      await deleteMemoryItem(id, item.id);
+      setNotice("物品已删除");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "删除物品失败");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -1644,7 +1877,7 @@ export function NovelWorkspace() {
       } else {
         await reloadGenerationLogs();
       }
-      setNotice(`已开启 AI 一键续写（${targetCount}章），请在生成日志中查看进度。`);
+      setTaskNotice(`已开启 AI 一键续写（${targetCount}章）。`);
       await reload(); // 获取最新小说状态，消除失败横幅
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "全自动生成失败");
@@ -1741,9 +1974,9 @@ export function NovelWorkspace() {
           });
           if (outcome === "failed") {
             setErr("卷章计划生成失败，请查看生成日志");
-            setNotice("卷章计划生成失败，请查看生成日志。");
+            setTaskNotice("卷章计划生成失败。");
           } else {
-            setNotice("本批卷章计划已生成，可在章计划列表中查看。");
+            setTaskNotice("本批卷章计划已生成，可在章计划列表中查看。");
           }
         } catch (e: unknown) {
           console.error("Background volume plan wait failed:", e);
@@ -1766,7 +1999,7 @@ export function NovelWorkspace() {
       await regenerateChapterPlan(id, selectedVolumeId, chapterNo, { instruction });
       const plan = await listVolumeChapterPlan(id, selectedVolumeId);
       setVolumePlan(plan);
-      setNotice(`第${chapterNo}章计划已重生成。`);
+      setTaskNotice(`第${chapterNo}章计划已重生成。`);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "重生成章计划失败");
     } finally {
@@ -1885,11 +2118,11 @@ export function NovelWorkspace() {
         (async () => {
           try {
             const outcome = await waitForChapterGenerationBatch(id, bid);
-            setNotice(
-              outcome === "done"
-                ? `第${chapterNo}章已生成（待审定）。`
-                : `第${chapterNo}章生成失败，请查看生成日志。`
-            );
+            if (outcome === "done") {
+              setTaskNotice(`第${chapterNo}章已生成（待审定）。`);
+            } else {
+              setTaskNotice(`第${chapterNo}章生成失败。`);
+            }
             if (outcome === "failed") {
               setErr("按章计划生成失败");
             }
@@ -2053,7 +2286,7 @@ export function NovelWorkspace() {
       if (logViewMode === "batch") {
         setLogBatchId(resp.batch_id);
       }
-      setNotice("章节增量记忆写入已手动入队执行，请在生成日志查看进度。");
+      setTaskNotice("章节增量记忆写入已手动入队执行。");
       await reloadGenerationLogs(resp.batch_id);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "重试记忆写入失败");
@@ -2326,10 +2559,42 @@ export function NovelWorkspace() {
         await run(async () => {
           const r = await consistencyFixChapter(chapterId);
           if (r.status === "queued" && r.batch_id && id) {
+            setTaskNotice("一致性修订已在后台启动。");
             const o = await waitForChapterConsistencyBatch(id, r.batch_id);
             if (o === "failed") {
+              setTaskNotice("一致性修订失败。");
               throw new Error("一致性修订失败，请查看生成日志");
             }
+            setTaskNotice("一致性修订已完成。");
+          }
+        });
+      }
+    );
+  }
+
+  function confirmPolishChapter(chapterId: string) {
+    void openLlmConfirm(
+      {
+        title: "确认进行去AI味润色？",
+        description: "这会调用大模型优化当前章节的表达方式，去除AI痕迹，同时严格保持原剧情不变。",
+        confirmLabel: "确认润色",
+        details: [
+          "提交后任务在后台执行，关闭或离开本页不会中断。",
+          "润色结果会先放入待确认修订稿，不会直接覆盖正式稿。",
+          "大模型会尝试压缩废话、优化分段，并使文风更符合中文网文习惯。",
+        ],
+      },
+      async () => {
+        await run(async () => {
+          const r = await polishChapter(chapterId);
+          if (r.status === "queued" && r.batch_id && id) {
+            setTaskNotice("去AI味润色已在后台启动。");
+            const o = await waitForChapterPolishBatch(id, r.batch_id);
+            if (o === "failed") {
+              setTaskNotice("去AI味润色失败。");
+              throw new Error("去AI味润色失败，请查看生成日志");
+            }
+            setTaskNotice("去AI味润色已完成。");
           }
         });
       }
@@ -2354,10 +2619,13 @@ export function NovelWorkspace() {
         await run(async () => {
           const r = await reviseChapter(chapterId, instruction);
           if (r.status === "queued" && r.batch_id && id) {
+            setTaskNotice("按指令改稿已在后台启动。");
             const o = await waitForChapterReviseBatch(id, r.batch_id);
             if (o === "failed") {
+              setTaskNotice("改稿失败。");
               throw new Error("改稿失败，请查看生成日志");
             }
+            setTaskNotice("改稿已完成。");
           }
           setRevisePrompt((d) => ({ ...d, [chapterId]: "" }));
         });
@@ -3686,6 +3954,17 @@ export function NovelWorkspace() {
                               size="sm"
                               variant="secondary"
                               className="font-bold text-foreground/80"
+                              disabled={busy || !(selectedChapter.content || selectedChapter.pending_content)?.trim()}
+                              onClick={() => confirmPolishChapter(selectedChapter.id)}
+                              title="去除正文中的 AI 味，压缩废话，优化表达，保持剧情不变"
+                            >
+                              去AI味
+                            </Button>
+                            <Button
+                              type="button"
+                              size="sm"
+                              variant="secondary"
+                              className="font-bold text-foreground/80"
                               disabled={busy || !(fbDraft[selectedChapter.id]?.trim())}
                               onClick={() =>
                                 run(async () => {
@@ -4207,87 +4486,169 @@ export function NovelWorkspace() {
                       );
                     })}
                   </div>
-                  {memoryNorm.skills.length > 0 ? (
-                    <div className="glass-panel-subtle space-y-2 p-4">
+                  <div className="glass-panel-subtle space-y-2 p-4">
+                    <div className="flex items-center justify-between gap-2">
                       <p className="font-medium text-foreground">技能</p>
-                      <ul className="space-y-2">
-                        {slicePage(
-                          memoryNorm.skills,
-                          structuredPages.skills ?? 0,
-                          STRUCTURED_LIST_PAGE
-                        ).map((s, i) => (
-                          <li
-                            key={`sk-${s.name}-${i}`}
-                            className="list-card flex items-center justify-between gap-2 px-3 py-2.5"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <span className="font-medium text-foreground">{s.name}</span>
-                              <p className="text-[10px] text-muted-foreground">
-                                影响力 {s.influence_score} · {s.is_active ? "活跃" : "已退场"}
-                                {s.aliases.length ? ` · 别名 ${s.aliases.slice(0, 3).join(" / ")}` : ""}
-                              </p>
-                            </div>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="h-7 text-xs"
-                              onClick={() => openNormDetail(`技能 · ${s.name}`, s)}
-                            >
-                              详情
-                            </Button>
-                          </li>
-                        ))}
-                      </ul>
-                      {normPager("skills", memoryNorm.skills.length, STRUCTURED_LIST_PAGE)}
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        disabled={busy}
+                        onClick={() => void runCreateSkill()}
+                      >
+                        新增技能
+                      </Button>
                     </div>
-                  ) : null}
-                  {memoryNorm.inventory.length > 0 ? (
-                    <div className="glass-panel-subtle space-y-2 p-4">
-                      <p className="font-medium text-foreground">物品</p>
-                      <ul className="space-y-2">
-                        {slicePage(
-                          memoryNorm.inventory,
-                          structuredPages.inventory ?? 0,
-                          STRUCTURED_LIST_PAGE
-                        ).map((it, i) => (
-                          <li
-                            key={`inv-${it.label}-${i}`}
-                            className="list-card flex items-center justify-between gap-2 px-3 py-2.5"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <span className="font-medium text-foreground">
-                                {inventoryDisplayLabel(it)}
-                              </span>
-                              {inventoryDisplaySummary(it) ? (
-                                <p className="mt-0.5 line-clamp-2 text-[11px] text-foreground/70 dark:text-muted-foreground">
-                                  {inventoryDisplaySummary(it)}
+                    {memoryNorm.skills.length > 0 ? (
+                      <>
+                        <ul className="space-y-2">
+                          {slicePage(
+                            memoryNorm.skills,
+                            structuredPages.skills ?? 0,
+                            STRUCTURED_LIST_PAGE
+                          ).map((s, i) => (
+                            <li
+                              key={`sk-${s.id ?? s.name}-${i}`}
+                              className="list-card flex items-center justify-between gap-2 px-3 py-2.5"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <span className="font-medium text-foreground">{s.name}</span>
+                                <p className="text-[10px] text-muted-foreground">
+                                  影响力 {s.influence_score} · {s.is_active ? "活跃" : "已退场"}
+                                  {s.aliases.length
+                                    ? ` · 别名 ${s.aliases.slice(0, 3).join(" / ")}`
+                                    : ""}
                                 </p>
-                              ) : null}
-                              <p className="text-[10px] text-muted-foreground">
-                                影响力 {it.influence_score} · {it.is_active ? "活跃" : "已退场"}
-                                {it.aliases.length ? ` · 别名 ${it.aliases.slice(0, 3).join(" / ")}` : ""}
-                              </p>
-                            </div>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="h-7 text-xs"
-                              onClick={() => openNormDetail(`物品 · ${inventoryDisplayLabel(it)}`, it)}
-                            >
-                              详情
-                            </Button>
-                          </li>
-                        ))}
-                      </ul>
-                      {normPager(
-                        "inventory",
-                        memoryNorm.inventory.length,
-                        STRUCTURED_LIST_PAGE
-                      )}
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 text-xs"
+                                  disabled={busy}
+                                  onClick={() => void runEditSkill(s)}
+                                >
+                                  编辑
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 text-xs text-destructive hover:text-destructive"
+                                  disabled={busy}
+                                  onClick={() => void runDeleteSkill(s)}
+                                >
+                                  删除
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-7 text-xs"
+                                  onClick={() => openNormDetail(`技能 · ${s.name}`, s)}
+                                >
+                                  详情
+                                </Button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                        {normPager("skills", memoryNorm.skills.length, STRUCTURED_LIST_PAGE)}
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">暂无技能，点击右上角新增。</p>
+                    )}
+                  </div>
+                  <div className="glass-panel-subtle space-y-2 p-4">
+                    <div className="flex items-center justify-between gap-2">
+                      <p className="font-medium text-foreground">物品</p>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        className="h-7 text-xs"
+                        disabled={busy}
+                        onClick={() => void runCreateItem()}
+                      >
+                        新增物品
+                      </Button>
                     </div>
-                  ) : null}
+                    {memoryNorm.inventory.length > 0 ? (
+                      <>
+                        <ul className="space-y-2">
+                          {slicePage(
+                            memoryNorm.inventory,
+                            structuredPages.inventory ?? 0,
+                            STRUCTURED_LIST_PAGE
+                          ).map((it, i) => (
+                            <li
+                              key={`inv-${it.id ?? it.label}-${i}`}
+                              className="list-card flex items-center justify-between gap-2 px-3 py-2.5"
+                            >
+                              <div className="min-w-0 flex-1">
+                                <span className="font-medium text-foreground">
+                                  {inventoryDisplayLabel(it)}
+                                </span>
+                                {inventoryDisplaySummary(it) ? (
+                                  <p className="mt-0.5 line-clamp-2 text-[11px] text-foreground/70 dark:text-muted-foreground">
+                                    {inventoryDisplaySummary(it)}
+                                  </p>
+                                ) : null}
+                                <p className="text-[10px] text-muted-foreground">
+                                  影响力 {it.influence_score} · {it.is_active ? "活跃" : "已退场"}
+                                  {it.aliases.length
+                                    ? ` · 别名 ${it.aliases.slice(0, 3).join(" / ")}`
+                                    : ""}
+                                </p>
+                              </div>
+                              <div className="flex items-center gap-1.5">
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 text-xs"
+                                  disabled={busy}
+                                  onClick={() => void runEditItem(it)}
+                                >
+                                  编辑
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="ghost"
+                                  className="h-7 text-xs text-destructive hover:text-destructive"
+                                  disabled={busy}
+                                  onClick={() => void runDeleteItem(it)}
+                                >
+                                  删除
+                                </Button>
+                                <Button
+                                  type="button"
+                                  size="sm"
+                                  variant="outline"
+                                  className="h-7 text-xs"
+                                  onClick={() =>
+                                    openNormDetail(`物品 · ${inventoryDisplayLabel(it)}`, it)
+                                  }
+                                >
+                                  详情
+                                </Button>
+                              </div>
+                            </li>
+                          ))}
+                        </ul>
+                        {normPager(
+                          "inventory",
+                          memoryNorm.inventory.length,
+                          STRUCTURED_LIST_PAGE
+                        )}
+                      </>
+                    ) : (
+                      <p className="text-xs text-muted-foreground">暂无物品，点击右上角新增。</p>
+                    )}
+                  </div>
                   {memoryNorm.pets.length > 0 ? (
                     <div className="glass-panel-subtle space-y-2 p-4">
                       <p className="font-medium text-foreground">宠物 / 从属</p>

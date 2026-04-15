@@ -562,3 +562,37 @@ def has_pending_chapter_revise_batch(
         if not terminal:
             return True
     return False
+
+
+def has_pending_chapter_polish_batch(
+    db: Session, novel_id: str, chapter_id: str
+) -> bool:
+    """同一章节是否有去AI味润色任务尚未结束。"""
+    rows = (
+        db.query(NovelGenerationLog.batch_id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id.like(f"polish-{chapter_id}-%"),
+            NovelGenerationLog.event.in_(
+                ["chapter_polish_queued", "chapter_polish_started"]
+            ),
+        )
+        .distinct()
+        .all()
+    )
+    for (bid,) in rows:
+        if not bid:
+            continue
+        terminal = (
+            db.query(NovelGenerationLog.id)
+            .filter(
+                NovelGenerationLog.batch_id == bid,
+                NovelGenerationLog.event.in_(
+                    ["chapter_polish_done", "chapter_polish_failed"]
+                ),
+            )
+            .first()
+        )
+        if not terminal:
+            return True
+    return False

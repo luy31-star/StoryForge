@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import {
   Dialog,
@@ -21,6 +22,7 @@ import {
   waitForFrameworkRegenerateBatch,
 } from "@/services/novelApi";
 import { ensureLlmReady } from "@/services/llmReady";
+import { Sparkles } from "lucide-react";
 
 type CharacterRow = {
   id: string;
@@ -50,7 +52,6 @@ function parseCharactersFromFrameworkJson(fwJson: string): CharacterRow[] {
     return [];
   }
 }
-
 export function FrameworkWizardDialog(props: {
   novelId: string;
   open: boolean;
@@ -62,10 +63,13 @@ export function FrameworkWizardDialog(props: {
   onReload: () => Promise<void>;
   onConfirmFramework: () => Promise<void>;
 }) {
+  const navigate = useNavigate();
   const [step, setStep] = useState(0);
   const [regenInstruction, setRegenInstruction] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [notice, setNotice] = useState<React.ReactNode | null>(null);
+  const [taskStartedOpen, setTaskStartedOpen] = useState(false);
 
   const originalChars = useMemo(
     () => parseCharactersFromFrameworkJson(props.frameworkJson),
@@ -98,9 +102,26 @@ export function FrameworkWizardDialog(props: {
       const r = await regenerateFramework(props.novelId, instruction);
       const bid = r.batch_id;
       if (r.status === "queued" && bid) {
+        setNotice(
+          <div className="flex items-center justify-between w-full">
+            <span>正在后台重生成大纲...</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-auto p-0 text-emerald-600 dark:text-emerald-300 font-bold underline decoration-2 underline-offset-4 ml-2 hover:bg-transparent"
+              onClick={() => {
+                props.onOpenChange(false);
+                navigate("/tasks");
+              }}
+            >
+              前往任务页查看进度
+            </Button>
+          </div>
+        );
         const o = await waitForFrameworkRegenerateBatch(props.novelId, bid);
         if (o === "failed") throw new Error("重生成大纲失败，请查看生成日志");
       }
+      setNotice(null);
       await props.onReload();
       setRegenInstruction("");
     } catch (e: unknown) {
@@ -117,9 +138,26 @@ export function FrameworkWizardDialog(props: {
       const r = await generateFramework(props.novelId);
       const bid = r.batch_id;
       if (r.status === "queued" && bid) {
+        setNotice(
+          <div className="flex items-center justify-between w-full">
+            <span>正在后台生成大纲框架...</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-auto p-0 text-emerald-600 dark:text-emerald-300 font-bold underline decoration-2 underline-offset-4 ml-2 hover:bg-transparent"
+              onClick={() => {
+                props.onOpenChange(false);
+                navigate("/tasks");
+              }}
+            >
+              前往任务页查看进度
+            </Button>
+          </div>
+        );
         const o = await waitForFrameworkGenerateBatch(props.novelId, bid);
         if (o === "failed") throw new Error("生成大纲失败，请查看生成日志");
       }
+      setNotice(null);
       await props.onReload();
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "重新生成大纲失败");
@@ -197,9 +235,26 @@ export function FrameworkWizardDialog(props: {
       const r = await updateFrameworkCharacters(props.novelId, payload);
       const bid = r.batch_id;
       if (r.status === "queued" && bid) {
+        setNotice(
+          <div className="flex items-center justify-between w-full">
+            <span>正在后台按设定更新大纲...</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-auto p-0 text-emerald-600 dark:text-emerald-300 font-bold underline decoration-2 underline-offset-4 ml-2 hover:bg-transparent"
+              onClick={() => {
+                props.onOpenChange(false);
+                navigate("/tasks");
+              }}
+            >
+              前往任务页查看进度
+            </Button>
+          </div>
+        );
         const o = await waitForFrameworkCharactersBatch(props.novelId, bid);
         if (o === "failed") throw new Error("更新人物设定失败，请查看生成日志");
       }
+      setNotice(null);
       await props.onReload();
       setStep(2);
     } catch (e: unknown) {
@@ -230,8 +285,10 @@ export function FrameworkWizardDialog(props: {
       }
       if (n > 0) {
         await autoGenerateChapters(props.novelId, n);
+        setTaskStartedOpen(true);
+      } else {
+        props.onOpenChange(false);
       }
-      props.onOpenChange(false);
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "确认框架失败");
     } finally {
@@ -240,6 +297,7 @@ export function FrameworkWizardDialog(props: {
   }
 
   return (
+    <>
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
@@ -255,6 +313,13 @@ export function FrameworkWizardDialog(props: {
           <div className="glass-panel-subtle flex items-center gap-2 border-destructive/30 px-4 py-3 text-sm text-destructive">
             <div className="h-1.5 w-1.5 rounded-full bg-destructive" />
             {err}
+          </div>
+        ) : null}
+
+        {notice ? (
+          <div className="glass-panel-subtle flex items-center gap-2 border-emerald-500/30 px-4 py-3 text-sm text-emerald-600 dark:text-emerald-300">
+            <div className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+            {notice}
           </div>
         ) : null}
 
@@ -505,6 +570,49 @@ export function FrameworkWizardDialog(props: {
             disabled={busy}
           >
             关闭
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+
+    <TaskStartedDialog open={taskStartedOpen} onOpenChange={(v) => {
+      setTaskStartedOpen(v);
+      if (!v) props.onOpenChange(false);
+    }} />
+    </>
+  );
+}
+
+function TaskStartedDialog(props: { open: boolean; onOpenChange: (open: boolean) => void }) {
+  const navigate = useNavigate();
+  return (
+    <Dialog open={props.open} onOpenChange={props.onOpenChange}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="text-xl font-bold flex items-center gap-2">
+            <Sparkles className="size-5 text-primary" />
+            任务已在后台启动
+          </DialogTitle>
+          <DialogDescription className="text-foreground/80 pt-2 leading-relaxed">
+            AI 正在为你生成内容。此过程可能需要几十秒，你可以留在本页等待，也可以前往「我的任务」模块查看详细进度。
+          </DialogDescription>
+        </DialogHeader>
+        <DialogFooter className="gap-2 sm:gap-0">
+          <Button
+            variant="outline"
+            className="font-bold"
+            onClick={() => props.onOpenChange(false)}
+          >
+            留在本页
+          </Button>
+          <Button
+            className="font-bold"
+            onClick={() => {
+              props.onOpenChange(false);
+              navigate("/tasks");
+            }}
+          >
+            前往我的任务
           </Button>
         </DialogFooter>
       </DialogContent>

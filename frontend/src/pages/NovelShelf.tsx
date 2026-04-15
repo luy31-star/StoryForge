@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
   BookOpen,
@@ -159,13 +159,13 @@ function NovelStageRail({
 }
 
 export function NovelShelf() {
-  const [items, setItems] = useState<
-    Awaited<ReturnType<typeof listNovels>>
-  >([]);
+  const navigate = useNavigate();
+  const [items, setItems] = useState<ShelfNovel[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
   const [aiCreateOpen, setAiCreateOpen] = useState(false);
+  const [taskStartedOpen, setTaskStartedOpen] = useState(false);
   const [aiCreateBusy, setAiCreateBusy] = useState(false);
   const [aiCreateSubject, setAiCreateSubject] = useState<string>("现言情感");
   const [aiCreatePlots, setAiCreatePlots] = useState<string[]>([]);
@@ -260,6 +260,7 @@ export function NovelShelf() {
         writing_style_id: aiCreateWritingStyleId || undefined,
       });
       setAiCreateOpen(false);
+      setTaskStartedOpen(true);
       reload();
     } catch (e: any) {
       setErr(e.message || "一键AI建书失败");
@@ -1071,11 +1072,52 @@ export function NovelShelf() {
           </div>
 
           <DialogFooter>
-            <Button variant="outline" onClick={() => setAiCreateOpen(false)} disabled={aiCreateBusy}>
+            <Button
+              variant="outline"
+              className="font-bold"
+              onClick={() => setAiCreateOpen(false)}
+              disabled={aiCreateBusy}
+            >
               取消
             </Button>
-            <Button onClick={handleAiCreate} disabled={aiCreateBusy || !aiCreateSubject}>
-              {aiCreateBusy ? "正在后台执行..." : "确认生成大纲"}
+            <Button
+              className="font-bold min-w-[100px]"
+              onClick={handleAiCreate}
+              disabled={aiCreateBusy || !aiCreateSubject}
+            >
+              {aiCreateBusy ? "正在发起任务..." : "立即开始 AI 建书"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={taskStartedOpen} onOpenChange={setTaskStartedOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle className="text-xl font-bold flex items-center gap-2">
+              <Sparkles className="size-5 text-primary" />
+              任务已在后台启动
+            </DialogTitle>
+            <DialogDescription className="text-foreground/80 pt-2 leading-relaxed">
+              AI 正在为你构思小说设定与大纲。此过程可能需要几十秒，你可以留在本页等待刷新，也可以前往「我的任务」模块查看详细进度。
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter className="gap-2 sm:gap-0">
+            <Button
+              variant="outline"
+              className="font-bold"
+              onClick={() => setTaskStartedOpen(false)}
+            >
+              留在本页
+            </Button>
+            <Button
+              className="font-bold"
+              onClick={() => {
+                setTaskStartedOpen(false);
+                navigate("/tasks");
+              }}
+            >
+              前往我的任务
             </Button>
           </DialogFooter>
         </DialogContent>

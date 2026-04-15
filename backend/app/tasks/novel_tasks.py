@@ -15,6 +15,8 @@ from sqlalchemy import func
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.novel import Chapter, ChapterFeedback, Novel, NovelGenerationLog, NovelMemory
+from app.models.volume import NovelChapterPlan
+from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.memory_normalize_sync import sync_json_snapshot_from_normalized
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_repo import (
@@ -341,7 +343,101 @@ def novel_daily_chapters() -> dict[str, int]:
                     logger.exception("daily_chapters trigger failed | novel_id=%s", n.id)
     finally:
         db.close()
-    return {"triggered": processed}
+
+
+@celery_app.task(name="novel.chapter_polish")
+def novel_chapter_polish(
+    chapter_id: str,
+    user_id: str | None,
+    batch_id: str,
+) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        c = db.get(Chapter, chapter_id)
+        if not c:
+            raise ValueError("章节不存在")
+        n = db.get(Novel, c.novel_id)
+        if not n:
+            raise ValueError("小说不存在")
+
+        # 获取对应的执行卡
+        plan = db.query(NovelChapterPlan).filter(
+            NovelChapterPlan.novel_id == c.novel_id,
+            NovelChapterPlan.chapter_no == c.chapter_no
+        ).first()
+        if not plan:
+            raise ValueError(f"未找到第 {c.chapter_no} 章的执行卡，无法润色")
+        try:
+            beats = json.loads(plan.beats_json or "{}")
+        except Exception:
+            beats = {}
+        beats = normalize_beats_to_v2(beats)
+
+        llm = NovelLLMService(billing_user_id=user_id)
+
+        append_generation_log(
+            db,
+            novel_id=c.novel_id,
+            batch_id=batch_id,
+            event="chapter_polish_started",
+            message="后台去AI味润色已开始",
+            chapter_no=c.chapter_no,
+            meta={"chapter_id": chapter_id},
+        )
+        db.commit()
+
+        # 优先使用正文，如果没有正文则使用待审阅正文
+        chapter_text = (c.content or c.pending_content or "").strip()
+        if not chapter_text:
+            raise ValueError("章节内容为空，无法润色")
+
+        polished_text = llm.polish_chapter_style_sync(
+            n,
+            chapter_no=c.chapter_no,
+            plan_title=plan.chapter_title or "",
+            beats=beats,
+            chapter_text=chapter_text,
+            db=db,
+        )
+
+        c.pending_content = polished_text
+        c.pending_revision_prompt = "去AI味润色（手动触发）"
+        c.status = "pending_review"
+
+        append_generation_log(
+            db,
+            novel_id=c.novel_id,
+            batch_id=batch_id,
+            event="chapter_polish_done",
+            message="去AI味润色已完成，待审阅",
+            chapter_no=c.chapter_no,
+            meta={"chapter_id": chapter_id},
+        )
+        db.commit()
+        return {"status": "ok", "chapter_id": chapter_id}
+    except Exception as e:
+        logger.exception("novel.chapter_polish failed | chapter_id=%s", chapter_id)
+        try:
+            db.rollback()
+            c2 = db.get(Chapter, chapter_id)
+            if c2:
+                # 更新小说状态为 failed (可选，这里不一定需要，因为只是单章润色)
+                append_generation_log(
+                    db,
+                    novel_id=c2.novel_id,
+                    batch_id=batch_id,
+                    event="chapter_polish_failed",
+                    level="error",
+                    message=f"去AI味润色失败：{e}",
+                    chapter_no=c2.chapter_no,
+                    meta={"chapter_id": chapter_id, "error": str(e)},
+                )
+                db.commit()
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        db.close()
 
 
 @celery_app.task(name="novel.auto_refresh_memories")

@@ -786,6 +786,25 @@ export async function waitForChapterConsistencyBatch(
   throw new Error("等待一致性修订超时，请稍后在生成日志中查看");
 }
 
+/** 轮询指定批次的去AI味润色任务 */
+export async function waitForChapterPolishBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 120 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("chapter_polish_done")) return "done";
+    if (ev.has("chapter_polish_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待去AI味润色超时，请稍后在生成日志中查看");
+}
+
 /** 轮询指定批次的改稿任务 */
 export async function waitForChapterReviseBatch(
   novelId: string,
@@ -997,6 +1016,19 @@ export async function applyChapterRevision(chapterId: string) {
   return r.json();
 }
 
+export async function polishChapter(chapterId: string) {
+  const r = await apiFetch(`${BASE}/chapters/${chapterId}/polish`, {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: string;
+    batch_id?: string;
+    task_id?: string | null;
+    message?: string;
+  }>;
+}
+
 export async function consistencyFixChapter(chapterId: string) {
   const r = await apiFetch(`${BASE}/chapters/${chapterId}/consistency-fix`, {
     method: "POST",
@@ -1104,6 +1136,7 @@ export type NormalizedMemoryPayload = {
     forbidden_constraints: unknown[];
   };
   skills: {
+    id?: string;
     name: string;
     detail: Record<string, unknown>;
     aliases: string[];
@@ -1111,6 +1144,7 @@ export type NormalizedMemoryPayload = {
     is_active: boolean;
   }[];
   inventory: {
+    id?: string;
     label: string;
     detail: Record<string, unknown>;
     aliases: string[];
@@ -1170,6 +1204,110 @@ export async function getMemoryNormalized(novelId: string) {
         health?: MemoryHealth;
       }
   >;
+}
+
+export async function createMemorySkill(
+  novelId: string,
+  payload: {
+    name: string;
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/skills`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    item: {
+      id: string;
+      name: string;
+      detail: Record<string, unknown>;
+      influence_score: number;
+      is_active: boolean;
+    };
+  }>;
+}
+
+export async function patchMemorySkill(
+  novelId: string,
+  skillId: string,
+  payload: {
+    name?: string;
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/skills/${skillId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok" }>;
+}
+
+export async function deleteMemorySkill(novelId: string, skillId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/skills/${skillId}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; deleted_id: string }>;
+}
+
+export async function createMemoryItem(
+  novelId: string,
+  payload: {
+    label: string;
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/inventory`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    item: {
+      id: string;
+      label: string;
+      detail: Record<string, unknown>;
+      influence_score: number;
+      is_active: boolean;
+    };
+  }>;
+}
+
+export async function patchMemoryItem(
+  novelId: string,
+  itemId: string,
+  payload: {
+    label?: string;
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/inventory/${itemId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok" }>;
+}
+
+export async function deleteMemoryItem(novelId: string, itemId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/inventory/${itemId}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; deleted_id: string }>;
 }
 
 export async function rebuildMemoryNormalized(novelId: string) {

@@ -53,6 +53,7 @@ from app.services.novel_repo import (
     format_open_plots_from_db,
     format_volume_event_summary,
     format_volume_progress_anchor,
+    chapter_content_metrics,
     chapter_execution_rules_block,
     forbidden_future_arcs_block,
     outline_beat_hint,
@@ -2305,8 +2306,8 @@ class NovelLLMService:
             "characters_updated": [],
             "relations_changed": [],
             "inventory_changed": {"added": [], "removed": []},
-            "skills_changed": {"added": [], "updated": []},
-            "pets_changed": {"added": [], "updated": []},
+            "skills_changed": {"added": [], "updated": [], "removed": []},
+            "pets_changed": {"added": [], "updated": [], "removed": []},
             "conflicts_detected": [],
             "forbidden_constraints_added": [],
             "ids_to_remove": [],
@@ -2360,6 +2361,7 @@ class NovelLLMService:
         normalized["skills_changed"] = {
             "added": skills_changed.get("added") if isinstance(skills_changed.get("added"), list) else [],
             "updated": skills_changed.get("updated") if isinstance(skills_changed.get("updated"), list) else [],
+            "removed": skills_changed.get("removed") if isinstance(skills_changed.get("removed"), list) else [],
         }
 
         pets_changed = normalized.get("pets_changed")
@@ -2368,6 +2370,7 @@ class NovelLLMService:
         normalized["pets_changed"] = {
             "added": pets_changed.get("added") if isinstance(pets_changed.get("added"), list) else [],
             "updated": pets_changed.get("updated") if isinstance(pets_changed.get("updated"), list) else [],
+            "removed": pets_changed.get("removed") if isinstance(pets_changed.get("removed"), list) else [],
         }
         return normalized
 
@@ -2606,13 +2609,14 @@ class NovelLLMService:
             "输出字段固定为："
             "facts_added[], facts_updated[], open_plots_added[], open_plots_resolved[],"
             "canonical_entries[], characters_updated[], relations_changed[],"
-            "inventory_changed{added[],removed[]}, skills_changed{added[],updated[]},"
-            "pets_changed{added[],updated[]}, conflicts_detected[],"
+            "inventory_changed{added[],removed[]}, skills_changed{added[],updated[],removed[]},"
+            "pets_changed{added[],updated[],removed[]}, conflicts_detected[],"
             "forbidden_constraints_added[], ids_to_remove[], entity_influence_updates[]。"
             "ids_to_remove[]：非常重要！当你判断某条【待收束线】已收束、某条【硬约束】已失效、或某项技能/道具已遗失/毁坏时，"
             "直接在 ids_to_remove 中填入该条目在下文提供的 4 位短 ID。不要通过文本匹配删除。\n"
             "【同类条目替换与升级规则（通用）】\n"
             "1. 状态/等级更新：若某项属性、技能或物品存在明显的等级递进或阶段更替（如：等级1 -> 等级2，初级 -> 中级），必须在 added 中加入新条目，并务必在 ids_to_remove 中放入旧条目的 ID。严禁同一实体的多个版本/阶段同时处于活跃状态。\n"
+            "1.1 若升级后名称发生变化（旧名不再出现），必须把旧条目放入 skills_changed.removed / pets_changed.removed（优先填 ID，没有 ID 才填旧名）。\n"
             "2. 唯一性冲突：对于在设定上具有唯一性或排他性的条目，新条目出现时必须移除旧条目。"
             "canonical_entries 每项结构："
             "{chapter_no:number, chapter_title:string, key_facts:string[], causal_results:string[],"
@@ -3261,8 +3265,13 @@ class NovelLLMService:
                             except (TypeError, ValueError):
                                 pass
                         if active is not None:
-                            row.is_active = bool(active)
-                        row.memory_version = memory_version
+                            if not bool(active):
+                                db.delete(row)
+                                row = None
+                            else:
+                                row.is_active = True
+                        if row is not None:
+                            row.memory_version = memory_version
                 elif et == "item":
                     row = (
                         db.query(NovelMemoryNormItem)
@@ -3279,8 +3288,13 @@ class NovelLLMService:
                             except (TypeError, ValueError):
                                 pass
                         if active is not None:
-                            row.is_active = bool(active)
-                        row.memory_version = memory_version
+                            if not bool(active):
+                                db.delete(row)
+                                row = None
+                            else:
+                                row.is_active = True
+                        if row is not None:
+                            row.memory_version = memory_version
                 elif et == "pet":
                     row = (
                         db.query(NovelMemoryNormPet)
@@ -3356,21 +3370,32 @@ class NovelLLMService:
             removed = inv_changed.get("removed") or []
 
             removed_labels: list[str] = []
+            removed_short_ids: set[str] = set()
             for x in removed:
+                if isinstance(x, dict):
+                    rid = str(x.get("id") or "").strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", rid):
+                        removed_short_ids.add(rid)
+                else:
+                    token = str(x or "").strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", token):
+                        removed_short_ids.add(token)
                 lab, _ = NovelLLMService._inventory_entry_label_and_detail(x)
                 if lab:
                     removed_labels.append(lab)
+            if removed_short_ids:
+                for row in db.query(NovelMemoryNormItem).filter(
+                    NovelMemoryNormItem.novel_id == novel_id
+                ).all():
+                    label = str(getattr(row, "label", "") or "").strip()
+                    if label and _short_id(label).lower() in removed_short_ids:
+                        removed_labels.append(label)
             if removed_labels:
+                removed_labels = _dedupe_str_list(removed_labels)
                 db.query(NovelMemoryNormItem).filter(
                     NovelMemoryNormItem.novel_id == novel_id,
                     NovelMemoryNormItem.label.in_(removed_labels),
-                ).update(
-                    {
-                        NovelMemoryNormItem.is_active: False,
-                        NovelMemoryNormItem.memory_version: memory_version,
-                    },
-                    synchronize_session=False,
-                )
+                ).delete(synchronize_session=False)
 
             for raw in added:
                 label, detail_json = NovelLLMService._inventory_entry_label_and_detail(raw)
@@ -3421,6 +3446,36 @@ class NovelLLMService:
         if isinstance(skills_changed, dict):
             added = skills_changed.get("added") or []
             updated = skills_changed.get("updated") or []
+            removed = skills_changed.get("removed") or []
+
+            removed_names: list[str] = []
+            removed_short_ids: set[str] = set()
+            for raw in removed:
+                if isinstance(raw, dict):
+                    name = str(raw.get("name") or "").strip()
+                    rid = str(raw.get("id") or "").strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", rid):
+                        removed_short_ids.add(rid)
+                else:
+                    name = str(raw or "").strip()
+                    token = name.lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", token):
+                        removed_short_ids.add(token)
+                if name:
+                    removed_names.append(name)
+            if removed_short_ids:
+                for row in db.query(NovelMemoryNormSkill).filter(
+                    NovelMemoryNormSkill.novel_id == novel_id
+                ).all():
+                    n = str(getattr(row, "name", "") or "").strip()
+                    if n and _short_id(n).lower() in removed_short_ids:
+                        removed_names.append(n)
+            if removed_names:
+                removed_names = _dedupe_str_list(removed_names)
+                db.query(NovelMemoryNormSkill).filter(
+                    NovelMemoryNormSkill.novel_id == novel_id,
+                    NovelMemoryNormSkill.name.in_(removed_names),
+                ).delete(synchronize_session=False)
             
             for item in [*added, *updated]:
                 if isinstance(item, dict):
@@ -3470,6 +3525,43 @@ class NovelLLMService:
         if isinstance(pets_changed, dict):
             added = pets_changed.get("added") or []
             updated = pets_changed.get("updated") or []
+            removed = pets_changed.get("removed") or []
+
+            removed_names: list[str] = []
+            removed_short_ids: set[str] = set()
+            for raw in removed:
+                if isinstance(raw, dict):
+                    name = str(raw.get("name") or "").strip()
+                    rid = str(raw.get("id") or "").strip().lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", rid):
+                        removed_short_ids.add(rid)
+                else:
+                    name = str(raw or "").strip()
+                    token = name.lower()
+                    if re.fullmatch(r"[0-9a-f]{4}", token):
+                        removed_short_ids.add(token)
+                if name:
+                    removed_names.append(name)
+            if removed_short_ids:
+                for row in db.query(NovelMemoryNormPet).filter(
+                    NovelMemoryNormPet.novel_id == novel_id
+                ).all():
+                    n = str(getattr(row, "name", "") or "").strip()
+                    if n and _short_id(n).lower() in removed_short_ids:
+                        removed_names.append(n)
+            if removed_names:
+                removed_names = _dedupe_str_list(removed_names)
+                db.query(NovelMemoryNormPet).filter(
+                    NovelMemoryNormPet.novel_id == novel_id,
+                    NovelMemoryNormPet.name.in_(removed_names),
+                ).update(
+                    {
+                        NovelMemoryNormPet.is_active: False,
+                        NovelMemoryNormPet.memory_version: memory_version,
+                    },
+                    synchronize_session=False,
+                )
+
             for item in [*added, *updated]:
                 if isinstance(item, dict):
                     name = str(item.get("name") or "").strip()
