@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import re
+from datetime import datetime, timedelta
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -17,6 +18,9 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.models.novel import NovelGenerationLog
 from app.services.chapter_plan_schema import normalize_beats_to_v2
+
+
+_CHAPTER_POLISH_STALE_GRACE = timedelta(minutes=30)
 
 
 def memory_refresh_confirmation_token(
@@ -593,6 +597,19 @@ def has_pending_chapter_polish_batch(
             )
             .first()
         )
+        if terminal:
+            continue
+        last_log = (
+            db.query(NovelGenerationLog.created_at)
+            .filter(NovelGenerationLog.batch_id == bid)
+            .order_by(NovelGenerationLog.created_at.desc())
+            .first()
+        )
+        last_at = last_log[0] if last_log else None
+        if last_at and (datetime.utcnow() - last_at) >= _CHAPTER_POLISH_STALE_GRACE:
+            continue
+        if not last_at:
+            continue
         if not terminal:
             return True
     return False

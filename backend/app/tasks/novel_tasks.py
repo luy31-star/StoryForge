@@ -31,6 +31,7 @@ from app.services.memory_readable import memory_payload_to_readable_zh
 from app.services.novel_chapter_generate_batch import run_generate_chapters_batch_sync
 from app.services.novel_generation_common import (
     append_generation_log,
+    ensure_chapter_heading,
     has_pending_auto_pipeline_batch,
     has_pending_chapter_generation_batch,
     memory_refresh_confirmation_token,
@@ -364,7 +365,7 @@ def novel_chapter_polish(
         plan = db.query(NovelChapterPlan).filter(
             NovelChapterPlan.novel_id == c.novel_id,
             NovelChapterPlan.chapter_no == c.chapter_no
-        ).first()
+        ).order_by(NovelChapterPlan.updated_at.desc()).first()
         if not plan:
             raise ValueError(f"未找到第 {c.chapter_no} 章的执行卡，无法润色")
         try:
@@ -399,8 +400,13 @@ def novel_chapter_polish(
             chapter_text=chapter_text,
             db=db,
         )
+        _, normalized_pending = ensure_chapter_heading(
+            c.chapter_no,
+            polished_text,
+            title_hint=plan.chapter_title or c.title or "",
+        )
 
-        c.pending_content = polished_text
+        c.pending_content = normalized_pending
         c.pending_revision_prompt = "去AI味润色（手动触发）"
         c.status = "pending_review"
 
