@@ -169,7 +169,7 @@ class AiCreateAndStartBody(BaseModel):
     target_chapters: int | None = Field(default=None, ge=1, le=5000)
     notes: str = ""
     length_type: str = "long"
-    target_generate_chapters: int = Field(default=0, ge=0, le=50)
+    target_generate_chapters: int = Field(default=0, ge=0, le=5000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
@@ -1603,7 +1603,7 @@ def polish_chapter(
 
 
 class AutoGenerateBody(BaseModel):
-    target_count: int = Field(default=10, ge=1, le=50)
+    target_count: int = Field(default=10, ge=1, le=5000)
 
 
 @router.post("/{novel_id}/auto-generate")

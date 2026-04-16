@@ -2732,7 +2732,7 @@ export function NovelWorkspace() {
       {
         title: `确认 AI 一键续写 ${generateCount} 章？`,
         description:
-          "将从已审定章节之后开始推进，后台会先消费已有章计划；如章计划不足，会自动补齐章计划并串行生成正文。生成完成后章节将保存为已审定，并在每章后更新工作记忆。",
+          "将从已审定章节之后开始推进，后台会先消费已有章计划；如章计划不足，会自动补齐章计划并串行生成正文。默认会在每章生成后直接审定并更新工作记忆；若你开启了执行卡校验/纠偏，则该流程可能被校验拦截。",
         confirmLabel: "确认开始续写",
         details: [
           "会优先使用已有章计划；不足部分将自动补齐章计划。",
@@ -3838,17 +3838,26 @@ export function NovelWorkspace() {
             <div className="glass-panel-subtle space-y-3 p-4">
               <div className="flex flex-wrap items-center gap-2">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">一次生成</Label>
-                <select
+                {(() => {
+                  const maxGenerateCount = Math.max(1, Number(novel?.target_chapters || 5000));
+                  return (
+                <input
+                  type="number"
+                  min={1}
+                  max={maxGenerateCount}
                   value={generateCount}
-                  onChange={(e) => setGenerateCount(Number(e.target.value))}
-                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-sm text-foreground font-bold"
-                >
-                  {[1, 2, 3, 4, 5].map((n) => (
-                    <option key={n} value={n}>
-                      {n} 章
-                    </option>
-                  ))}
-                </select>
+                  onChange={(e) => {
+                    const parsed = Number.parseInt(e.target.value, 10);
+                    if (!Number.isFinite(parsed)) {
+                      setGenerateCount(1);
+                      return;
+                    }
+                    setGenerateCount(Math.max(1, Math.min(maxGenerateCount, Math.round(parsed))));
+                  }}
+                  className="h-8 w-24 rounded-xl border border-border/70 bg-background px-2.5 text-sm text-foreground font-bold"
+                />
+                  );
+                })()}
                 <Button
                   type="button"
                   size="sm"

@@ -380,10 +380,12 @@ def run_generate_chapters_batch_sync(
                 )
                 db.commit()
 
-        # 仅 batch_auto 或非 manual 来源才自动更新工作记忆并审定
-        auto_approve_requested = source != "manual"
+        # 一键续写默认直接自动审定并同步工作记忆；
+        # 但若用户显式开启了执行卡校验/纠偏，则允许校验链路拦截。
+        force_auto_approve = source == "auto_pipeline" and not do_plan_guard_check
+        auto_approve_requested = force_auto_approve or source != "manual"
         auto_approval_issues: list[str] = []
-        if auto_approve_requested:
+        if auto_approve_requested and not force_auto_approve:
             auto_approval_issues = collect_chapter_approval_issues(
                 novel=n,
                 chapter_no=no,
@@ -405,7 +407,9 @@ def run_generate_chapters_batch_sync(
                     meta={"issues": auto_approval_issues},
                 )
                 db.commit()
-        auto_approve = auto_approve_requested and not auto_approval_issues
+        auto_approve = force_auto_approve or (
+            auto_approve_requested and not auto_approval_issues
+        )
         try:
             memory_delta_result: dict[str, Any] | None = None
             if auto_approve:
