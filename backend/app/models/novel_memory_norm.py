@@ -115,6 +115,7 @@ class NovelMemoryNormRelation(Base):
     src: Mapped[str] = mapped_column(String(512), default="")
     dst: Mapped[str] = mapped_column(String(512), default="")
     relation: Mapped[str] = mapped_column(LONGTEXT, default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
 
 
 class NovelMemoryNormPlot(Base):

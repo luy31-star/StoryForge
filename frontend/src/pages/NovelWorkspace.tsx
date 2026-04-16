@@ -18,7 +18,9 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   addChapterFeedback,
+  createMemoryCharacter,
   createMemoryItem,
+  createMemoryRelation,
   createMemorySkill,
   applyRefreshMemoryCandidate,
   applyChapterRevision,
@@ -29,7 +31,9 @@ import {
   clearGenerationLogs,
   confirmFramework,
   deleteChapter,
+  deleteMemoryCharacter,
   deleteMemoryItem,
+  deleteMemoryRelation,
   deleteMemorySkill,
   discardChapterRevision,
   exportChapters,
@@ -55,7 +59,9 @@ import {
   listChapters,
   patchChapter,
   patchChapterPlan,
+  patchMemoryCharacter,
   patchMemoryItem,
+  patchMemoryRelation,
   patchMemorySkill,
   patchNovel,
   polishChapter,
@@ -668,6 +674,9 @@ export function NovelWorkspace() {
     daily_auto_time: "14:30",
     chapter_target_words: 3000,
     auto_consistency_check: false,
+    auto_plan_guard_check: false,
+    auto_plan_guard_fix: false,
+    auto_style_polish: false,
     style: "",
     writing_style_id: "",
   });
@@ -706,6 +715,11 @@ export function NovelWorkspace() {
       daily_auto_time: String(novel.daily_auto_time || "14:30"),
       chapter_target_words: Number(novel.chapter_target_words || 3000),
       auto_consistency_check: Boolean(novel.auto_consistency_check),
+      auto_plan_guard_check: Boolean(
+        novel.auto_plan_guard_check || novel.auto_plan_guard_fix
+      ),
+      auto_plan_guard_fix: Boolean(novel.auto_plan_guard_fix),
+      auto_style_polish: Boolean(novel.auto_style_polish),
       style: String(novel.style || ""),
       writing_style_id: String(novel.writing_style_id || ""),
     });
@@ -1076,7 +1090,7 @@ export function NovelWorkspace() {
       topCharacters,
       maxInfluence,
       topOpenPlots,
-      topRelations: memoryNorm.relations.slice(0, 6),
+      topRelations: memoryNorm.relations.filter((relation) => relation.is_active !== false).slice(0, 6),
       activeCharacters: memoryNorm.characters.filter((character) => character.is_active).length,
       activeInventory: memoryNorm.inventory.filter((item) => item.is_active).length,
       staleCount: memoryHealth?.stale_plots.length ?? 0,
@@ -1547,6 +1561,197 @@ export function NovelWorkspace() {
       setErr(e instanceof Error ? e.message : "从快照导入结构化记忆失败");
     } finally {
       setMemoryNormRebuildBusy(false);
+    }
+  }
+
+  async function runCreateCharacter() {
+    if (!id) return;
+    const name = (window.prompt("请输入人物主名") || "").trim();
+    if (!name) return;
+    const role = (window.prompt("人物角色（可选）", "") || "").trim();
+    const status = (window.prompt("人物状态（可选）", "") || "").trim();
+    const traitsRaw = (window.prompt("人物特征（可选，逗号分隔）", "") || "").trim();
+    const influence = readPromptNumber("人物影响力（0-100）", 0, 0, 100);
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm("是否标记为活跃人物？（确定=活跃，取消=已退场）");
+    setErr(null);
+    setBusy(true);
+    try {
+      await createMemoryCharacter(id, {
+        name,
+        role,
+        status,
+        traits: traitsRaw
+          ? traitsRaw
+              .split(/[，,]/)
+              .map((x) => x.trim())
+              .filter(Boolean)
+          : [],
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("人物已新增");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "新增人物失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runEditCharacter(character: NormalizedMemoryPayload["characters"][number]) {
+    if (!id) return;
+    if (!character.id) {
+      setErr("当前人物缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    const name = (window.prompt("人物主名", character.name) || "").trim();
+    if (!name) return;
+    const role = (window.prompt("人物角色（可选）", character.role || "") || "").trim();
+    const status = (window.prompt("人物状态（可选）", character.status || "") || "").trim();
+    const currentTraits = Array.isArray(character.traits)
+      ? character.traits.map((x) => String(x || "").trim()).filter(Boolean).join("，")
+      : "";
+    const traitsRaw = (window.prompt("人物特征（可选，逗号分隔）", currentTraits) || "").trim();
+    const influence = readPromptNumber(
+      "人物影响力（0-100）",
+      character.influence_score ?? 0,
+      0,
+      100
+    );
+    if (influence == null) {
+      setErr("影响力需为 0-100 的数字");
+      return;
+    }
+    const isActive = window.confirm(
+      `当前状态：${character.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
+    );
+    setErr(null);
+    setBusy(true);
+    try {
+      await patchMemoryCharacter(id, character.id, {
+        name,
+        role,
+        status,
+        traits: traitsRaw
+          ? traitsRaw
+              .split(/[，,]/)
+              .map((x) => x.trim())
+              .filter(Boolean)
+          : [],
+        detail: character.detail,
+        influence_score: influence,
+        is_active: isActive,
+      });
+      setNotice("人物已更新");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "更新人物失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runDeleteCharacter(character: NormalizedMemoryPayload["characters"][number]) {
+    if (!id) return;
+    if (!character.id) {
+      setErr("当前人物缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    if (!window.confirm(`确认将人物「${character.name}」标记为已退场吗？`)) return;
+    setErr(null);
+    setBusy(true);
+    try {
+      await deleteMemoryCharacter(id, character.id);
+      setNotice("人物已标记为退场");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "人物下线失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runCreateRelation() {
+    if (!id) return;
+    const fromName = (window.prompt("关系起点人物") || "").trim();
+    if (!fromName) return;
+    const toName = (window.prompt("关系终点人物") || "").trim();
+    if (!toName) return;
+    const relation = (window.prompt("关系描述") || "").trim();
+    if (!relation) return;
+    const isActive = window.confirm("是否标记为当前生效关系？（确定=生效，取消=失效）");
+    setErr(null);
+    setBusy(true);
+    try {
+      await createMemoryRelation(id, {
+        from_name: fromName,
+        to_name: toName,
+        relation,
+        is_active: isActive,
+      });
+      setNotice("关系已新增");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "新增关系失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runEditRelation(relation: NormalizedMemoryPayload["relations"][number]) {
+    if (!id) return;
+    if (!relation.id) {
+      setErr("当前关系缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    const fromName = (window.prompt("关系起点人物", relation.from) || "").trim();
+    if (!fromName) return;
+    const toName = (window.prompt("关系终点人物", relation.to) || "").trim();
+    if (!toName) return;
+    const relText = (window.prompt("关系描述", relation.relation) || "").trim();
+    if (!relText) return;
+    const isActive = window.confirm(
+      `当前状态：${relation.is_active === false ? "失效" : "生效"}。点击“确定”设置为生效，点击“取消”设置为失效。`
+    );
+    setErr(null);
+    setBusy(true);
+    try {
+      await patchMemoryRelation(id, relation.id, {
+        from_name: fromName,
+        to_name: toName,
+        relation: relText,
+        is_active: isActive,
+      });
+      setNotice("关系已更新");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "更新关系失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runDeleteRelation(relation: NormalizedMemoryPayload["relations"][number]) {
+    if (!id) return;
+    if (!relation.id) {
+      setErr("当前关系缺少唯一标识，请先点击“从快照同步分表”后重试");
+      return;
+    }
+    if (!window.confirm(`确认将关系「${relation.from} → ${relation.to}」标记为失效吗？`)) return;
+    setErr(null);
+    setBusy(true);
+    try {
+      await deleteMemoryRelation(id, relation.id);
+      setNotice("关系已标记为失效");
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "关系失效失败");
+    } finally {
+      setBusy(false);
     }
   }
 
@@ -2320,15 +2525,23 @@ export function NovelWorkspace() {
   }) {
     const isApproved = ch.status === "approved";
     const title = ch.title || `第${ch.chapter_no}章`;
+    let updateMemory = true;
     if (isApproved) {
       const typed = window.prompt(
         [
           `你正在删除已审定章节：第${ch.chapter_no}章《${title}》`,
-          "此操作会触发后台记忆重算，可能影响后续衔接。",
+          "该章节已经进入记忆体系。",
           '请输入 DELETE 以确认删除：',
         ].join("\n")
       );
       if (typed !== "DELETE") return;
+      updateMemory = window.confirm(
+        [
+          `是否同时更新记忆？`,
+          "确定：删除章节，并在后台刷新记忆。",
+          "取消：只删除章节，不更新记忆。",
+        ].join("\n")
+      );
     } else {
       const msg = `确认删除第${ch.chapter_no}章《${title}》吗？\n该章节未审定，删除不会影响记忆。`;
       if (!window.confirm(msg)) return;
@@ -2338,9 +2551,11 @@ export function NovelWorkspace() {
     setNotice(null);
     setBusy(true);
     try {
-      const resp = await deleteChapter(ch.id);
+      const resp = await deleteChapter(ch.id, { update_memory: updateMemory });
       if (resp.was_approved) {
-        if (resp.memory_refresh_status === "queued") {
+        if (!resp.update_memory) {
+          setNotice("章节已删除，记忆未更新。");
+        } else if (resp.memory_refresh_status === "queued") {
           if (resp.memory_refresh_batch_id) {
             setRefreshBatchId(resp.memory_refresh_batch_id);
             if (logViewMode === "batch") {
@@ -4684,90 +4899,171 @@ export function NovelWorkspace() {
                       {normPager("pets", memoryNorm.pets.length, STRUCTURED_LIST_PAGE)}
                     </div>
                   ) : null}
-                  {memoryNorm.characters.length > 0 ? (
-                    <div className="glass-panel-subtle space-y-2 p-4">
-                      <p className="font-medium text-foreground">人物</p>
-                      <ul className="space-y-2">
-                        {slicePage(
-                          memoryNorm.characters,
-                          structuredPages.characters ?? 0,
-                          STRUCTURED_LIST_PAGE
-                        ).map((c, i) => (
-                          <li
-                            key={`ch-${c.name}-${i}`}
-                            className="list-card flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
-                          >
-                            <div className="min-w-0 flex-1">
-                              <div className="font-medium text-foreground">{c.name}</div>
-                              {(c.role || c.status) ? (
-                                <p className="text-[11px] text-muted-foreground">
-                                  {[c.role, c.status].filter(Boolean).join(" · ")}
-                                </p>
-                              ) : null}
-                              <p className="text-[10px] text-muted-foreground">
-                                影响力 {c.influence_score} · {c.is_active ? "活跃" : "已退场"}
-                                {c.aliases.length ? ` · 别名 ${c.aliases.slice(0, 3).join(" / ")}` : ""}
-                              </p>
-                            </div>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="h-7 shrink-0 text-xs"
-                              onClick={() => openNormDetail(`人物 · ${c.name}`, c)}
-                            >
-                              详情
-                            </Button>
-                          </li>
-                        ))}
-                      </ul>
-                      {normPager(
-                        "characters",
-                        memoryNorm.characters.length,
-                        STRUCTURED_LIST_PAGE
+                  <div className="glass-panel-subtle space-y-2 p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="font-medium text-foreground">人物</p>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs"
+                          disabled={busy}
+                          onClick={() => void runCreateCharacter()}
+                        >
+                          新增人物
+                        </Button>
+                      </div>
+                      {memoryNorm.characters.length > 0 ? (
+                        <>
+                          <ul className="space-y-2">
+                            {slicePage(
+                              memoryNorm.characters,
+                              structuredPages.characters ?? 0,
+                              STRUCTURED_LIST_PAGE
+                            ).map((c, i) => (
+                              <li
+                                key={`ch-${c.name}-${i}`}
+                                className="list-card flex flex-wrap items-center justify-between gap-2 px-3 py-2.5"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <div className="font-medium text-foreground">{c.name}</div>
+                                  {(c.role || c.status) ? (
+                                    <p className="text-[11px] text-muted-foreground">
+                                      {[c.role, c.status].filter(Boolean).join(" · ")}
+                                    </p>
+                                  ) : null}
+                                  <p className="text-[10px] text-muted-foreground">
+                                    影响力 {c.influence_score} · {c.is_active ? "活跃" : "已退场"}
+                                    {c.aliases.length ? ` · 别名 ${c.aliases.slice(0, 3).join(" / ")}` : ""}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 text-xs"
+                                    disabled={busy}
+                                    onClick={() => void runEditCharacter(c)}
+                                  >
+                                    编辑
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 text-xs text-destructive hover:text-destructive"
+                                    disabled={busy}
+                                    onClick={() => void runDeleteCharacter(c)}
+                                  >
+                                    下线
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="outline"
+                                    className="h-7 shrink-0 text-xs"
+                                    onClick={() => openNormDetail(`人物 · ${c.name}`, c)}
+                                  >
+                                    详情
+                                  </Button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                          {normPager(
+                            "characters",
+                            memoryNorm.characters.length,
+                            STRUCTURED_LIST_PAGE
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">暂无人物，点击右上角新增。</p>
                       )}
                     </div>
-                  ) : null}
-                  {memoryNorm.relations.length > 0 ? (
-                    <div className="glass-panel-subtle space-y-2 p-4">
-                      <p className="font-medium text-foreground">人物关系</p>
-                      <ul className="space-y-2">
-                        {slicePage(
-                          memoryNorm.relations,
-                          structuredPages.relations ?? 0,
-                          STRUCTURED_LIST_PAGE
-                        ).map((r, i) => (
-                          <li
-                            key={`rel-${i}-${r.from}-${r.to}`}
-                            className="list-card flex items-start justify-between gap-2 px-3 py-2"
-                          >
-                            <span className="line-clamp-2 flex-1 break-words text-muted-foreground">
-                              {r.from} → {r.to}：{r.relation}
-                            </span>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="ghost"
-                              className="h-7 shrink-0 text-[11px]"
-                              onClick={() =>
-                                openNormDetail(
-                                  `关系 · ${r.from} → ${r.to}`,
-                                  r
-                                )
-                              }
-                            >
-                              详情
-                            </Button>
-                          </li>
-                        ))}
-                      </ul>
-                      {normPager(
-                        "relations",
-                        memoryNorm.relations.length,
-                        STRUCTURED_LIST_PAGE
+                  <div className="glass-panel-subtle space-y-2 p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <p className="font-medium text-foreground">人物关系</p>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="outline"
+                          className="h-7 text-xs"
+                          disabled={busy}
+                          onClick={() => void runCreateRelation()}
+                        >
+                          新增关系
+                        </Button>
+                      </div>
+                      {memoryNorm.relations.length > 0 ? (
+                        <>
+                          <ul className="space-y-2">
+                            {slicePage(
+                              memoryNorm.relations,
+                              structuredPages.relations ?? 0,
+                              STRUCTURED_LIST_PAGE
+                            ).map((r, i) => (
+                              <li
+                                key={`rel-${i}-${r.from}-${r.to}`}
+                                className="list-card flex items-start justify-between gap-2 px-3 py-2"
+                              >
+                                <div className="min-w-0 flex-1">
+                                  <span className="line-clamp-2 block break-words text-muted-foreground">
+                                    {r.from} → {r.to}：{r.relation}
+                                  </span>
+                                  <p className="text-[10px] text-muted-foreground">
+                                    {r.is_active === false ? "已失效" : "生效中"}
+                                  </p>
+                                </div>
+                                <div className="flex items-center gap-1.5">
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 text-xs"
+                                    disabled={busy}
+                                    onClick={() => void runEditRelation(r)}
+                                  >
+                                    编辑
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 text-xs text-destructive hover:text-destructive"
+                                    disabled={busy}
+                                    onClick={() => void runDeleteRelation(r)}
+                                  >
+                                    失效
+                                  </Button>
+                                  <Button
+                                    type="button"
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-7 shrink-0 text-[11px]"
+                                    onClick={() =>
+                                      openNormDetail(
+                                        `关系 · ${r.from} → ${r.to}`,
+                                        r
+                                      )
+                                    }
+                                  >
+                                    详情
+                                  </Button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                          {normPager(
+                            "relations",
+                            memoryNorm.relations.length,
+                            STRUCTURED_LIST_PAGE
+                          )}
+                        </>
+                      ) : (
+                        <p className="text-xs text-muted-foreground">暂无关系，点击右上角新增。</p>
                       )}
                     </div>
-                  ) : null}
                   {memoryNorm.open_plots.length > 0 ? (
                     <div className="glass-panel-subtle space-y-2 p-4">
                       <p className="font-medium text-foreground">全书待收束线</p>
@@ -5486,6 +5782,96 @@ export function NovelWorkspace() {
                   <p className="text-sm font-semibold text-foreground">生成正文后，追加一次一致性修订</p>
                   <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
                     默认关闭。开启后会多一次 LLM 调用，速度更慢，但会先做一轮通顺性与设定衔接修订。
+                  </p>
+                </div>
+              </label>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="auto_plan_guard_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                执行卡硬校验
+              </Label>
+              <label
+                htmlFor="auto_plan_guard_check"
+                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
+              >
+                <input
+                  id="auto_plan_guard_check"
+                  type="checkbox"
+                  checked={novelSettingsDraft.auto_plan_guard_check}
+                  onChange={(e) =>
+                    setNovelSettingsDraft({
+                      ...novelSettingsDraft,
+                      auto_plan_guard_check: e.target.checked,
+                      auto_plan_guard_fix: e.target.checked
+                        ? novelSettingsDraft.auto_plan_guard_fix
+                        : false,
+                    })
+                  }
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">生成正文初稿后，按执行卡做一次硬校验</p>
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                    默认关闭。开启后会额外消耗一次 LLM 调用；若同时未开启纠偏，校验失败会直接终止当前批次。
+                  </p>
+                </div>
+              </label>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="auto_plan_guard_fix" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                执行卡纠偏
+              </Label>
+              <label
+                htmlFor="auto_plan_guard_fix"
+                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
+              >
+                <input
+                  id="auto_plan_guard_fix"
+                  type="checkbox"
+                  checked={novelSettingsDraft.auto_plan_guard_fix}
+                  onChange={(e) =>
+                    setNovelSettingsDraft({
+                      ...novelSettingsDraft,
+                      auto_plan_guard_fix: e.target.checked,
+                      auto_plan_guard_check: e.target.checked
+                        ? true
+                        : novelSettingsDraft.auto_plan_guard_check,
+                    })
+                  }
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">硬校验失败时，自动按执行卡重写纠偏</p>
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                    默认关闭。开启后会自动联动硬校验，并在失败时追加一次纠偏调用，进一步增加耗时与 token。
+                  </p>
+                </div>
+              </label>
+            </div>
+            <div className="space-y-2">
+              <Label htmlFor="auto_style_polish" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                AI 润色
+              </Label>
+              <label
+                htmlFor="auto_style_polish"
+                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
+              >
+                <input
+                  id="auto_style_polish"
+                  type="checkbox"
+                  checked={novelSettingsDraft.auto_style_polish}
+                  onChange={(e) =>
+                    setNovelSettingsDraft({
+                      ...novelSettingsDraft,
+                      auto_style_polish: e.target.checked,
+                    })
+                  }
+                  className="mt-0.5 h-4 w-4"
+                />
+                <div className="space-y-1">
+                  <p className="text-sm font-semibold text-foreground">保存前追加一次去 AI 味风格润色</p>
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                    默认关闭。开启后会在正文初稿完成后再做一轮风格整理，速度更慢但文面更细。
                   </p>
                 </div>
               </label>

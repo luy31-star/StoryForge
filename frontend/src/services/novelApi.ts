@@ -411,6 +411,9 @@ export async function createNovel(body: {
   daily_auto_time?: string;
   chapter_target_words?: number;
   auto_consistency_check?: boolean;
+  auto_plan_guard_check?: boolean;
+  auto_plan_guard_fix?: boolean;
+  auto_style_polish?: boolean;
 }) {
   const r = await apiFetch(BASE, {
     method: "POST",
@@ -434,6 +437,9 @@ export async function aiCreateAndStartNovel(body: {
   daily_auto_time?: string;
   chapter_target_words?: number;
   auto_consistency_check?: boolean;
+  auto_plan_guard_check?: boolean;
+  auto_plan_guard_fix?: boolean;
+  auto_style_polish?: boolean;
   writing_style_id?: string;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
@@ -480,6 +486,9 @@ export async function getNovel(id: string) {
     daily_auto_time: string;
     chapter_target_words: number;
     auto_consistency_check: boolean;
+    auto_plan_guard_check: boolean;
+    auto_plan_guard_fix: boolean;
+    auto_style_polish: boolean;
     framework_confirmed: boolean;
     status: string;
     [key: string]: any;
@@ -580,6 +589,9 @@ export async function generateChapters(
     use_cold_recall?: boolean;
     cold_recall_items?: number;
     auto_consistency_check?: boolean;
+    auto_plan_guard_check?: boolean;
+    auto_plan_guard_fix?: boolean;
+    auto_style_polish?: boolean;
     chapter_no?: number;
     source?: string;
   }
@@ -594,6 +606,15 @@ export async function generateChapters(
   };
   if (typeof options?.auto_consistency_check === "boolean") {
     payload.auto_consistency_check = options.auto_consistency_check;
+  }
+  if (typeof options?.auto_plan_guard_check === "boolean") {
+    payload.auto_plan_guard_check = options.auto_plan_guard_check;
+  }
+  if (typeof options?.auto_plan_guard_fix === "boolean") {
+    payload.auto_plan_guard_fix = options.auto_plan_guard_fix;
+  }
+  if (typeof options?.auto_style_polish === "boolean") {
+    payload.auto_style_polish = options.auto_style_polish;
   }
   const r = await apiFetch(`${BASE}/${novelId}/chapters/generate`, {
     method: "POST",
@@ -890,9 +911,15 @@ export async function patchChapter(
   return r.json() as Promise<{ status: "ok" }>;
 }
 
-export async function deleteChapter(chapterId: string) {
+export async function deleteChapter(
+  chapterId: string,
+  options?: { update_memory?: boolean }
+) {
   const r = await apiFetch(`${BASE}/chapters/${chapterId}`, {
     method: "DELETE",
+    body: JSON.stringify({
+      update_memory: options?.update_memory ?? true,
+    }),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{
@@ -900,6 +927,7 @@ export async function deleteChapter(chapterId: string) {
     deleted_chapter_id: string;
     deleted_chapter_no: number;
     was_approved: boolean;
+    update_memory: boolean;
     memory_refresh_status?: "queued" | "skipped" | "none";
     memory_refresh_task_id?: string | null;
     memory_refresh_batch_id?: string | null;
@@ -1152,6 +1180,7 @@ export type NormalizedMemoryPayload = {
     is_active: boolean;
   }[];
   pets: {
+    id?: string;
     name: string;
     detail: Record<string, unknown>;
     aliases: string[];
@@ -1159,6 +1188,7 @@ export type NormalizedMemoryPayload = {
     is_active: boolean;
   }[];
   characters: {
+    id?: string;
     name: string;
     role: string;
     status: string;
@@ -1168,7 +1198,7 @@ export type NormalizedMemoryPayload = {
     influence_score: number;
     is_active: boolean;
   }[];
-  relations: { from: string; to: string; relation: string }[];
+  relations: { id?: string; from: string; to: string; relation: string; is_active?: boolean }[];
   /** 与后端一致：多为 { body, plot_type, priority, estimated_duration }[] */
   open_plots: Array<{
     body: string;
@@ -1230,6 +1260,98 @@ export async function createMemorySkill(
       is_active: boolean;
     };
   }>;
+}
+
+export async function createMemoryCharacter(
+  novelId: string,
+  payload: {
+    name: string;
+    role?: string;
+    status?: string;
+    traits?: string[];
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/characters`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; item: { id: string } }>;
+}
+
+export async function patchMemoryCharacter(
+  novelId: string,
+  characterId: string,
+  payload: {
+    name?: string;
+    role?: string;
+    status?: string;
+    traits?: string[];
+    detail?: Record<string, unknown>;
+    influence_score?: number;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/characters/${characterId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok" }>;
+}
+
+export async function deleteMemoryCharacter(novelId: string, characterId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/characters/${characterId}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; deleted_id: string }>;
+}
+
+export async function createMemoryRelation(
+  novelId: string,
+  payload: {
+    from_name: string;
+    to_name: string;
+    relation: string;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/relations`, {
+    method: "POST",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; item: { id: string } }>;
+}
+
+export async function patchMemoryRelation(
+  novelId: string,
+  relationId: string,
+  payload: {
+    from_name?: string;
+    to_name?: string;
+    relation?: string;
+    is_active?: boolean;
+  }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/relations/${relationId}`, {
+    method: "PATCH",
+    body: JSON.stringify(payload),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok" }>;
+}
+
+export async function deleteMemoryRelation(novelId: string, relationId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/relations/${relationId}`, {
+    method: "DELETE",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; deleted_id: string }>;
 }
 
 export async function patchMemorySkill(

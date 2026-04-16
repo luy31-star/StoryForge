@@ -251,7 +251,14 @@ def _compact_characters_for_hot(chars: Any, max_items: int) -> list[dict[str, st
     if not isinstance(chars, list):
         return []
     out: list[dict[str, str]] = []
-    for x in chars[:max_items]:
+    rows = [x for x in chars if isinstance(x, dict) and x.get("is_active", True) is not False]
+    rows.sort(
+        key=lambda x: (
+            -int(x.get("influence_score") or 0),
+            str(x.get("name") or ""),
+        )
+    )
+    for x in rows[:max_items]:
         if not isinstance(x, dict):
             continue
         item: dict[str, str] = {}
@@ -296,6 +303,8 @@ def _compact_relations_for_hot(relations: Any, max_items: int = 10) -> list[dict
     for rel in relations:
         if not isinstance(rel, dict):
             continue
+        if rel.get("is_active", True) is False:
+            continue
         src = str(rel.get("from") or "").strip()
         dst = str(rel.get("to") or "").strip()
         relation = str(rel.get("relation") or "").strip()
@@ -318,6 +327,8 @@ def _compact_inventory_for_hot(inventory: Any, max_items: int = 12) -> list[dict
     seen = set()
     for item in inventory:
         if isinstance(item, dict):
+            if item.get("is_active", True) is False:
+                continue
             label = str(
                 item.get("name") or item.get("item") or item.get("label") or ""
             ).strip()
@@ -341,6 +352,8 @@ def _compact_named_state_for_hot(items: Any, max_items: int = 8) -> list[dict[st
     out: list[dict[str, str]] = []
     for item in items:
         if not isinstance(item, dict):
+            continue
+        if item.get("is_active", True) is False:
             continue
         name = str(item.get("name") or "").strip()
         if not name:
@@ -436,6 +449,8 @@ def _extract_recall_terms(memory_json: str, query_text: str) -> list[str]:
             for item in items:
                 if not isinstance(item, dict):
                     continue
+                if item.get("is_active", True) is False:
+                    continue
                 name = str(item.get("name") or "").strip()
                 if name and name in query:
                     candidates.append(name)
@@ -444,6 +459,8 @@ def _extract_recall_terms(memory_json: str, query_text: str) -> list[str]:
                         candidates.append(alias)
     for raw in data.get("inventory", []) if isinstance(data.get("inventory"), list) else []:
         if isinstance(raw, dict):
+            if raw.get("is_active", True) is False:
+                continue
             item = str(raw.get("name") or raw.get("item") or raw.get("label") or "").strip()
             aliases = extract_aliases(raw)
         else:
@@ -522,6 +539,8 @@ def format_entity_recall_block(
         matched_rel: list[str] = []
         for item in relations:
             if not isinstance(item, dict):
+                continue
+            if item.get("is_active", True) is False:
                 continue
             src = str(item.get("from") or "").strip()
             dst = str(item.get("to") or "").strip()
@@ -1728,12 +1747,18 @@ def build_hot_memory_from_db(
     # 4. 关系
     rels = (
         db.query(NovelMemoryNormRelation)
-        .filter(NovelMemoryNormRelation.novel_id == novel_id)
+        .filter(
+            NovelMemoryNormRelation.novel_id == novel_id,
+            NovelMemoryNormRelation.is_active.is_(True),
+        )
         .order_by(NovelMemoryNormRelation.sort_order.asc())
         .limit(10)
         .all()
     )
-    relations_hot = [{"from": r.src, "to": r.dst, "relation": r.relation} for r in rels]
+    relations_hot = [
+        {"id": r.id, "from": r.src, "to": r.dst, "relation": r.relation}
+        for r in rels
+    ]
 
     # 5. 物品与技能（影响力优先 + 仅活跃）
     inventory_items = (
@@ -1968,6 +1993,7 @@ def format_entity_recall_from_db(
             db.query(NovelMemoryNormRelation)
             .filter(
                 NovelMemoryNormRelation.novel_id == novel_id,
+                NovelMemoryNormRelation.is_active.is_(True),
                 or_(
                     NovelMemoryNormRelation.src.in_(matched_terms),
                     NovelMemoryNormRelation.dst.in_(matched_terms),

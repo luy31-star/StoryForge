@@ -8,7 +8,7 @@ import re
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
@@ -26,8 +26,10 @@ from app.models.novel import (
     NovelMemory,
 )
 from app.models.novel_memory_norm import (
+    NovelMemoryNormCharacter,
     NovelMemoryNormItem,
     NovelMemoryNormOutline,
+    NovelMemoryNormRelation,
     NovelMemoryNormSkill,
 )
 from app.models.task import UserTask
@@ -172,6 +174,9 @@ class AiCreateAndStartBody(BaseModel):
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
     auto_consistency_check: bool = False
+    auto_plan_guard_check: bool = False
+    auto_plan_guard_fix: bool = False
+    auto_style_polish: bool = False
     writing_style_id: str | None = Field(default=None, max_length=36)
     
 class NovelCreate(BaseModel):
@@ -185,6 +190,9 @@ class NovelCreate(BaseModel):
     daily_auto_time: str = Field(default="14:30")
     chapter_target_words: int = Field(default=3000, ge=500, le=10000)
     auto_consistency_check: bool = False
+    auto_plan_guard_check: bool = False
+    auto_plan_guard_fix: bool = False
+    auto_style_polish: bool = False
 
 class NovelPatch(BaseModel):
     title: str | None = None
@@ -197,6 +205,9 @@ class NovelPatch(BaseModel):
     daily_auto_time: str | None = None
     chapter_target_words: int | None = Field(default=None, ge=500, le=10000)
     auto_consistency_check: bool | None = None
+    auto_plan_guard_check: bool | None = None
+    auto_plan_guard_fix: bool | None = None
+    auto_style_polish: bool | None = None
     status: str | None = None
 
 
@@ -235,6 +246,9 @@ class GenerateChapterBody(BaseModel):
     use_cold_recall: bool = False
     cold_recall_items: int = Field(default=5, ge=1, le=12)
     auto_consistency_check: bool | None = None
+    auto_plan_guard_check: bool | None = None
+    auto_plan_guard_fix: bool | None = None
+    auto_style_polish: bool | None = None
     # 按卷驱动：允许生成指定章（用于点击章计划条目生成正文）
     chapter_no: int | None = Field(default=None, ge=1, le=20000)
     source: str | None = Field(default=None, description="章节来源，如 manual 或 batch_auto")
@@ -300,6 +314,40 @@ class MemoryItemUpdateBody(BaseModel):
     label: str | None = Field(default=None, min_length=1, max_length=512)
     detail: dict[str, Any] | None = None
     influence_score: int | None = Field(default=None, ge=0, le=100)
+    is_active: bool | None = None
+
+
+class MemoryCharacterCreateBody(BaseModel):
+    name: str = Field(..., min_length=1, max_length=512)
+    role: str = Field(default="", max_length=512)
+    status: str = Field(default="", max_length=512)
+    traits: list[str] = Field(default_factory=list)
+    detail: dict[str, Any] = Field(default_factory=dict)
+    influence_score: int = Field(default=0, ge=0, le=100)
+    is_active: bool = True
+
+
+class MemoryCharacterUpdateBody(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=512)
+    role: str | None = Field(default=None, max_length=512)
+    status: str | None = Field(default=None, max_length=512)
+    traits: list[str] | None = None
+    detail: dict[str, Any] | None = None
+    influence_score: int | None = Field(default=None, ge=0, le=100)
+    is_active: bool | None = None
+
+
+class MemoryRelationCreateBody(BaseModel):
+    from_name: str = Field(..., min_length=1, max_length=512)
+    to_name: str = Field(..., min_length=1, max_length=512)
+    relation: str = Field(..., min_length=1, max_length=4000)
+    is_active: bool = True
+
+
+class MemoryRelationUpdateBody(BaseModel):
+    from_name: str | None = Field(default=None, min_length=1, max_length=512)
+    to_name: str | None = Field(default=None, min_length=1, max_length=512)
+    relation: str | None = Field(default=None, min_length=1, max_length=4000)
     is_active: bool | None = None
 
 
@@ -659,6 +707,9 @@ def ai_create_and_start(
         daily_auto_time=body.daily_auto_time,
         chapter_target_words=body.chapter_target_words,
         auto_consistency_check=body.auto_consistency_check,
+        auto_plan_guard_check=body.auto_plan_guard_check or body.auto_plan_guard_fix,
+        auto_plan_guard_fix=body.auto_plan_guard_fix,
+        auto_style_polish=body.auto_style_polish,
         writing_style_id=body.writing_style_id,
         user_id=user.id,
         status="draft",
@@ -765,6 +816,9 @@ def create_novel(
         daily_auto_time=body.daily_auto_time,
         chapter_target_words=body.chapter_target_words,
         auto_consistency_check=body.auto_consistency_check,
+        auto_plan_guard_check=body.auto_plan_guard_check or body.auto_plan_guard_fix,
+        auto_plan_guard_fix=body.auto_plan_guard_fix,
+        auto_style_polish=body.auto_style_polish,
         user_id=user.id,
     )
     db.add(n)
@@ -790,6 +844,11 @@ def get_novel(
         "target_chapters": n.target_chapters,
         "chapter_target_words": n.chapter_target_words,
         "auto_consistency_check": bool(getattr(n, "auto_consistency_check", False)),
+        "auto_plan_guard_check": bool(
+            getattr(n, "auto_plan_guard_check", False) or getattr(n, "auto_plan_guard_fix", False)
+        ),
+        "auto_plan_guard_fix": bool(getattr(n, "auto_plan_guard_fix", False)),
+        "auto_style_polish": bool(getattr(n, "auto_style_polish", False)),
         "length_tag": _get_length_tag(n.target_chapters),
         "daily_auto_chapters": n.daily_auto_chapters,
         "daily_auto_time": n.daily_auto_time,
@@ -813,6 +872,10 @@ def patch_novel(
 ) -> dict[str, str]:
     n = require_novel_access(db, novel_id, user)
     data = body.model_dump(exclude_unset=True)
+    if data.get("auto_plan_guard_fix") is True:
+        data["auto_plan_guard_check"] = True
+    if data.get("auto_plan_guard_check") is False:
+        data["auto_plan_guard_fix"] = False
     for k, v in data.items():
         setattr(n, k, v)
     db.commit()
@@ -1331,6 +1394,24 @@ async def generate_chapters(
         if body.auto_consistency_check is not None
         else bool(getattr(n, "auto_consistency_check", False))
     )
+    resolved_auto_plan_guard_fix = (
+        body.auto_plan_guard_fix
+        if body.auto_plan_guard_fix is not None
+        else bool(getattr(n, "auto_plan_guard_fix", False))
+    )
+    resolved_auto_plan_guard_check = (
+        body.auto_plan_guard_check
+        if body.auto_plan_guard_check is not None
+        else bool(getattr(n, "auto_plan_guard_check", False))
+    )
+    resolved_auto_plan_guard_check = bool(
+        resolved_auto_plan_guard_check or resolved_auto_plan_guard_fix
+    )
+    resolved_auto_style_polish = (
+        body.auto_style_polish
+        if body.auto_style_polish is not None
+        else bool(getattr(n, "auto_style_polish", False))
+    )
 
     payload: dict[str, Any] = {
         "title_hint": body.title_hint,
@@ -1339,6 +1420,9 @@ async def generate_chapters(
         "use_cold_recall": body.use_cold_recall,
         "cold_recall_items": body.cold_recall_items,
         "auto_consistency_check": bool(resolved_auto_consistency_check),
+        "auto_plan_guard_check": bool(resolved_auto_plan_guard_check),
+        "auto_plan_guard_fix": bool(resolved_auto_plan_guard_fix),
+        "auto_style_polish": bool(resolved_auto_style_polish),
         "source": source,
     }
     logger.info(
@@ -2176,6 +2260,7 @@ def retry_chapter_memory(
 @router.delete("/chapters/{chapter_id}")
 async def delete_chapter(
     chapter_id: str,
+    body: dict[str, Any] = Body(default_factory=dict),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
@@ -2184,12 +2269,13 @@ async def delete_chapter(
     is_approved = c.status == "approved"
     novel_id = c.novel_id
     chapter_no = c.chapter_no
+    update_memory = bool(body.get("update_memory", True))
     refresh_status = "none"
     refresh_task_id: str | None = None
     refresh_batch_id: str | None = None
 
     db.delete(c)
-    if is_approved:
+    if is_approved and update_memory:
         refresh_status, refresh_task_id, refresh_batch_id = _enqueue_auto_refresh_memory_from_approved(
             db, novel_id, reason="后台自动合并：删除已审定章节后同步记忆"
         )
@@ -2199,6 +2285,7 @@ async def delete_chapter(
         "deleted_chapter_id": chapter_id,
         "deleted_chapter_no": chapter_no,
         "was_approved": is_approved,
+        "update_memory": update_memory,
         "memory_refresh_status": refresh_status,
         "memory_refresh_task_id": refresh_task_id,
         "memory_refresh_batch_id": refresh_batch_id,
@@ -2294,6 +2381,213 @@ def get_memory_normalized(
         "schema_guide": build_memory_schema_guide(),
         "health": build_memory_health_summary(db, novel_id),
     }
+
+
+@router.post("/{novel_id}/memory/characters")
+def create_memory_character(
+    novel_id: str,
+    body: MemoryCharacterCreateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    current_max_order = (
+        db.query(func.max(NovelMemoryNormCharacter.sort_order))
+        .filter(NovelMemoryNormCharacter.novel_id == novel_id)
+        .scalar()
+    )
+    row = NovelMemoryNormCharacter(
+        novel_id=novel_id,
+        memory_version=outline.memory_version or 0,
+        sort_order=int(current_max_order or -1) + 1,
+        name=_clean_required_text(body.name, "人物名称"),
+        role=str(body.role or "").strip(),
+        status=str(body.status or "").strip(),
+        traits_json=json.dumps(body.traits or [], ensure_ascii=False),
+        detail_json=json.dumps(body.detail or {}, ensure_ascii=False),
+        influence_score=int(body.influence_score),
+        is_active=bool(body.is_active),
+    )
+    db.add(row)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：新增人物")
+    db.commit()
+    return {"status": "ok", "item": {"id": row.id}}
+
+
+@router.patch("/{novel_id}/memory/characters/{character_id}")
+def patch_memory_character(
+    novel_id: str,
+    character_id: str,
+    body: MemoryCharacterUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "请至少提供一个更新字段")
+    row = (
+        db.query(NovelMemoryNormCharacter)
+        .filter(
+            NovelMemoryNormCharacter.novel_id == novel_id,
+            NovelMemoryNormCharacter.id == character_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "人物不存在")
+    if "name" in patch and patch["name"] is not None:
+        row.name = _clean_required_text(str(patch["name"]), "人物名称")
+    if "role" in patch and patch["role"] is not None:
+        row.role = str(patch["role"]).strip()
+    if "status" in patch and patch["status"] is not None:
+        row.status = str(patch["status"]).strip()
+    if "traits" in patch and patch["traits"] is not None:
+        row.traits_json = json.dumps(patch["traits"] or [], ensure_ascii=False)
+    if "detail" in patch and patch["detail"] is not None:
+        row.detail_json = json.dumps(patch["detail"] or {}, ensure_ascii=False)
+    if "influence_score" in patch and patch["influence_score"] is not None:
+        row.influence_score = int(patch["influence_score"])
+    if "is_active" in patch and patch["is_active"] is not None:
+        row.is_active = bool(patch["is_active"])
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：更新人物")
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{novel_id}/memory/characters/{character_id}")
+def delete_memory_character(
+    novel_id: str,
+    character_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    row = (
+        db.query(NovelMemoryNormCharacter)
+        .filter(
+            NovelMemoryNormCharacter.novel_id == novel_id,
+            NovelMemoryNormCharacter.id == character_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "人物不存在")
+    row.is_active = False
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：人物下线")
+    db.commit()
+    return {"status": "ok", "deleted_id": character_id}
+
+
+@router.post("/{novel_id}/memory/relations")
+def create_memory_relation(
+    novel_id: str,
+    body: MemoryRelationCreateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    current_max_order = (
+        db.query(func.max(NovelMemoryNormRelation.sort_order))
+        .filter(NovelMemoryNormRelation.novel_id == novel_id)
+        .scalar()
+    )
+    row = NovelMemoryNormRelation(
+        novel_id=novel_id,
+        memory_version=outline.memory_version or 0,
+        sort_order=int(current_max_order or -1) + 1,
+        src=_clean_required_text(body.from_name, "关系起点"),
+        dst=_clean_required_text(body.to_name, "关系终点"),
+        relation=_clean_required_text(body.relation, "关系描述"),
+        is_active=bool(body.is_active),
+    )
+    db.add(row)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：新增关系")
+    db.commit()
+    return {"status": "ok", "item": {"id": row.id}}
+
+
+@router.patch("/{novel_id}/memory/relations/{relation_id}")
+def patch_memory_relation(
+    novel_id: str,
+    relation_id: str,
+    body: MemoryRelationUpdateBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    patch = body.model_dump(exclude_unset=True)
+    if not patch:
+        raise HTTPException(400, "请至少提供一个更新字段")
+    row = (
+        db.query(NovelMemoryNormRelation)
+        .filter(
+            NovelMemoryNormRelation.novel_id == novel_id,
+            NovelMemoryNormRelation.id == relation_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "关系不存在")
+    if "from_name" in patch and patch["from_name"] is not None:
+        row.src = _clean_required_text(str(patch["from_name"]), "关系起点")
+    if "to_name" in patch and patch["to_name"] is not None:
+        row.dst = _clean_required_text(str(patch["to_name"]), "关系终点")
+    if "relation" in patch and patch["relation"] is not None:
+        row.relation = _clean_required_text(str(patch["relation"]), "关系描述")
+    if "is_active" in patch and patch["is_active"] is not None:
+        row.is_active = bool(patch["is_active"])
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：更新关系")
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.delete("/{novel_id}/memory/relations/{relation_id}")
+def delete_memory_relation(
+    novel_id: str,
+    relation_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    row = (
+        db.query(NovelMemoryNormRelation)
+        .filter(
+            NovelMemoryNormRelation.novel_id == novel_id,
+            NovelMemoryNormRelation.id == relation_id,
+        )
+        .first()
+    )
+    if not row:
+        raise HTTPException(404, "关系不存在")
+    row.is_active = False
+    outline = _ensure_normalized_outline_row(db, novel_id)
+    next_ver = _next_memory_version(db, novel_id)
+    outline.memory_version = next_ver
+    row.memory_version = next_ver
+    sync_json_snapshot_from_normalized(db, novel_id, summary="人工编辑：关系失效")
+    db.commit()
+    return {"status": "ok", "deleted_id": relation_id}
 
 
 @router.post("/{novel_id}/memory/skills")

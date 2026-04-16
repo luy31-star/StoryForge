@@ -84,9 +84,45 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN auto_consistency_check BOOLEAN DEFAULT 0")
                     )
                     logger.info("db migrate: added novels.auto_consistency_check (sqlite)")
+                if _has_column_sqlite(conn, "novels", "auto_plan_guard_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN auto_plan_guard_check BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_check (sqlite)")
+                if _has_column_sqlite(conn, "novels", "auto_plan_guard_fix"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN auto_plan_guard_fix BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_fix (sqlite)")
+                if _has_column_sqlite(conn, "novels", "auto_style_polish"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN auto_style_polish BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.auto_style_polish (sqlite)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, 0)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_check = COALESCE(auto_plan_guard_check, 0)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_fix = COALESCE(auto_plan_guard_fix, 0)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_style_polish = COALESCE(auto_style_polish, 0)"
                     )
                 )
                 return
@@ -137,9 +173,51 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.auto_consistency_check (postgres)")
+                if _has_column_postgres(conn, "novels", "auto_plan_guard_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_plan_guard_check BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_check (postgres)")
+                if _has_column_postgres(conn, "novels", "auto_plan_guard_fix"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_plan_guard_fix BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_fix (postgres)")
+                if _has_column_postgres(conn, "novels", "auto_style_polish"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_style_polish BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_style_polish (postgres)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_check = COALESCE(auto_plan_guard_check, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_fix = COALESCE(auto_plan_guard_fix, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_style_polish = COALESCE(auto_style_polish, FALSE)"
                     )
                 )
                 return
@@ -184,9 +262,51 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.auto_consistency_check (mysql)")
+                if _has_column_mysql(conn, "novels", "auto_plan_guard_check"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_plan_guard_check BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_check (mysql)")
+                if _has_column_mysql(conn, "novels", "auto_plan_guard_fix"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_plan_guard_fix BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_plan_guard_fix (mysql)")
+                if _has_column_mysql(conn, "novels", "auto_style_polish"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN auto_style_polish BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.auto_style_polish (mysql)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_check = COALESCE(auto_plan_guard_check, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_plan_guard_fix = COALESCE(auto_plan_guard_fix, FALSE)"
+                    )
+                )
+                conn.execute(
+                    text(
+                        "UPDATE novels SET auto_style_polish = COALESCE(auto_style_polish, FALSE)"
                     )
                 )
                 return
@@ -376,6 +496,7 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
         ("novel_memory_norm_pets", "is_active BOOLEAN DEFAULT 1"),
         ("novel_memory_norm_characters", "influence_score INTEGER DEFAULT 0"),
         ("novel_memory_norm_characters", "is_active BOOLEAN DEFAULT 1"),
+        ("novel_memory_norm_relations", "is_active BOOLEAN DEFAULT 1"),
         ("novel_memory_norm_plots", "plot_type VARCHAR(32) DEFAULT 'Transient'"),
         ("novel_memory_norm_plots", "priority INTEGER DEFAULT 0"),
         ("novel_memory_norm_plots", "estimated_duration INTEGER DEFAULT 0"),
@@ -396,6 +517,7 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
         ("novel_memory_norm_pets", "is_active BOOLEAN DEFAULT TRUE"),
         ("novel_memory_norm_characters", "influence_score INTEGER DEFAULT 0"),
         ("novel_memory_norm_characters", "is_active BOOLEAN DEFAULT TRUE"),
+        ("novel_memory_norm_relations", "is_active BOOLEAN DEFAULT TRUE"),
         ("novel_memory_norm_plots", "plot_type VARCHAR(32) DEFAULT 'Transient'"),
         ("novel_memory_norm_plots", "priority INTEGER DEFAULT 0"),
         ("novel_memory_norm_plots", "estimated_duration INTEGER DEFAULT 0"),

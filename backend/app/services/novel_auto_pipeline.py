@@ -569,6 +569,9 @@ def run_full_auto_generation_sync(
     use_cold_recall: bool = False,
     cold_recall_items: int = 5,
     auto_consistency_check: bool | None = None,
+    auto_plan_guard_check: bool | None = None,
+    auto_plan_guard_fix: bool | None = None,
+    auto_style_polish: bool | None = None,
 ) -> dict[str, Any]:
     """
     全自动 Pipeline：补齐卷 -> 补齐章计划 -> 串行生成正文。
@@ -582,6 +585,24 @@ def run_full_auto_generation_sync(
         bool(getattr(n, "auto_consistency_check", False))
         if auto_consistency_check is None
         else bool(auto_consistency_check)
+    )
+    resolved_auto_plan_guard_fix = (
+        bool(getattr(n, "auto_plan_guard_fix", False))
+        if auto_plan_guard_fix is None
+        else bool(auto_plan_guard_fix)
+    )
+    resolved_auto_plan_guard_check = (
+        bool(getattr(n, "auto_plan_guard_check", False))
+        if auto_plan_guard_check is None
+        else bool(auto_plan_guard_check)
+    )
+    resolved_auto_plan_guard_check = bool(
+        resolved_auto_plan_guard_check or resolved_auto_plan_guard_fix
+    )
+    resolved_auto_style_polish = (
+        bool(getattr(n, "auto_style_polish", False))
+        if auto_style_polish is None
+        else bool(auto_style_polish)
     )
 
     next_no = next_chapter_no_from_approved(db, novel_id)
@@ -670,6 +691,9 @@ def run_full_auto_generation_sync(
                 use_cold_recall=use_cold_recall,
                 cold_recall_items=cold_recall_items,
                 auto_consistency_check=resolved_auto_consistency_check,
+                auto_plan_guard_check=resolved_auto_plan_guard_check,
+                auto_plan_guard_fix=resolved_auto_plan_guard_fix,
+                auto_style_polish=resolved_auto_style_polish,
                 batch_id=batch_id,
                 source="auto_pipeline",
             )

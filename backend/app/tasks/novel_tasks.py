@@ -1033,6 +1033,9 @@ def novel_generate_chapters_for_novel(
             use_cold_recall=bool(body.get("use_cold_recall")),
             cold_recall_items=max(1, min(int(body.get("cold_recall_items") or 5), 12)),
             auto_consistency_check=bool(body.get("auto_consistency_check")),
+            auto_plan_guard_check=bool(body.get("auto_plan_guard_check")),
+            auto_plan_guard_fix=bool(body.get("auto_plan_guard_fix")),
+            auto_style_polish=bool(body.get("auto_style_polish")),
             batch_id=batch_id,
             source=str(body.get("source") or "batch_auto"),
         )
@@ -1918,6 +1921,9 @@ def novel_auto_pipeline_task(
             use_cold_recall=False,
             cold_recall_items=5,
             auto_consistency_check=None,
+            auto_plan_guard_check=None,
+            auto_plan_guard_fix=None,
+            auto_style_polish=None,
         )
         result_status = str(result.get("status") or "")
         if result_status == "cancelled":

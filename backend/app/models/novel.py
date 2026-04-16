@@ -44,6 +44,12 @@ class Novel(Base):
     chapter_target_words: Mapped[int] = mapped_column(Integer, default=3000)
     # 生成前是否追加一次一致性修订
     auto_consistency_check: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 生成后是否执行执行卡硬校验
+    auto_plan_guard_check: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 执行卡硬校验失败后是否自动纠偏
+    auto_plan_guard_fix: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 保存前是否执行风格润色
+    auto_style_polish: Mapped[bool] = mapped_column(Boolean, default=False)
     # 记录最后一次执行每日自动撰写的日期（YYYY-MM-DD），防止重复执行
     last_auto_date: Mapped[str] = mapped_column(String(10), default="")
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")

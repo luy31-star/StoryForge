@@ -254,6 +254,7 @@ def _relation_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         src = str(item.get("from") or "").strip()
         dst = str(item.get("to") or "").strip()
         rel = str(item.get("relation") or "").strip()
+        active = item.get("is_active")
         if not (src and dst):
             continue
         out.append(
@@ -262,6 +263,7 @@ def _relation_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                 "src": src,
                 "dst": dst,
                 "relation": rel,
+                "is_active": True if active is None else bool(active),
             }
         )
     return out
@@ -433,6 +435,7 @@ def replace_normalized_from_payload(
                 src=row["src"],
                 dst=row["dst"],
                 relation=row["relation"],
+                is_active=bool(row.get("is_active", True)),
             )
         )
     for row in _plot_rows(data):
@@ -571,6 +574,7 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         ],
         "pets": [
             (lambda detail, aliases: {
+                "id": p.id,
                 "name": p.name,
                 "detail": detail,
                 "aliases": aliases,
@@ -581,6 +585,7 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
         ],
         "characters": [
             (lambda detail, aliases: {
+                "id": c.id,
                 "name": c.name,
                 "role": c.role,
                 "status": c.status,
@@ -593,7 +598,14 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
             for c in chars
         ],
         "relations": [
-            {"from": r.src, "to": r.dst, "relation": r.relation} for r in rels
+            {
+                "id": r.id,
+                "from": r.src,
+                "to": r.dst,
+                "relation": r.relation,
+                "is_active": getattr(r, "is_active", True),
+            }
+            for r in rels
         ],
         "open_plots": [
             {
@@ -694,6 +706,8 @@ def sync_json_snapshot_from_normalized(
         aliases = dedupe_clean_strs(s.get("aliases"))
         if aliases:
             d["aliases"] = aliases
+        if s.get("id"):
+            d["id"] = s["id"]
         if "influence_score" in s:
             d["influence_score"] = s["influence_score"]
         if "is_active" in s:
@@ -711,6 +725,8 @@ def sync_json_snapshot_from_normalized(
         aliases = dedupe_clean_strs(c.get("aliases"))
         if aliases:
             entry["aliases"] = aliases
+        if c.get("id"):
+            entry["id"] = c["id"]
         if "influence_score" in c:
             entry["influence_score"] = c["influence_score"]
         if "is_active" in c:

@@ -17,6 +17,7 @@ from app.core.database import SessionLocal
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 from app.models.novel import Chapter, Novel, NovelMemory
+from app.models.volume import NovelChapterPlan
 from app.models.writing_style import WritingStyle
 from app.models.novel_memory_norm import (
     NovelMemoryNormChapter,
@@ -34,6 +35,7 @@ from app.services.chapter_plan_schema import (
     chapter_plan_guard_payload,
     chapter_plan_has_guardrails,
     chapter_plan_hook,
+    chapter_plan_execution_card,
     chapter_plan_plot_summary,
     normalize_beats_to_v2,
 )
@@ -99,6 +101,30 @@ def _safe_json_dict(raw: str) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return data if isinstance(data, dict) else {}
+
+
+_CHARACTER_INACTIVE_STATUS_KEYWORDS = (
+    "死亡",
+    "身亡",
+    "牺牲",
+    "退场",
+    "下线",
+    "离队",
+    "离开主线",
+    "失踪",
+    "封印",
+)
+
+
+def _status_implies_inactive(status: Any) -> bool:
+    raw = str(status or "").strip()
+    if not raw:
+        return False
+    return any(token in raw for token in _CHARACTER_INACTIVE_STATUS_KEYWORDS)
+
+
+def _relation_identity(src: str, dst: str) -> str:
+    return _short_id(f"{src}->{dst}")
 
 
 def _canonical_entries_from_payload(data: dict[str, Any]) -> list[dict[str, Any]]:
@@ -2304,7 +2330,12 @@ class NovelLLMService:
             "open_plots_added": [],
             "open_plots_resolved": [],
             "canonical_entries": [],
+            "characters_added": [],
             "characters_updated": [],
+            "characters_inactivated": [],
+            "relations_added": [],
+            "relations_updated": [],
+            "relations_inactivated": [],
             "relations_changed": [],
             "inventory_changed": {"added": [], "removed": []},
             "skills_changed": {"added": [], "updated": [], "removed": []},
@@ -2336,16 +2367,46 @@ class NovelLLMService:
                         unique_entries_map[cno] = norm_item
             normalized["canonical_entries"] = [unique_entries_map[k] for k in sorted(unique_entries_map.keys())]
 
-        # 2. 角色更新去重（按 name）
-        raw_chars = normalized.get("characters_updated")
-        if isinstance(raw_chars, list):
-            unique_chars_map: dict[str, dict[str, Any]] = {}
-            for item in raw_chars:
-                if isinstance(item, dict):
-                    name = str(item.get("name") or "").strip()
-                    if name:
-                        unique_chars_map[name] = item
-            normalized["characters_updated"] = list(unique_chars_map.values())
+        def _dedupe_named_entities(raw: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw, list):
+                return []
+            unique_map: dict[str, dict[str, Any]] = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                name = str(item.get("name") or "").strip()
+                if name:
+                    unique_map[name] = item
+            return list(unique_map.values())
+
+        def _dedupe_relations(raw: Any) -> list[dict[str, Any]]:
+            if not isinstance(raw, list):
+                return []
+            unique_map: dict[tuple[str, str], dict[str, Any]] = {}
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                src = str(item.get("from") or "").strip()
+                dst = str(item.get("to") or "").strip()
+                if src and dst:
+                    unique_map[(src, dst)] = item
+            return list(unique_map.values())
+
+        normalized["characters_added"] = _dedupe_named_entities(normalized.get("characters_added"))
+        normalized["characters_updated"] = _dedupe_named_entities(normalized.get("characters_updated"))
+        normalized["characters_inactivated"] = _dedupe_named_entities(
+            normalized.get("characters_inactivated")
+        )
+        normalized["relations_added"] = _dedupe_relations(normalized.get("relations_added"))
+        normalized["relations_updated"] = _dedupe_relations(
+            [
+                *_dedupe_relations(normalized.get("relations_updated")),
+                *_dedupe_relations(normalized.get("relations_changed")),
+            ]
+        )
+        normalized["relations_inactivated"] = _dedupe_relations(
+            normalized.get("relations_inactivated")
+        )
 
         # 3. 其他常规字段清理
         inventory_changed = normalized.get("inventory_changed")
@@ -2590,8 +2651,65 @@ class NovelLLMService:
             return {}
         return self._parse_refresh_memory_response(repaired_raw)
 
+    def _build_memory_delta_plan_targets(
+        self,
+        db: Session | None,
+        novel_id: str,
+        chapters_summary: str,
+    ) -> str:
+        if not db:
+            return ""
+        chapter_nos = [
+            int(blob["chapter_no"])
+            for blob in self._extract_chapter_blobs(chapters_summary)
+            if isinstance(blob, dict) and blob.get("chapter_no")
+        ]
+        if not chapter_nos:
+            return ""
+        rows = (
+            db.query(NovelChapterPlan)
+            .filter(
+                NovelChapterPlan.novel_id == novel_id,
+                NovelChapterPlan.chapter_no.in_(chapter_nos),
+            )
+            .order_by(NovelChapterPlan.chapter_no.asc())
+            .all()
+        )
+        if not rows:
+            return ""
+
+        sections: list[str] = ["【本批章节对应章计划的结束状态目标】"]
+        for row in rows:
+            try:
+                beats = json.loads(row.beats_json or "{}")
+            except json.JSONDecodeError:
+                beats = {}
+            card = chapter_plan_execution_card(beats)
+            targets = card.get("end_state_targets") if isinstance(card, dict) else {}
+            if not isinstance(targets, dict):
+                continue
+            chunks: list[str] = []
+            for key, label in (
+                ("characters", "角色状态"),
+                ("relations", "关系状态"),
+                ("items", "物品状态"),
+                ("plots", "线索状态"),
+            ):
+                values = targets.get(key)
+                if not isinstance(values, list):
+                    continue
+                bullets = [str(x).strip() for x in values if str(x).strip()]
+                if bullets:
+                    chunks.append(f"{label}：\n" + "\n".join(f"  · {x}" for x in bullets[:8]))
+            if chunks:
+                sections.append(
+                    f"第{row.chapter_no}章《{row.chapter_title or f'第{row.chapter_no}章'}》\n"
+                    + "\n".join(chunks)
+                )
+        return "\n\n".join(sections) if len(sections) > 1 else ""
+
     def _memory_delta_messages(
-        self, novel: Novel, chapters_summary: str, prev_memory: str
+        self, novel: Novel, chapters_summary: str, prev_memory: str, db: Session | None = None
     ) -> list[dict[str, str]]:
         fj = truncate_framework_json(novel.framework_json or "", 6000)
         compact_prev = build_hot_memory_for_prompt(
@@ -2601,6 +2719,7 @@ class NovelLLMService:
             characters_hot_max=settings.novel_characters_hot_max,
         )
         prev_open_plots = format_open_plots_block(prev_memory)
+        plan_targets_block = self._build_memory_delta_plan_targets(db, novel.id, chapters_summary)
         sys = (
             "你是小说记忆增量抽取器。"
             "你不能重写整份记忆，只能根据新章节内容输出“本批新增/变更了什么”。"
@@ -2609,7 +2728,8 @@ class NovelLLMService:
             "若本批输入里包含 1 章或多章内容，则 canonical_entries 必须为本批每一章各输出一条条目，不允许漏章。"
             "输出字段固定为："
             "facts_added[], facts_updated[], open_plots_added[], open_plots_resolved[],"
-            "canonical_entries[], characters_updated[], relations_changed[],"
+            "canonical_entries[], characters_added[], characters_updated[], characters_inactivated[],"
+            "relations_added[], relations_updated[], relations_inactivated[],"
             "inventory_changed{added[],removed[]}, skills_changed{added[],updated[],removed[]},"
             "pets_changed{added[],updated[],removed[]}, conflicts_detected[],"
             "forbidden_constraints_added[], ids_to_remove[], entity_influence_updates[]。"
@@ -2627,7 +2747,11 @@ class NovelLLMService:
             "open_plots_added 可为字符串或对象：对象时 plot_type 取 Core|Arc|Transient，"
             "priority 越大越重要，estimated_duration 为预计持续章节数（估算即可），"
             "current_stage 为当前推进到哪一步，resolve_when 为真正收束所需条件。"
-            "characters_updated / entity_influence_updates 可含 influence_score(0-100)、is_active。"
+            "新人物首次进入重要叙事时，必须写入 characters_added；已有人物状态变化写入 characters_updated；"
+            "人物死亡、长期退场、离队、封印等明确下线写入 characters_inactivated。"
+            "人物条目必须使用唯一主名，避免用代称、称谓或模糊指代。"
+            "characters_added / characters_updated / characters_inactivated / entity_influence_updates 可含 influence_score(0-100)、is_active。"
+            "relations_added 用于新建立的重要关系；relations_updated 用于已有关系变化；relations_inactivated 用于关系失效、断裂或不再成立。"
             "entity_influence_updates 每项：{entity_type, name, influence_score?, is_active?}，"
             "entity_type 为 character|skill|item|pet|plot 之一。"
             "forbidden_constraints_added：新增全局禁止事项（硬设定防火墙），须谨慎，只写正文绝不能违反的规则。"
@@ -2643,12 +2767,19 @@ class NovelLLMService:
             f"【框架 JSON（硬约束）】\n{fj}\n\n"
             f"【旧记忆热层快照（含 ID）】\n{compact_prev}\n\n"
             f"{prev_open_plots}\n\n"
+            f"{plan_targets_block}\n\n" if plan_targets_block else
+            f"【框架 JSON（硬约束）】\n{fj}\n\n"
+            f"【旧记忆热层快照（含 ID）】\n{compact_prev}\n\n"
+            f"{prev_open_plots}\n\n"
+        )
+        user += (
             f"【新章节文本/摘要】\n{chapters_summary}\n\n"
             "任务：提取本批章节相对旧记忆的增量事实。\n"
             "特别提醒：若实体状态/等级发生变更（升级、替换），必须找到旧版本的 ID 放入 ids_to_remove！"
             "如果某条线索在本批明确收束，请将该线索的 ID 放入 ids_to_remove；"
             "如果某条硬约束、技能或物品不再适用，也请放入 ids_to_remove。"
             "如果只是推进但未真正解决，不要移除。"
+            "如果章计划里明确给了本章结束状态目标，优先按该目标判断人物、关系和物品的新增/更新/下线。"
             "再次强调：只总结关键收束线，不要总结对主剧情没有实质影响的小收尾。"
         )
         return [
@@ -2923,10 +3054,10 @@ class NovelLLMService:
         # 0. 处理全局删除：ids_to_remove
         ids_to_remove = set(delta.get("ids_to_remove") or [])
         if ids_to_remove:
-            # 尝试在各分表中根据内容哈希删除匹配项
+            # 尝试在各分表中根据内容哈希删除或失效匹配项。
+            # 人物与关系遵循软下线；物品保持硬删除。
             for table, attr in [
                 (NovelMemoryNormPlot, "body"),
-                (NovelMemoryNormCharacter, "name"),
                 (NovelMemoryNormSkill, "name"),
                 (NovelMemoryNormItem, "label"),
                 (NovelMemoryNormPet, "name"),
@@ -2939,6 +3070,29 @@ class NovelLLMService:
                         to_del_ids.append(row.id)
                 if to_del_ids:
                     db.query(table).filter(table.id.in_(to_del_ids)).delete(synchronize_session='fetch')
+
+            for row in (
+                db.query(NovelMemoryNormCharacter)
+                .filter(NovelMemoryNormCharacter.novel_id == novel_id)
+                .all()
+            ):
+                name = str(getattr(row, "name", "") or "").strip()
+                if name and _short_id(name) in ids_to_remove:
+                    row.is_active = False
+                    row.memory_version = memory_version
+
+            for row in (
+                db.query(NovelMemoryNormRelation)
+                .filter(NovelMemoryNormRelation.novel_id == novel_id)
+                .all()
+            ):
+                relation_id = _relation_identity(
+                    str(getattr(row, "src", "") or "").strip(),
+                    str(getattr(row, "dst", "") or "").strip(),
+                )
+                if relation_id in ids_to_remove:
+                    row.is_active = False
+                    row.memory_version = memory_version
         active_plot_lookup = {
             str(row.body or "").strip(): row
             for row in db.query(NovelMemoryNormPlot)
@@ -3163,62 +3317,102 @@ class NovelLLMService:
             ).delete(synchronize_session='fetch')
             stats["open_plots_resolved"] += len(top_resolved)
 
-        # 3. 更新角色
-        incoming_chars = delta.get("characters_updated")
-        if isinstance(incoming_chars, list):
-            for item in incoming_chars:
+        # 3. 更新角色（新增 / 更新 / 软下线）
+        def _ensure_character_row(name: str) -> NovelMemoryNormCharacter:
+            char = (
+                db.query(NovelMemoryNormCharacter)
+                .filter(
+                    NovelMemoryNormCharacter.novel_id == novel_id,
+                    NovelMemoryNormCharacter.name == name,
+                )
+                .first()
+            )
+            if char:
+                return char
+            max_order = (
+                db.query(func.max(NovelMemoryNormCharacter.sort_order))
+                .filter(NovelMemoryNormCharacter.novel_id == novel_id)
+                .scalar()
+                or 0
+            )
+            char = NovelMemoryNormCharacter(
+                novel_id=novel_id,
+                name=name,
+                sort_order=max_order + 1,
+                memory_version=memory_version,
+            )
+            db.add(char)
+            return char
+
+        def _apply_character_item(
+            item: dict[str, Any],
+            *,
+            force_inactive: bool = False,
+        ) -> NovelMemoryNormCharacter | None:
+            name = str(item.get("name") or "").strip()
+            if not name:
+                return None
+            char = _ensure_character_row(name)
+            if item.get("role"):
+                char.role = str(item["role"]).strip()
+            status = str(item.get("status") or "").strip()
+            if status:
+                char.status = status
+
+            traits = item.get("traits")
+            if traits:
+                old_traits = json.loads(char.traits_json or "[]")
+                if isinstance(traits, list):
+                    new_traits = _dedupe_str_list([*old_traits, *traits])
+                else:
+                    new_traits = _dedupe_str_list([*old_traits, str(traits)])
+                char.traits_json = json.dumps(new_traits, ensure_ascii=False)
+
+            detail = json.loads(char.detail_json or "{}")
+            for k, v in item.items():
+                if k not in ("name", "role", "status", "traits", "is_active"):
+                    detail[k] = v
+            if latest_delta_chapter_no > 0:
+                detail["last_seen_chapter"] = latest_delta_chapter_no
+                detail["last_touched_chapter"] = latest_delta_chapter_no
+            if force_inactive:
+                if latest_delta_chapter_no > 0:
+                    detail["deactivated_at_chapter"] = latest_delta_chapter_no
+                if status:
+                    detail["inactive_reason"] = status
+            char.detail_json = json.dumps(detail, ensure_ascii=False)
+
+            if item.get("influence_score") is not None:
+                try:
+                    char.influence_score = int(item["influence_score"])
+                except (TypeError, ValueError):
+                    pass
+            explicit_active = item.get("is_active")
+            if explicit_active is not None:
+                char.is_active = bool(explicit_active)
+            elif force_inactive or _status_implies_inactive(status):
+                char.is_active = False
+            elif not status or char.is_active is None:
+                char.is_active = True
+            char.memory_version = memory_version
+            return char
+
+        for bucket_key in ("characters_added", "characters_updated"):
+            incoming_chars = delta.get(bucket_key)
+            if isinstance(incoming_chars, list):
+                for item in incoming_chars:
+                    if not isinstance(item, dict):
+                        continue
+                    if _apply_character_item(item) is not None:
+                        stats["characters_updated"] += 1
+
+        incoming_chars_inactivated = delta.get("characters_inactivated")
+        if isinstance(incoming_chars_inactivated, list):
+            for item in incoming_chars_inactivated:
                 if not isinstance(item, dict):
                     continue
-                name = str(item.get("name") or "").strip()
-                if not name:
-                    continue
-                
-                char = db.query(NovelMemoryNormCharacter).filter(
-                    NovelMemoryNormCharacter.novel_id == novel_id,
-                    NovelMemoryNormCharacter.name == name
-                ).first()
-                
-                if not char:
-                    max_order = db.query(func.max(NovelMemoryNormCharacter.sort_order)).filter(
-                        NovelMemoryNormCharacter.novel_id == novel_id
-                    ).scalar() or 0
-                    char = NovelMemoryNormCharacter(
-                        novel_id=novel_id,
-                        name=name,
-                        sort_order=max_order + 1,
-                        memory_version=memory_version
-                    )
-                    db.add(char)
-                
-                if item.get("role"):
-                    char.role = str(item["role"]).strip()
-                if item.get("status"):
-                    char.status = str(item["status"]).strip()
-                
-                traits = item.get("traits")
-                if traits:
-                    old_traits = json.loads(char.traits_json or "[]")
-                    if isinstance(traits, list):
-                        new_traits = _dedupe_str_list([*old_traits, *traits])
-                    else:
-                        new_traits = _dedupe_str_list([*old_traits, str(traits)])
-                    char.traits_json = json.dumps(new_traits, ensure_ascii=False)
-                
-                # 处理其他字段存入 detail_json
-                detail = json.loads(char.detail_json or "{}")
-                for k, v in item.items():
-                    if k not in ("name", "role", "status", "traits"):
-                        detail[k] = v
-                char.detail_json = json.dumps(detail, ensure_ascii=False)
-                if item.get("influence_score") is not None:
-                    try:
-                        char.influence_score = int(item["influence_score"])
-                    except (TypeError, ValueError):
-                        pass
-                if item.get("is_active") is not None:
-                    char.is_active = bool(item["is_active"])
-                char.memory_version = memory_version
-                stats["characters_updated"] += 1
+                if _apply_character_item(item, force_inactive=True) is not None:
+                    stats["characters_updated"] += 1
 
         # 3b. 实体影响力批量更新
         inf_updates = delta.get("entity_influence_updates")
@@ -3330,39 +3524,70 @@ class NovelLLMService:
                             pass
                         row.memory_version = memory_version
 
-        # 4. 关系
-        incoming_relations = delta.get("relations_changed")
-        if isinstance(incoming_relations, list):
-            for item in incoming_relations:
-                if not isinstance(item, dict):
-                    continue
-                src = str(item.get("from") or "").strip()
-                dst = str(item.get("to") or "").strip()
-                relation = str(item.get("relation") or "").strip()
-                if not (src and dst and relation):
-                    continue
-                
-                rel = db.query(NovelMemoryNormRelation).filter(
+        # 4. 关系（新增 / 更新 / 软失效）
+        def _ensure_relation_row(src: str, dst: str) -> NovelMemoryNormRelation:
+            rel = (
+                db.query(NovelMemoryNormRelation)
+                .filter(
                     NovelMemoryNormRelation.novel_id == novel_id,
                     NovelMemoryNormRelation.src == src,
-                    NovelMemoryNormRelation.dst == dst
-                ).first()
-                
-                if not rel:
-                    max_order = db.query(func.max(NovelMemoryNormRelation.sort_order)).filter(
-                        NovelMemoryNormRelation.novel_id == novel_id
-                    ).scalar() or 0
-                    rel = NovelMemoryNormRelation(
-                        novel_id=novel_id,
-                        src=src,
-                        dst=dst,
-                        sort_order=max_order + 1,
-                        memory_version=memory_version
-                    )
-                    db.add(rel)
-                
+                    NovelMemoryNormRelation.dst == dst,
+                )
+                .first()
+            )
+            if rel:
+                return rel
+            max_order = (
+                db.query(func.max(NovelMemoryNormRelation.sort_order))
+                .filter(NovelMemoryNormRelation.novel_id == novel_id)
+                .scalar()
+                or 0
+            )
+            rel = NovelMemoryNormRelation(
+                novel_id=novel_id,
+                src=src,
+                dst=dst,
+                sort_order=max_order + 1,
+                memory_version=memory_version,
+            )
+            db.add(rel)
+            return rel
+
+        def _apply_relation_item(
+            item: dict[str, Any],
+            *,
+            force_inactive: bool = False,
+        ) -> NovelMemoryNormRelation | None:
+            src = str(item.get("from") or "").strip()
+            dst = str(item.get("to") or "").strip()
+            relation = str(item.get("relation") or "").strip()
+            if not (src and dst):
+                return None
+            rel = _ensure_relation_row(src, dst)
+            if relation:
                 rel.relation = relation
-                rel.memory_version = memory_version
+            explicit_active = item.get("is_active")
+            if explicit_active is not None:
+                rel.is_active = bool(explicit_active)
+            else:
+                rel.is_active = not force_inactive
+            rel.memory_version = memory_version
+            return rel
+
+        for bucket_key in ("relations_added", "relations_updated", "relations_changed"):
+            incoming_relations = delta.get(bucket_key)
+            if isinstance(incoming_relations, list):
+                for item in incoming_relations:
+                    if not isinstance(item, dict):
+                        continue
+                    _apply_relation_item(item, force_inactive=False)
+
+        incoming_relations_inactivated = delta.get("relations_inactivated")
+        if isinstance(incoming_relations_inactivated, list):
+            for item in incoming_relations_inactivated:
+                if not isinstance(item, dict):
+                    continue
+                _apply_relation_item(item, force_inactive=True)
 
         # 5. 物品（added/removed 可能为字符串或 dict，禁止把 dict 直接绑到 label 列）
         inv_changed = delta.get("inventory_changed")
@@ -3745,26 +3970,73 @@ class NovelLLMService:
                         if "id" not in item: item["id"] = _short_id(name)
                         characters_by_name[name] = dict(item)
         
-        # 移除 ID 在 ids_to_remove 中的项
-        char_names_to_del = [n for n, c in characters_by_name.items() if c.get("id") in ids_to_remove]
-        for n in char_names_to_del: characters_by_name.pop(n)
+        # 人物遵循软下线，不在合并时直接删除
+        for character in characters_by_name.values():
+            if character.get("id") in ids_to_remove:
+                character["is_active"] = False
 
-        incoming_chars = delta.get("characters_updated")
-        if isinstance(incoming_chars, list):
-            for item in incoming_chars:
-                if not isinstance(item, dict): continue
+        for bucket_key in ("characters_added", "characters_updated"):
+            incoming_chars = delta.get(bucket_key)
+            if isinstance(incoming_chars, list):
+                for item in incoming_chars:
+                    if not isinstance(item, dict):
+                        continue
+                    name = str(item.get("name") or "").strip()
+                    if not name:
+                        continue
+                    base = characters_by_name.get(
+                        name, {"name": name, "id": _short_id(name), "is_active": True}
+                    )
+                    for key in ("role", "status"):
+                        val = str(item.get(key) or "").strip()
+                        if val:
+                            base[key] = val
+                    traits = item.get("traits")
+                    if isinstance(traits, list):
+                        base["traits"] = _dedupe_str_list(traits)
+                    elif "traits" not in base:
+                        base["traits"] = []
+                    if item.get("influence_score") is not None:
+                        try:
+                            base["influence_score"] = clamp_int(
+                                item["influence_score"], minimum=0, maximum=100, default=0
+                            )
+                        except Exception:
+                            pass
+                    if item.get("is_active") is not None:
+                        base["is_active"] = bool(item["is_active"])
+                    elif _status_implies_inactive(item.get("status")):
+                        base["is_active"] = False
+                    characters_by_name[name] = base
+                    stats["characters_updated"] += 1
+        incoming_chars_inactivated = delta.get("characters_inactivated")
+        if isinstance(incoming_chars_inactivated, list):
+            for item in incoming_chars_inactivated:
+                if not isinstance(item, dict):
+                    continue
                 name = str(item.get("name") or "").strip()
-                if not name: continue
-                base = characters_by_name.get(name, {"name": name, "id": _short_id(name)})
+                if not name:
+                    continue
+                base = characters_by_name.get(
+                    name, {"name": name, "id": _short_id(name), "is_active": False}
+                )
                 for key in ("role", "status"):
                     val = str(item.get(key) or "").strip()
-                    if val: base[key] = val
+                    if val:
+                        base[key] = val
                 traits = item.get("traits")
-                if isinstance(traits, list): base["traits"] = _dedupe_str_list(traits)
+                if isinstance(traits, list):
+                    base["traits"] = _dedupe_str_list(traits)
+                elif "traits" not in base:
+                    base["traits"] = []
                 if item.get("influence_score") is not None:
-                    try: base["influence_score"] = clamp_int(item["influence_score"], minimum=0, maximum=100, default=0)
-                    except: pass
-                if item.get("is_active") is not None: base["is_active"] = bool(item["is_active"])
+                    try:
+                        base["influence_score"] = clamp_int(
+                            item["influence_score"], minimum=0, maximum=100, default=0
+                        )
+                    except Exception:
+                        pass
+                base["is_active"] = False
                 characters_by_name[name] = base
                 stats["characters_updated"] += 1
         data["characters"] = list(characters_by_name.values())
@@ -3806,24 +4078,57 @@ class NovelLLMService:
                 src = str(item.get("from") or "").strip()
                 dst = str(item.get("to") or "").strip()
                 if src and dst:
-                    iid = item.get("id") or _short_id(f"{src}-{dst}")
+                    iid = item.get("id") or _relation_identity(src, dst)
                     relation_map[iid] = {
                         "id": iid, "from": src, "to": dst, 
-                        "relation": str(item.get("relation") or "").strip()
+                        "relation": str(item.get("relation") or "").strip(),
+                        "is_active": True if item.get("is_active") is None else bool(item.get("is_active")),
                     }
-        # 移除
-        for iid in ids_to_remove: relation_map.pop(iid, None)
+        # 关系遵循软失效，不在合并时直接删除
+        for relation in relation_map.values():
+            if relation.get("id") in ids_to_remove:
+                relation["is_active"] = False
         # 更新/新增
-        incoming_relations = delta.get("relations_changed")
-        if isinstance(incoming_relations, list):
-            for item in incoming_relations:
-                if not isinstance(item, dict): continue
+        for bucket_key in ("relations_added", "relations_updated", "relations_changed"):
+            incoming_relations = delta.get(bucket_key)
+            if isinstance(incoming_relations, list):
+                for item in incoming_relations:
+                    if not isinstance(item, dict):
+                        continue
+                    src = str(item.get("from") or "").strip()
+                    dst = str(item.get("to") or "").strip()
+                    relation = str(item.get("relation") or "").strip()
+                    if src and dst:
+                        iid = item.get("id") or _relation_identity(src, dst)
+                        base = relation_map.get(
+                            iid,
+                            {"id": iid, "from": src, "to": dst, "relation": relation, "is_active": True},
+                        )
+                        if relation:
+                            base["relation"] = relation
+                        if item.get("is_active") is not None:
+                            base["is_active"] = bool(item.get("is_active"))
+                        else:
+                            base["is_active"] = True
+                        relation_map[iid] = base
+        incoming_relations_inactivated = delta.get("relations_inactivated")
+        if isinstance(incoming_relations_inactivated, list):
+            for item in incoming_relations_inactivated:
+                if not isinstance(item, dict):
+                    continue
                 src = str(item.get("from") or "").strip()
                 dst = str(item.get("to") or "").strip()
                 relation = str(item.get("relation") or "").strip()
-                if src and dst and relation:
-                    iid = _short_id(f"{src}-{dst}")
-                    relation_map[iid] = {"id": iid, "from": src, "to": dst, "relation": relation}
+                if src and dst:
+                    iid = item.get("id") or _relation_identity(src, dst)
+                    base = relation_map.get(
+                        iid,
+                        {"id": iid, "from": src, "to": dst, "relation": relation, "is_active": False},
+                    )
+                    if relation:
+                        base["relation"] = relation
+                    base["is_active"] = False
+                    relation_map[iid] = base
         data["relations"] = list(relation_map.values())
 
         # 7. Generic Collections: Inventory, Skills, Pets (ID 化)
@@ -4227,7 +4532,7 @@ class NovelLLMService:
             router=router,
             operation="memory_refresh",
             novel_id=novel.id,
-            messages=self._memory_delta_messages(novel, chapters_summary, prev_memory),
+            messages=self._memory_delta_messages(novel, chapters_summary, prev_memory, db=db if isinstance(db, Session) else None),
             temperature=0.2,
             web_search=self._novel_web_search(db, flow="memory_refresh"),
             timeout=settings.novel_memory_refresh_batch_timeout,
@@ -4392,7 +4697,7 @@ class NovelLLMService:
             router=router,
             operation="memory_refresh",
             novel_id=novel.id,
-            messages=self._memory_delta_messages(novel, chapters_summary, prev_memory),
+            messages=self._memory_delta_messages(novel, chapters_summary, prev_memory, db=db if isinstance(db, Session) else None),
             temperature=0.2,
             timeout=settings.novel_memory_refresh_batch_timeout,
             web_search=self._novel_web_search(db, flow="memory_refresh"),
