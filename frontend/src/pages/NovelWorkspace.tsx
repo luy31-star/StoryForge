@@ -37,6 +37,7 @@ import {
   deleteMemorySkill,
   discardChapterRevision,
   exportChapters,
+  formatChapter,
   generateChapters,
   autoGenerateChapters,
   generateVolumeChapterPlan,
@@ -2141,6 +2142,26 @@ export function NovelWorkspace() {
     );
   }
 
+  async function runFormatSelectedChapter() {
+    if (!selectedChapter || !editContent.trim()) return;
+    setErr(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const result = await formatChapter(selectedChapter.id, {
+        content: editContent,
+      });
+      setEditContent(result.formatted_content);
+      setNotice(
+        `正文已按小说段落规则格式化：${result.before_paragraphs} 段 -> ${result.after_paragraphs} 段`
+      );
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "格式化失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runGenerateVolumePlan(force = false) {
     if (!id || !selectedVolumeId) return;
     setErr(null);
@@ -4083,6 +4104,17 @@ export function NovelWorkspace() {
                           <Button
                             type="button"
                             size="sm"
+                            variant="secondary"
+                            className="font-bold text-foreground/80"
+                            disabled={busy || !editContent.trim()}
+                            onClick={() => void runFormatSelectedChapter()}
+                            title="纯规则格式化：自动拆段、对白单独成段、场景切换换段，不调用大模型"
+                          >
+                            一键格式化段落
+                          </Button>
+                          <Button
+                            type="button"
+                            size="sm"
                             className="font-bold"
                             disabled={busy || !editContent.trim()}
                             onClick={() => void runSaveSelectedChapter()}
@@ -5463,7 +5495,7 @@ export function NovelWorkspace() {
 
           {activeTab === "chapters" ? (
             selectedChapter ? (
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <Button
                   type="button"
                   variant="outline"
@@ -5472,6 +5504,15 @@ export function NovelWorkspace() {
                   onClick={() => void runSaveSelectedChapter()}
                 >
                   保存
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="font-semibold"
+                  disabled={busy || !editContent.trim()}
+                  onClick={() => void runFormatSelectedChapter()}
+                >
+                  格式化
                 </Button>
                 {selectedChapter.pending_content ? (
                   <Button

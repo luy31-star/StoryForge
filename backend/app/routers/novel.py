@@ -75,6 +75,7 @@ from app.services.novel_generation_common import (
     has_pending_memory_refresh_batch,
     memory_refresh_confirmation_token,
 )
+from app.services.novel_text_formatter import format_novel_text
 from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import (
     novel_chapter_approve_memory_delta,
@@ -260,6 +261,10 @@ class ChapterReviseBody(BaseModel):
 
 class ChapterUpdateBody(BaseModel):
     title: str | None = None
+    content: str = Field(..., min_length=1)
+
+
+class ChapterFormatBody(BaseModel):
     content: str = Field(..., min_length=1)
 
 
@@ -2212,6 +2217,21 @@ async def patch_chapter(
         "memory_refresh_status": refresh_status,
         "memory_refresh_task_id": refresh_task_id,
         "memory_refresh_batch_id": refresh_batch_id,
+    }
+
+
+@router.post("/chapters/{chapter_id}/format")
+def format_chapter_body(
+    chapter_id: str,
+    body: ChapterFormatBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_chapter_access(db, chapter_id, user)
+    result = format_novel_text(body.content)
+    return {
+        "status": "ok",
+        **result,
     }
 
 

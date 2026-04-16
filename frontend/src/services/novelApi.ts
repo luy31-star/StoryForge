@@ -911,6 +911,24 @@ export async function patchChapter(
   return r.json() as Promise<{ status: "ok" }>;
 }
 
+export async function formatChapter(
+  chapterId: string,
+  body: { content: string }
+) {
+  const r = await apiFetch(`${BASE}/chapters/${chapterId}/format`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    formatted_content: string;
+    before_paragraphs: number;
+    after_paragraphs: number;
+    body_chars: number;
+  }>;
+}
+
 export async function deleteChapter(
   chapterId: string,
   options?: { update_memory?: boolean }
