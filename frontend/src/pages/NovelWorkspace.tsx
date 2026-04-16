@@ -5758,14 +5758,14 @@ export function NovelWorkspace() {
               <Input
                 id="chapter_target_words"
                 type="number"
-                min={500}
+                min={300}
                 max={10000}
-                step={100}
+                step={1}
                 value={novelSettingsDraft.chapter_target_words}
                 onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, chapter_target_words: Number(e.target.value) })}
                 className="field-shell text-foreground font-bold"
               />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">AI 会尽量按这个目标控制正文篇幅，通常允许上下浮动 1000 字。</p>
+              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">提示词会强力要求正文紧贴目标字数，只允许轻微浮动。当前默认规则为上下约 5%，至少 30 字、最多 150 字。</p>
             </div>
             <div className="space-y-2">
               <Label htmlFor="auto_consistency_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">

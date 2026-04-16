@@ -145,6 +145,26 @@ def _canonical_entries_from_payload(data: dict[str, Any]) -> list[dict[str, Any]
     return entries
 
 
+def _chapter_target_words(novel: Novel) -> int:
+    return max(300, int(getattr(novel, "chapter_target_words", 3000) or 3000))
+
+
+def _chapter_word_tolerance(target_words: int) -> int:
+    return max(30, min(150, int(round(target_words * 0.05))))
+
+
+def _strong_chapter_word_rule(target_words: int) -> str:
+    tolerance = _chapter_word_tolerance(target_words)
+    lower = max(1, target_words - tolerance)
+    upper = target_words + tolerance
+    return (
+        f"正文（不含标题行）必须严格围绕目标字数 {target_words} 字来写。"
+        f"这是硬性要求，不是建议；正文必须控制在 {lower}～{upper} 字之间。"
+        f"该范围只允许轻微浮动（上下 {tolerance} 字），绝不能明显偏短，也绝不能明显超长。"
+        "字数按去除空白后的正文字符数计算。"
+    )
+
+
 def _writing_style_block(style: WritingStyle | None) -> str:
     if not style:
         return ""
@@ -385,18 +405,14 @@ def _chapter_messages(
         f"请写第 {chapter_no} 章"
         f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}。"
     )
-    target_words = getattr(novel, "chapter_target_words", 3000) or 3000
-    words_min = max(500, int(target_words) - 1000)
-    words_max = int(target_words) + 1000
+    target_words = _chapter_target_words(novel)
 
     user_parts.append(
         "【统一输出规则】\n"
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
         "2) 若未提供章标题建议，请先拟定一个贴合剧情的章名；\n"
         "3) 第二行留空一行，再开始正文。\n"
-        f"4) 正文（不含标题行）目标体量为 {target_words} 汉字左右；你必须尽量把正文控制在 {words_min}～{words_max} 汉字之间，"
-        "也就是与目标字数的上下偏差最多 1000 字。若明显低于下限，说明内容展开不足；若明显高于上限，说明节奏失控，"
-        "你必须优先通过补足场景细节或压缩冗余来在一次输出内贴近该区间。\n"
+        f"4) {_strong_chapter_word_rule(target_words)} 请在输出前自行检查并修正，确保落在允许范围内。\n"
         "5) 用场景、对白与细节描写支撑篇幅，避免用一两段概括带过，也不要为了凑字数重复心理、环境或解释。\n"
         "6) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
         "7) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
@@ -419,6 +435,7 @@ def _revise_chapter_messages(
     fj_block = truncate_framework_json(novel.framework_json or "", 6000)
     fb = "\n".join(f"- {b}" for b in feedback_bodies) or "（无）"
     style_block = _writing_style_block(getattr(novel, "writing_style", None))
+    target_words = _chapter_target_words(novel)
     sys = (
         "你是资深小说编辑。在保持世界观与人物一致的前提下，根据历史反馈意见与用户最新指令，"
         "对章节全文进行改写。框架 JSON 中的 world_rules 与已定设定不得被改稿推翻；只输出改写后的正文，"
@@ -432,6 +449,7 @@ def _revise_chapter_messages(
     ]
     if style_block:
         user_parts.append(style_block)
+    user_parts.append(f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}")
     user_parts.append(f"第 {chapter.chapter_no} 章《{chapter.title}》\n\n【当前正文（正式稿）】\n{chapter.content}")
     user_parts.append(f"【历史改进意见】\n{fb}")
     user_parts.append(f"【用户本次指令】\n{user_prompt}")
@@ -452,6 +470,7 @@ def _check_and_fix_chapter_messages(
 ) -> list[dict[str, str]]:
     bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
     fj_block = truncate_framework_json(novel.framework_json or "", 6000)
+    target_words = _chapter_target_words(novel)
     sys = (
         "你是小说一致性编辑。你的任务是对「待核对正文」做最小修改，解决设定漂移与前后因果断裂。"
         "严格遵守世界观与人物设定，必要时以【框架 JSON】与 world_rules 为准修正正文。"
@@ -465,13 +484,15 @@ def _check_and_fix_chapter_messages(
         f"【结构化记忆 JSON（含 canonical_timeline 与 open_plots）】\n{memory_json}\n\n"
         f"【本章信息】第 {chapter_no} 章"
         f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}\n\n"
+        f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}\n\n"
         f"【前文衔接摘录（含再前一章与上一章结尾）】\n{continuity_excerpt or '（首章）'}\n\n"
         f"【待核对正文】\n{chapter_text}\n\n"
         "【要求】\n"
         "1) 若发现与 world_rules/canonical_timeline 冲突，必须修正正文；不得只做说明。\n"
         "2) 允许做必要的因果补线、人物状态修正、伏笔承接与收束呈现，但不要大幅重写风格。\n"
         "3) 维持中文小说的正常排版与阅读节奏：对话、动作、场景切换、心理变化处应合理换段。\n"
-        "4) 只输出最终正文。"
+        "4) 修正后正文仍必须严格满足上述目标字数范围要求。\n"
+        "5) 只输出最终正文。"
     )
     return [
         {"role": "system", "content": sys},
@@ -524,6 +545,7 @@ def _fix_chapter_to_plan_messages(
 ) -> list[dict[str, str]]:
     bible = novel.framework_markdown[:12000] if novel.framework_markdown else novel.background
     fj_block = truncate_framework_json(novel.framework_json or "", 6000)
+    target_words = _chapter_target_words(novel)
     plan_payload = chapter_plan_guard_payload(
         beats,
         chapter_no=chapter_no,
@@ -539,6 +561,7 @@ def _fix_chapter_to_plan_messages(
         f"【框架 Markdown】\n{bible}\n\n"
         f"【框架 JSON（锚点，截断）】\n{fj_block}\n\n"
         f"【结构化记忆 JSON】\n{memory_json}\n\n"
+        f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}\n\n"
         f"【前文衔接摘录】\n{continuity_excerpt or '（首章）'}\n\n"
         "【执行卡】\n"
         f"{json.dumps(plan_payload, ensure_ascii=False)}\n\n"
@@ -551,7 +574,8 @@ def _fix_chapter_to_plan_messages(
         "2) 保持本章标题行格式与章号正确；\n"
         "3) 尽量保留已有可用段落，只改冲突处；\n"
         "4) 章末尽量贴近 ending_hook，但不要额外越级推进；\n"
-        "5) 只输出最终正文。"
+        "5) 修正后正文必须严格满足上述目标字数范围要求；\n"
+        "6) 只输出最终正文。"
     )
     return [
         {"role": "system", "content": sys},
@@ -575,12 +599,10 @@ def _de_ai_chapter_messages(
         chapter_no=chapter_no,
         plan_title=plan_title,
     )
-    target_words = int(getattr(novel, "chapter_target_words", 3000) or 3000)
-    max_allowed = target_words + 500
+    target_words = _chapter_target_words(novel)
     original_body_chars = int(
         chapter_content_metrics(chapter_text).get("body_chars", 0) or 0
     )
-    min_allowed = max(0, original_body_chars - 500)
     sys = (
         "你是中文网文润色编辑。你的任务是去除正文中的 AI 味，但不得改动剧情事实。"
         "你只能改写表达方式，不能改事件顺序、人物决定、信息边界、伏笔状态、章末结果。"
@@ -604,8 +626,8 @@ def _de_ai_chapter_messages(
             "1) 只改描述，不改剧情；\n"
             "2) 禁止把概述性句子改成新的剧情发展；\n"
             "3) 可以缩短、拆句、换更自然的表达，但不要扩写，也不要大幅删减有效情节与描写；\n"
-            f"4) 正文（不含标题行）仍不得超过 {max_allowed} 汉字；\n"
-            f"5) 当前正文约 {original_body_chars} 字，润色后正文不得少于 {min_allowed} 字，最多只允许缩减 500 字；\n"
+            f"4) {_strong_chapter_word_rule(target_words)}\n"
+            f"5) 当前正文约 {original_body_chars} 字，润色后必须重新计数并修正到允许范围内；\n"
             "6) 优先处理解释腔、总结腔、空泛心理句、重复修饰和机械比喻。",
             f"【当前正文】\n{chapter_text}",
         ]
@@ -2747,11 +2769,17 @@ class NovelLLMService:
             "open_plots_added 可为字符串或对象：对象时 plot_type 取 Core|Arc|Transient，"
             "priority 越大越重要，estimated_duration 为预计持续章节数（估算即可），"
             "current_stage 为当前推进到哪一步，resolve_when 为真正收束所需条件。"
-            "新人物首次进入重要叙事时，必须写入 characters_added；已有人物状态变化写入 characters_updated；"
+            "【人物抽取硬约束】"
+            "只要本批章节中出现了明确人名，这个人物就必须被记录，绝对不允许遗漏。"
+            "不管是主角、配角、反派、路人、只出场一次的人物，还是回忆/传闻/书信中明确点名的人物，只要出现姓名都要入库。"
+            "首次出现的人名必须写入 characters_added；旧人物有状态、立场、伤势、阵营、目标、身份认知变化时必须写入 characters_updated；"
             "人物死亡、长期退场、离队、封印等明确下线写入 characters_inactivated。"
-            "人物条目必须使用唯一主名，避免用代称、称谓或模糊指代。"
+            "人物条目必须使用唯一主名，避免用代称、称谓或模糊指代；若正文里只写称谓，但上下文能确定实名，也必须回填实名。"
             "characters_added / characters_updated / characters_inactivated / entity_influence_updates 可含 influence_score(0-100)、is_active。"
+            "【人物关系硬约束】"
+            "只要本批章节里出现两个人物之间的亲属、同盟、敌对、上下级、爱慕、利用、师徒、交易、控制、怀疑、冲突等可识别关系，relations 必须有记录，绝对不能缺失。"
             "relations_added 用于新建立的重要关系；relations_updated 用于已有关系变化；relations_inactivated 用于关系失效、断裂或不再成立。"
+            "若 characters 中出现了本批新人物或发生状态变化的人物，你必须同步检查并补齐其与其他人物的关系变化；不要只记人物不记关系。"
             "entity_influence_updates 每项：{entity_type, name, influence_score?, is_active?}，"
             "entity_type 为 character|skill|item|pet|plot 之一。"
             "forbidden_constraints_added：新增全局禁止事项（硬设定防火墙），须谨慎，只写正文绝不能违反的规则。"
@@ -2780,6 +2808,7 @@ class NovelLLMService:
             "如果某条硬约束、技能或物品不再适用，也请放入 ids_to_remove。"
             "如果只是推进但未真正解决，不要移除。"
             "如果章计划里明确给了本章结束状态目标，优先按该目标判断人物、关系和物品的新增/更新/下线。"
+            "再次强调：所有出现明确姓名的人物都要记录，且相关人物关系必须补齐，不允许漏人、不允许漏关系。"
             "再次强调：只总结关键收束线，不要总结对主剧情没有实质影响的小收尾。"
         )
         return [

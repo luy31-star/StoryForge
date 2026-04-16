@@ -10,7 +10,6 @@ from app.models.novel import Novel
 from app.models.volume import NovelChapterPlan
 from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.novel_llm_service import NovelLLMService
-from app.services.novel_repo import chapter_content_metrics
 
 
 def latest_chapter_plan(
@@ -91,14 +90,5 @@ def collect_chapter_approval_issues(
                         if str(x).strip()
                     ]
                 )
-
-    metrics = chapter_content_metrics(content)
-    target_words = int(getattr(novel, "chapter_target_words", 3000) or 3000)
-    max_allowed = target_words + 500
-    body_chars = int(metrics.get("body_chars", 0) or 0)
-    if body_chars > max_allowed:
-        issues.append(
-            f"正文约 {body_chars} 字，超过上限 {max_allowed} 字（目标 {target_words} 字，最多允许超出 500 字）"
-        )
 
     return issues

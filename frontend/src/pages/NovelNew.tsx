@@ -429,13 +429,16 @@ export function NovelNew() {
                   <Input
                     id="ctw"
                     type="number"
-                    min={500}
+                    min={300}
                     max={10000}
-                    step={100}
+                    step={1}
                     value={chapterTargetWords}
                     onChange={(e) => setChapterTargetWords(Number(e.target.value))}
                     className="field-shell mt-1 h-11 text-foreground"
                   />
+                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
+                    提示词会强力要求正文紧贴目标字数，只允许轻微浮动。当前默认规则为上下约 5%，至少 30 字、最多 150 字。
+                  </p>
                 </div>
                 <div className="space-y-2">
                   <Label htmlFor="daily" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写章数</Label>

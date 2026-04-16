@@ -366,7 +366,7 @@ export function NovelShelf() {
     { id: "medium", label: "中篇", defaultChapters: 150 },
     { id: "long", label: "长篇", defaultChapters: 500 },
   ];
-  const WORDS_PER_CHAPTER = [2000, 3000, 5000];
+  const WORDS_PER_CHAPTER = [300, 2000, 3000, 5000];
 
   function toggleLimit(
     current: string[],
@@ -1014,9 +1014,9 @@ export function NovelShelf() {
                   <Label className="text-xs font-semibold text-foreground/70">自定义字数</Label>
                   <Input
                     type="number"
-                    min={500}
+                    min={300}
                     max={10000}
-                    step={100}
+                    step={1}
                     value={aiCreateChapterTargetWords}
                     onChange={(e) => setAiCreateChapterTargetWords(Number(e.target.value))}
                     className="text-foreground"
@@ -1024,7 +1024,7 @@ export function NovelShelf() {
                 </div>
                 <div className="space-y-2">
                   <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium pt-7">
-                    AI 会尽量按这个目标控制正文篇幅，通常允许上下浮动 1000 字。
+                    提示词会强力要求正文紧贴目标字数，只允许轻微浮动。当前默认规则为上下约 5%，至少 30 字、最多 150 字。
                   </p>
                 </div>
               </div>

@@ -172,7 +172,7 @@ class AiCreateAndStartBody(BaseModel):
     target_generate_chapters: int = Field(default=0, ge=0, le=5000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
-    chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    chapter_target_words: int = Field(default=3000, ge=300, le=10000)
     auto_consistency_check: bool = False
     auto_plan_guard_check: bool = False
     auto_plan_guard_fix: bool = False
@@ -188,7 +188,7 @@ class NovelCreate(BaseModel):
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
     daily_auto_time: str = Field(default="14:30")
-    chapter_target_words: int = Field(default=3000, ge=500, le=10000)
+    chapter_target_words: int = Field(default=3000, ge=300, le=10000)
     auto_consistency_check: bool = False
     auto_plan_guard_check: bool = False
     auto_plan_guard_fix: bool = False
@@ -203,7 +203,7 @@ class NovelPatch(BaseModel):
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
     daily_auto_time: str | None = None
-    chapter_target_words: int | None = Field(default=None, ge=500, le=10000)
+    chapter_target_words: int | None = Field(default=None, ge=300, le=10000)
     auto_consistency_check: bool | None = None
     auto_plan_guard_check: bool | None = None
     auto_plan_guard_fix: bool | None = None
