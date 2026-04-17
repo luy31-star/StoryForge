@@ -100,6 +100,38 @@ def _extract_total_chapters_from_framework(framework_json: str) -> int | None:
     return None
 
 
+def _append_volumes(
+    db: Session,
+    *,
+    novel_id: str,
+    start_volume_no: int,
+    start_chapter: int,
+    total_chapters: int,
+    approx_size: int,
+) -> int:
+    added = 0
+    vol_no = start_volume_no
+    ch = start_chapter
+    while ch <= total_chapters:
+        lo = ch
+        hi = min(total_chapters, ch + approx_size - 1)
+        db.add(
+            NovelVolume(
+                novel_id=novel_id,
+                volume_no=vol_no,
+                title=f"第{vol_no}卷",
+                summary="",
+                from_chapter=lo,
+                to_chapter=hi,
+                status="draft",
+            )
+        )
+        added += 1
+        vol_no += 1
+        ch = hi + 1
+    return added
+
+
 @router.post("/generate")
 def generate_volumes(
     novel_id: str,
@@ -129,7 +161,7 @@ def generate_volumes(
         total = max(1, int((getattr(n, "target_word_count", 100_000) or 100_000) // 3000))
 
     approx = int(body.approx_size or 50)
-    # 2) 清理旧 volumes（仅当还没写任何计划时可安全重建；这里先“保守策略”：如果已有 volume 直接返回）
+    # 2) 已有卷时不直接跳过，而是按目标章数补齐缺失的后续卷
     existing = (
         db.query(NovelVolume)
         .filter(NovelVolume.novel_id == novel_id)
@@ -137,41 +169,70 @@ def generate_volumes(
         .all()
     )
     if existing:
+        covered_to = max(int(v.to_chapter or 0) for v in existing)
+        if covered_to >= total:
+            logger.info(
+                "volumes.generate skipped | op=%s novel_id=%s reason=already_covered count=%s covered_to=%s total=%s",
+                op,
+                novel_id,
+                len(existing),
+                covered_to,
+                total,
+            )
+            return {
+                "status": "skipped",
+                "reason": f"现有卷列表已覆盖到第{covered_to}章",
+                "count": len(existing),
+                "covered_to": covered_to,
+                "total_chapters": total,
+                "approx_size": approx,
+            }
+        added = _append_volumes(
+            db,
+            novel_id=novel_id,
+            start_volume_no=max(int(v.volume_no or 0) for v in existing) + 1,
+            start_chapter=covered_to + 1,
+            total_chapters=total,
+            approx_size=approx,
+        )
+        db.commit()
         logger.info(
-            "volumes.generate skipped | op=%s novel_id=%s reason=volumes_already_exist count=%s",
+            "volumes.generate extended | op=%s novel_id=%s existing=%s added=%s covered_to=%s total=%s approx_size=%s",
             op,
             novel_id,
             len(existing),
+            added,
+            covered_to,
+            total,
+            approx,
         )
-        return {"status": "skipped", "reason": "volumes 已存在", "count": len(existing)}
+        return {
+            "status": "extended",
+            "count": len(existing) + added,
+            "added": added,
+            "covered_to": total,
+            "total_chapters": total,
+            "approx_size": approx,
+        }
 
-    vol_no = 1
-    ch = 1
-    while ch <= total:
-        lo = ch
-        hi = min(total, ch + approx - 1)
-        v = NovelVolume(
-            novel_id=novel_id,
-            volume_no=vol_no,
-            title=f"第{vol_no}卷",
-            summary="",
-            from_chapter=lo,
-            to_chapter=hi,
-            status="draft",
-        )
-        db.add(v)
-        vol_no += 1
-        ch = hi + 1
+    added = _append_volumes(
+        db,
+        novel_id=novel_id,
+        start_volume_no=1,
+        start_chapter=1,
+        total_chapters=total,
+        approx_size=approx,
+    )
     db.commit()
     logger.info(
         "volumes.generate done | op=%s novel_id=%s count=%s total_chapters=%s approx_size=%s",
         op,
         novel_id,
-        vol_no - 1,
+        added,
         total,
         approx,
     )
-    return {"status": "ok", "count": vol_no - 1, "total_chapters": total, "approx_size": approx}
+    return {"status": "ok", "count": added, "total_chapters": total, "approx_size": approx}
 
 
 @router.get("")

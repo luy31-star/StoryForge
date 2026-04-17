@@ -100,7 +100,15 @@ export async function generateVolumes(
     }),
   });
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<{ status: string; count?: number; reason?: string }>;
+  return r.json() as Promise<{
+    status: string;
+    count?: number;
+    added?: number;
+    reason?: string;
+    covered_to?: number;
+    total_chapters?: number;
+    approx_size?: number;
+  }>;
 }
 
 export async function listVolumes(novelId: string) {

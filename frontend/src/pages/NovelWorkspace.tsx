@@ -2101,9 +2101,24 @@ export function NovelWorkspace() {
     setNotice(null);
     setVolumeBusy(true);
     try {
-      await generateVolumes(id, { approx_size: 50 });
+      const resp = await generateVolumes(id, {
+        approx_size: 50,
+        total_chapters: Number(novel?.target_chapters || 0) || undefined,
+      });
       await reloadVolumes();
-      setNotice("卷列表已生成。请选择一卷后生成本卷章计划。");
+      if (resp.status === "extended") {
+        setNotice(
+          `已补生成后续卷 ${resp.added ?? 0} 个，现已覆盖到第${resp.covered_to ?? resp.total_chapters ?? "?"}章。`
+        );
+      } else if (resp.status === "skipped") {
+        setNotice(
+          resp.reason
+            ? `未新增卷：${resp.reason}。`
+            : "未新增卷：当前卷列表已经覆盖目标章节范围。"
+        );
+      } else {
+        setNotice("卷列表已生成。请选择一卷后生成本卷章计划。");
+      }
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "生成卷列表失败");
     } finally {
