@@ -5,6 +5,7 @@ import json
 import logging
 from pathlib import Path
 import re
+from types import SimpleNamespace
 import time
 from typing import Any, Literal
 
@@ -95,6 +96,16 @@ logger = logging.getLogger(__name__)
 
 def _novel_llm(user: User) -> NovelLLMService:
     return NovelLLMService(billing_user_id=user.id)
+
+
+def _snapshot_novel_prompt_view(novel: Novel) -> Any:
+    return SimpleNamespace(
+        id=str(novel.id),
+        title=str(novel.title or ""),
+        framework_markdown=str(novel.framework_markdown or ""),
+        background=str(novel.background or ""),
+        framework_json=str(novel.framework_json or ""),
+    )
 
 
 class BatchReplaceNamesBody(BaseModel):
@@ -582,6 +593,7 @@ async def chapter_context_chat_stream(
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     n = require_novel_access(db, novel_id, user)
+    n_prompt = _snapshot_novel_prompt_view(n)
     mem = latest_memory_json(db, novel_id)
     approved = (
         db.query(Chapter)
@@ -603,7 +615,7 @@ async def chapter_context_chat_stream(
     async def event_iter():
         try:
             async for evt in llm.chapter_context_chat_stream(
-                n,
+                n_prompt,
                 memory_json=mem,
                 approved_chapters_summary=approved_summary,
                 continuity_excerpt=continuity,

@@ -13,7 +13,7 @@ httpx==0.28.1
 websockets==14.1
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
-bcrypt==4.2.1
+bcrypt==4.0.1
 aiosmtplib==3.0.2
 json-repair>=0.30.0
 alibabacloud-oss-v2>=1.0.0

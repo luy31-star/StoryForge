@@ -10,6 +10,27 @@ from passlib.context import CryptContext
 
 from app.core.config import settings
 
+
+def _patch_bcrypt_about() -> None:
+    """
+    兼容 passlib 1.7.4 与 bcrypt 4.1+：
+    passlib 会读取 bcrypt.__about__.__version__，但新版本 bcrypt 已移除此属性。
+    """
+    try:
+        import bcrypt as _bcrypt
+    except Exception:
+        return
+
+    if hasattr(_bcrypt, "__about__"):
+        return
+
+    version = getattr(_bcrypt, "__version__", "")
+    about_type = type("_BcryptAbout", (), {"__version__": version})
+    _bcrypt.__about__ = about_type()  # type: ignore[attr-defined]
+
+
+_patch_bcrypt_about()
+
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
