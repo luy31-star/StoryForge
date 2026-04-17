@@ -37,6 +37,7 @@ import {
   deleteMemorySkill,
   discardChapterRevision,
   exportChapters,
+  generateFramework,
   formatChapter,
   generateChapters,
   autoGenerateChapters,
@@ -76,6 +77,7 @@ import {
   waitForChapterGenerationBatch,
   waitForChapterPolishBatch,
   waitForChapterReviseBatch,
+  waitForFrameworkGenerateBatch,
   waitForMemoryRefreshBatch,
   waitForVolumePlanBatch,
 } from "@/services/novelApi";
@@ -2095,6 +2097,31 @@ export function NovelWorkspace() {
     }
   }
 
+  async function runRetryFrameworkGeneration() {
+    if (!id) return;
+    const ready = await ensureLlmReady();
+    if (!ready) return;
+    setErr(null);
+    setNotice(null);
+    setBusy(true);
+    try {
+      const resp = await generateFramework(id);
+      if (resp.status === "queued" && resp.batch_id) {
+        const outcome = await waitForFrameworkGenerateBatch(id, resp.batch_id);
+        if (outcome === "failed") {
+          throw new Error("大纲 JSON 不完整或生成失败，请点击“重新生成大纲”再次尝试，并查看生成日志。");
+        }
+      }
+      await reload();
+      setNotice("大纲已重新入队生成，请稍候自动刷新。");
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "重新生成大纲失败");
+      await reload();
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runGenerateVolumes() {
     if (!id) return;
     setErr(null);
@@ -3103,6 +3130,16 @@ export function NovelWorkspace() {
               >
                 查看错误详情
               </Button>
+              {!novel.framework_confirmed ? (
+                <Button
+                  variant="outline"
+                  className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
+                  disabled={busy}
+                  onClick={() => void runRetryFrameworkGeneration()}
+                >
+                  {busy ? "重新生成中…" : "重新生成大纲"}
+                </Button>
+              ) : null}
               <Button
                 variant="outline"
                 className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
@@ -3111,7 +3148,9 @@ export function NovelWorkspace() {
                 <Link to="/novels">回到书架</Link>
               </Button>
               <p className="text-[11px] text-foreground/50 dark:text-muted-foreground italic font-medium ml-2">
-                建议查看错误日志，如有必要可删除当前失败的作品重新尝试。
+                {!novel.framework_confirmed
+                  ? "如果报错里提到 JSON 不完整或截断，直接点击“重新生成大纲”即可。"
+                  : "建议先查看错误日志，再决定是否继续重试。"}
               </p>
             </div>
           </div>
@@ -3182,14 +3221,23 @@ export function NovelWorkspace() {
                         <div className="h-4 w-4 rounded-full bg-destructive" />
                       </div>
                       <p className="font-bold text-base text-destructive">AI 构思似乎失败了</p>
-                      <p className="text-xs opacity-60 max-w-xs mb-2">可能是网络波动或 AI 解析错误。建议点击下方“修改向导”进行手动重试。</p>
+                      <p className="text-xs opacity-60 max-w-xs mb-2">如果是大纲 JSON 不完整或输出截断，直接点击下方重新生成即可。</p>
+                      <Button 
+                        size="sm" 
+                        variant="default" 
+                        className="font-bold"
+                        onClick={() => void runRetryFrameworkGeneration()}
+                        disabled={busy}
+                      >
+                        {busy ? "重新生成中..." : "重新生成大纲"}
+                      </Button>
                       <Button 
                         size="sm" 
                         variant="outline" 
                         className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
                         onClick={() => setFrameworkWizardOpen(true)}
                       >
-                        进入修改向导重试
+                        进入修改向导
                       </Button>
                     </>
                   ) : (

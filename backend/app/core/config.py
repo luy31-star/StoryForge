@@ -76,6 +76,8 @@ class Settings(BaseSettings):
     novel_beat_minute: int = 0
     # 单章生成：传给 OpenAI 兼容接口的 max_tokens（豆包等未显式传时网关默认可能偏小，导致篇幅不足）
     novel_chapter_max_tokens: int = 8192
+    # 大纲生成：同时要求 Markdown + 结构化 JSON，输出体量远大于单章，预算需显著放大
+    novel_framework_max_tokens: int = 24576
     # 单章正文生成超时（秒）
     novel_chapter_timeout: float = 900.0
     # 一致性修订超时（秒）

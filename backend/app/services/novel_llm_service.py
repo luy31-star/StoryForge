@@ -723,6 +723,93 @@ def _volume_plan_strip_trailing_commas(blob: str) -> str:
     return s
 
 
+def _extract_last_fenced_block(raw: str) -> str | None:
+    blocks = re.findall(r"```(?:json)?\s*([\s\S]*?)```", raw or "", flags=re.IGNORECASE)
+    if not blocks:
+        return None
+    return str(blocks[-1]).strip()
+
+
+def _extract_balanced_json_object(raw: str) -> str | None:
+    s = str(raw or "")
+    start: int | None = None
+    depth = 0
+    in_str = False
+    escape = False
+    last_full: str | None = None
+    for idx, ch in enumerate(s):
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+            continue
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+            continue
+        if ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    last_full = s[start : idx + 1].strip()
+                    start = None
+    if last_full:
+        return last_full
+    return None
+
+
+def _strip_last_fenced_block(raw: str) -> str:
+    text = str(raw or "").strip()
+    return re.sub(
+        r"\n*```(?:json)?\s*[\s\S]*?```\s*$",
+        "",
+        text,
+        count=1,
+        flags=re.IGNORECASE,
+    ).rstrip()
+
+
+def _parse_framework_json_from_reply(raw: str) -> dict[str, Any]:
+    s = str(raw or "").strip()
+    if not s:
+        raise ValueError("框架生成结果为空")
+
+    candidates: list[str] = []
+    for c in (
+        _extract_last_fenced_block(s),
+        _extract_balanced_json_object(s),
+        s,
+    ):
+        if c and c not in candidates:
+            candidates.append(c)
+
+    last_err: Exception | None = None
+    for blob in candidates:
+        try:
+            data = json.loads(blob)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            last_err = e
+
+    for blob in candidates:
+        try:
+            data = json_repair_loads(blob)
+            if isinstance(data, dict):
+                return data
+        except Exception as e:
+            last_err = e
+
+    raise ValueError("生成的大纲结构化 JSON 不完整，疑似输出被截断，请点击重新生成") from last_err
+
+
 def _volume_plan_parse_llm_json_to_dict(raw: str) -> dict[str, Any]:
     """多步容错解析卷章计划 JSON。"""
     s = (raw or "").strip()
@@ -1172,19 +1259,14 @@ class NovelLLMService:
                 {"role": "user", "content": user},
             ],
             temperature=0.6,
+            max_tokens=settings.novel_framework_max_tokens,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
             **self._bill_kw(db, self._billing_user_id),
         )
-        json_part = "{}"
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            try:
-                json.loads(m.group(1).strip())
-                json_part = m.group(1).strip()
-            except json.JSONDecodeError:
-                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
-        return text, json_part
+        parsed = _parse_framework_json_from_reply(text)
+        markdown = _strip_last_fenced_block(text)
+        return markdown or text, json.dumps(parsed, ensure_ascii=False)
 
     async def regenerate_framework(
         self, novel: Novel, instruction: str, db: Any = None
@@ -1232,19 +1314,14 @@ class NovelLLMService:
                 {"role": "user", "content": user},
             ],
             temperature=0.55,
+            max_tokens=settings.novel_framework_max_tokens,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
             **self._bill_kw(db, self._billing_user_id),
         )
-        json_part = "{}"
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            try:
-                json.loads(m.group(1).strip())
-                json_part = m.group(1).strip()
-            except json.JSONDecodeError:
-                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
-        return text, json_part
+        parsed = _parse_framework_json_from_reply(text)
+        markdown = _strip_last_fenced_block(text)
+        return markdown or text, json.dumps(parsed, ensure_ascii=False)
 
     async def update_framework_characters(
         self, novel: Novel, characters: list[dict[str, Any]], db: Any = None
@@ -1290,19 +1367,14 @@ class NovelLLMService:
                 {"role": "user", "content": user},
             ],
             temperature=0.55,
+            max_tokens=settings.novel_framework_max_tokens,
             web_search=self._novel_web_search(db, flow="default"),
             timeout=600.0,
             **self._bill_kw(db, self._billing_user_id),
         )
-        json_part = "{}"
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-        if m:
-            try:
-                json.loads(m.group(1).strip())
-                json_part = m.group(1).strip()
-            except json.JSONDecodeError:
-                json_part = json.dumps({"raw_framework_tail": text[-4000:]})
-        return text, json_part
+        parsed = _parse_framework_json_from_reply(text)
+        markdown = _strip_last_fenced_block(text)
+        return markdown or text, json.dumps(parsed, ensure_ascii=False)
 
     async def generate_volume_chapter_plan_batch_json(
         self,
