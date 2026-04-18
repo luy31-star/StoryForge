@@ -13,22 +13,37 @@ export function validateReferenceFile(file: File): string | null {
   return null;
 }
 
-export async function listNovels() {
-  const r = await apiFetch(BASE);
+export type ShelfNovel = {
+  id: string;
+  title: string;
+  intro: string;
+  status: string;
+  framework_confirmed: boolean;
+  target_chapters: number;
+  length_tag: string;
+  daily_auto_chapters: number;
+  updated_at: string | null;
+};
+
+export async function listNovels(params?: {
+  q?: string;
+  status?: string;
+  page?: number;
+  page_size?: number;
+}) {
+  const query = new URLSearchParams();
+  if (params?.q) query.set("q", params.q);
+  if (params?.status) query.set("status", params.status);
+  if (params?.page) query.set("page", String(params.page));
+  if (params?.page_size) query.set("page_size", String(params.page_size));
+  const r = await apiFetch(`${BASE}${query.toString() ? `?${query.toString()}` : ""}`);
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<
-    {
-      id: string;
-      title: string;
-      intro: string;
-      status: string;
-      framework_confirmed: boolean;
-      target_chapters: number;
-      length_tag: string;
-      daily_auto_chapters: number;
-      updated_at: string | null;
-    }[]
-  >;
+  return r.json() as Promise<{
+    items: ShelfNovel[];
+    total: number;
+    page: number;
+    page_size: number;
+  }>;
 }
 
 export async function inspirationChat(

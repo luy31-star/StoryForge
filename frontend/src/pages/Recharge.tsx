@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
-import { ArrowRight, CheckCircle2, Loader2, ShieldCheck, Sparkles, Wallet } from "lucide-react";
+import { Loader2, Sparkles, Wallet } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -36,22 +36,22 @@ const STATUS_COPY: Record<
   paid: {
     label: "已到账",
     tone: "default",
-    description: "支付宝已确认收款，积分已发放到当前账号。",
+    description: "积分已发放到当前账号。",
   },
   pending: {
     label: "支付处理中",
     tone: "secondary",
-    description: "正在等待支付宝异步通知或主动查单结果，请稍候。",
+    description: "正在确认支付结果，请稍候。",
   },
   created: {
     label: "待支付",
     tone: "outline",
-    description: "订单已创建，尚未完成付款。",
+    description: "订单已创建。",
   },
   closed: {
     label: "已关闭",
     tone: "destructive",
-    description: "订单已关闭，如需充值请重新发起支付。",
+    description: "订单已关闭。",
   },
 };
 
@@ -242,10 +242,7 @@ export function Recharge() {
                 支付宝电脑支付
               </Badge>
               <div>
-                <h1 className="text-3xl font-semibold tracking-tight text-foreground md:text-4xl">购买积分</h1>
-                <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground md:text-base">
-                  直接跳转支付宝付款，充值成功后积分自动发放到当前登录账号。
-                </p>
+                <h1 className="text-3xl font-semibold tracking-tight text-foreground md:text-4xl">积分充值</h1>
               </div>
             </div>
             <div className="grid gap-3 md:min-w-[290px]">
@@ -270,7 +267,7 @@ export function Recharge() {
             <CardHeader className="border-b border-border/60">
               <CardTitle>选择充值方案</CardTitle>
               <CardDescription>
-                固定套餐直接下单，自定义充值最低 {config?.min_custom_points ?? 50} 积分。
+                选择套餐或输入自定义积分。
               </CardDescription>
             </CardHeader>
             <CardContent className="space-y-6 p-5">
@@ -307,8 +304,7 @@ export function Recharge() {
                   <div>
                     <div className="text-base font-semibold text-foreground">自定义积分</div>
                     <div className="mt-1 text-sm text-muted-foreground">
-                      最低 {config?.min_custom_points ?? 50} 积分，按 {config?.custom_points_step ?? 10} 积分步进，基础单价{" "}
-                      {config?.base_points_per_cny ?? 10} 积分 / 元。
+                      最低 {config?.min_custom_points ?? 10} 积分，按 {config?.custom_points_step ?? 10} 积分步进。
                     </div>
                   </div>
                   <Button
@@ -350,9 +346,7 @@ export function Recharge() {
               ) : null}
 
               <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-                <div className="text-sm text-muted-foreground">
-                  点击“去支付宝支付”后会离开当前页，支付完成会自动返回此页面并刷新状态。
-                </div>
+                <div className="text-sm text-muted-foreground">确认后跳转支付宝支付。</div>
                 <Button
                   type="button"
                   size="lg"
@@ -370,7 +364,7 @@ export function Recharge() {
             <Card>
               <CardHeader>
                 <CardTitle>本次订单摘要</CardTitle>
-                <CardDescription>下单前确认积分和金额。</CardDescription>
+                <CardDescription>确认金额后发起支付。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="rounded-[1.4rem] border border-border/70 bg-background/55 p-4">
@@ -387,16 +381,13 @@ export function Recharge() {
                     </span>
                   </div>
                 </div>
-                <div className="rounded-[1.4rem] border border-border/70 bg-secondary/35 p-4 text-sm text-muted-foreground">
-                  固定套餐直接享受优惠，自定义充值按基础单价换算。支付成功后积分只会记入当前登录账户。
-                </div>
               </CardContent>
             </Card>
 
             <Card>
               <CardHeader>
                 <CardTitle>支付状态</CardTitle>
-                <CardDescription>从支付宝返回后，这里会自动展示订单结果。</CardDescription>
+                <CardDescription>支付完成后可在这里查看结果。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 {order ? (
@@ -451,29 +442,9 @@ export function Recharge() {
                   </>
                 ) : (
                   <div className="rounded-[1.4rem] border border-dashed border-border/80 bg-background/45 p-5 text-sm leading-6 text-muted-foreground">
-                    还没有待查询的订单。完成支付宝付款后，会自动回到当前页面并带上订单号进行状态查询。
+                    暂无待查询订单。
                   </div>
                 )}
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardHeader>
-                <CardTitle>安全说明</CardTitle>
-              </CardHeader>
-              <CardContent className="space-y-3 text-sm text-muted-foreground">
-                <div className="flex items-start gap-3 rounded-2xl border border-border/70 bg-background/55 p-4">
-                  <ShieldCheck className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                  <span>积分到账以支付宝异步通知和服务端查单结果为准，不依赖前端本地状态。</span>
-                </div>
-                <div className="flex items-start gap-3 rounded-2xl border border-border/70 bg-background/55 p-4">
-                  <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                  <span>支付完成后如果结果未立即刷新，停留当前页数秒或点击“刷新状态”即可。</span>
-                </div>
-                <div className="flex items-start gap-3 rounded-2xl border border-border/70 bg-background/55 p-4">
-                  <ArrowRight className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                  <span>支付宝配置中的异步通知地址必须指向后端公网地址，授权回调地址需能回到前端 `/recharge` 页面。</span>
-                </div>
               </CardContent>
             </Card>
           </div>

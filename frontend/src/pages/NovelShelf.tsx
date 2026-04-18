@@ -3,6 +3,8 @@ import { Link, useNavigate } from "react-router-dom";
 import {
   ArrowRight,
   BookOpen,
+  ChevronLeft,
+  ChevronRight,
   Clock3,
   Plus,
   Sparkles,
@@ -25,10 +27,8 @@ import {
 } from "@/components/ui/dialog";
 import { Label } from "@/components/ui/label";
 import { Input } from "@/components/ui/input";
-import { deleteNovel, listNovels, aiCreateAndStartNovel } from "@/services/novelApi";
+import { deleteNovel, listNovels, aiCreateAndStartNovel, type ShelfNovel } from "@/services/novelApi";
 import { ensureLlmReady } from "@/services/llmReady";
-
-type ShelfNovel = Awaited<ReturnType<typeof listNovels>>[number];
 
 const shelfThemes = [
   {
@@ -161,6 +161,12 @@ function NovelStageRail({
 export function NovelShelf() {
   const navigate = useNavigate();
   const [items, setItems] = useState<ShelfNovel[]>([]);
+  const [total, setTotal] = useState(0);
+  const [page, setPage] = useState(1);
+  const [pageSize] = useState(12);
+  const [searchInput, setSearchInput] = useState("");
+  const [searchKeyword, setSearchKeyword] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
 
@@ -189,14 +195,24 @@ export function NovelShelf() {
   const [newMood, setNewMood] = useState("");
   const [newBackground, setNewBackground] = useState("");
 
-  const reload = useCallback(() => {
-    listNovels()
-      .then(setItems)
-      .catch((e: Error) => setErr(e.message));
-  }, []);
+  const reload = useCallback(async () => {
+    try {
+      setErr(null);
+      const data = await listNovels({
+        q: searchKeyword,
+        status: statusFilter,
+        page,
+        page_size: pageSize,
+      });
+      setItems(data.items);
+      setTotal(data.total);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "加载作品失败");
+    }
+  }, [page, pageSize, searchKeyword, statusFilter]);
 
   useEffect(() => {
-    reload();
+    void reload();
   }, [reload]);
 
   async function onDeleteNovel(id: string, title: string) {
@@ -215,6 +231,7 @@ export function NovelShelf() {
   }
 
   const confirmedCount = items.filter((item) => item.framework_confirmed).length;
+  const totalPages = Math.max(1, Math.ceil(total / pageSize));
   const activeAutomationCount = useMemo(
     () => items.filter((item) => item.daily_auto_chapters > 0).length,
     [items]
@@ -238,6 +255,17 @@ export function NovelShelf() {
     ? themeForNovel(`${spotlightNovel.id}${spotlightNovel.title}`)
     : shelfThemes[0];
   const spotlightStage = spotlightNovel ? stageForNovel(spotlightNovel) : null;
+
+  useEffect(() => {
+    if (page > totalPages) {
+      setPage(totalPages);
+    }
+  }, [page, totalPages]);
+
+  function submitSearch() {
+    setPage(1);
+    setSearchKeyword(searchInput.trim());
+  }
 
   async function handleAiCreate() {
     const ready = await ensureLlmReady();
@@ -436,9 +464,9 @@ export function NovelShelf() {
 
               <div className="grid gap-3 sm:grid-cols-3">
                 {[
-                  ["作品总数", `${items.length}`, "当前书架中的全部项目"],
-                  ["可继续推进", `${confirmedCount}`, "框架已确认，可直接进入卷规划与正文"],
-                  ["自动推进", `${activeAutomationCount}`, `累计每日 ${totalAutoChapters} 章`],
+                  ["作品总数", `${total}`, "当前查询结果下的作品总数"],
+                  ["本页可推进", `${confirmedCount}`, "当前页已确认框架的作品"],
+                  ["本页自动推进", `${activeAutomationCount}`, `当前页累计每日 ${totalAutoChapters} 章`],
                 ].map(([label, value, hint]) => (
                   <div key={label} className="glass-panel-subtle p-4">
                     <p className="text-xs font-semibold uppercase tracking-[0.22em] text-foreground/55">
@@ -546,15 +574,69 @@ export function NovelShelf() {
           <div className="flex flex-wrap items-end justify-between gap-3">
             <div>
               <p className="section-heading text-foreground font-bold">你的作品</p>
-              <p className="mt-1 text-sm text-foreground/60 dark:text-muted-foreground font-medium">
-                每张卡片只保留阶段、最近活动和下一步入口。
+              <p className="mt-1 text-sm font-medium text-foreground/60 dark:text-muted-foreground">
+                支持按标题、简介和状态快速筛选。
               </p>
             </div>
             <div className="glass-chip font-bold text-foreground/80">
-              当前共 {items.length} 本作品
+              共 {total} 本作品
             </div>
           </div>
-          {items.length === 0 ? (
+          <div className="glass-panel-subtle p-4">
+            <div className="flex flex-col gap-3 lg:flex-row lg:items-end">
+              <div className="flex-1">
+                <Label htmlFor="novel-search">搜索</Label>
+                <div className="mt-2 flex gap-2">
+                  <Input
+                    id="novel-search"
+                    value={searchInput}
+                    onChange={(e) => setSearchInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        submitSearch();
+                      }
+                    }}
+                    placeholder="搜索标题或简介"
+                    className="h-10"
+                  />
+                  <Button type="button" onClick={submitSearch}>
+                    查询
+                  </Button>
+                </div>
+              </div>
+              <div className="w-full lg:w-56">
+                <Label htmlFor="novel-status">状态</Label>
+                <select
+                  id="novel-status"
+                  value={statusFilter}
+                  onChange={(e) => {
+                    setPage(1);
+                    setStatusFilter(e.target.value);
+                  }}
+                  className="mt-2 flex h-10 w-full rounded-xl border border-input bg-background px-3 py-2 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  <option value="">全部状态</option>
+                  <option value="draft">草稿</option>
+                  <option value="active">进行中</option>
+                  <option value="failed">失败</option>
+                </select>
+              </div>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => {
+                  setSearchInput("");
+                  setSearchKeyword("");
+                  setStatusFilter("");
+                  setPage(1);
+                }}
+              >
+                清空筛选
+              </Button>
+            </div>
+          </div>
+          {total === 0 ? (
             <Card className="overflow-hidden">
               <CardContent className="flex flex-col items-center gap-4 py-14 text-center">
                 <div className="flex size-14 items-center justify-center rounded-2xl bg-primary/10 text-primary">
@@ -574,6 +656,14 @@ export function NovelShelf() {
                     创建第一本小说
                   </Link>
                 </Button>
+              </CardContent>
+            </Card>
+          ) : null}
+          {total > 0 && items.length === 0 ? (
+            <Card className="overflow-hidden">
+              <CardContent className="flex flex-col items-center gap-3 py-14 text-center">
+                <p className="text-lg font-semibold tracking-tight text-foreground">没有匹配的作品</p>
+                <p className="text-sm text-muted-foreground">试试更短的关键词，或者切换状态筛选。</p>
               </CardContent>
             </Card>
           ) : null}
@@ -694,6 +784,33 @@ export function NovelShelf() {
               );
             })}
           </div>
+          {total > 0 ? (
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="text-sm text-muted-foreground">
+                第 {page} / {totalPages} 页
+              </div>
+              <div className="flex gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={page <= 1}
+                  onClick={() => setPage((prev) => Math.max(1, prev - 1))}
+                >
+                  <ChevronLeft className="size-4" />
+                  上一页
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={page >= totalPages}
+                  onClick={() => setPage((prev) => Math.min(totalPages, prev + 1))}
+                >
+                  下一页
+                  <ChevronRight className="size-4" />
+                </Button>
+              </div>
+            </div>
+          ) : null}
         </section>
       </div>
 

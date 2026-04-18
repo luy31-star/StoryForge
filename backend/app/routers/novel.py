@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import time
 from typing import Any, Literal
 
-from fastapi import APIRouter, Body, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
@@ -642,29 +642,54 @@ async def chapter_context_chat_stream(
 
 @router.get("")
 def list_novels(
+    q: str = Query(default="", max_length=100),
+    status: str = Query(default="", max_length=32),
+    page: int = Query(default=1, ge=1),
+    page_size: int = Query(default=12, ge=1, le=60),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
-) -> list[dict[str, Any]]:
-    q = db.query(Novel)
+) -> dict[str, Any]:
+    query = db.query(Novel)
     if not user.is_admin:
-        q = q.filter(Novel.user_id == user.id)
-    rows = q.order_by(Novel.updated_at.desc()).all()
-    return [
-        {
-            "id": n.id,
-            "title": n.title,
-            "intro": n.intro,
-            "status": n.status,
-            "framework_confirmed": n.framework_confirmed,
-            "target_chapters": n.target_chapters,
-            "chapter_target_words": n.chapter_target_words,
-            "length_tag": _get_length_tag(n.target_chapters),
-            "daily_auto_chapters": n.daily_auto_chapters,
-            "daily_auto_time": n.daily_auto_time,
-            "updated_at": n.updated_at.isoformat() if n.updated_at else None,
-        }
-        for n in rows
-    ]
+        query = query.filter(Novel.user_id == user.id)
+
+    keyword = (q or "").strip()
+    if keyword:
+        like = f"%{keyword}%"
+        query = query.filter(or_(Novel.title.ilike(like), Novel.intro.ilike(like)))
+
+    normalized_status = (status or "").strip()
+    if normalized_status:
+        query = query.filter(Novel.status == normalized_status)
+
+    total = int(query.with_entities(func.count(Novel.id)).scalar() or 0)
+    rows = (
+        query.order_by(Novel.updated_at.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+    return {
+        "items": [
+            {
+                "id": n.id,
+                "title": n.title,
+                "intro": n.intro,
+                "status": n.status,
+                "framework_confirmed": n.framework_confirmed,
+                "target_chapters": n.target_chapters,
+                "chapter_target_words": n.chapter_target_words,
+                "length_tag": _get_length_tag(n.target_chapters),
+                "daily_auto_chapters": n.daily_auto_chapters,
+                "daily_auto_time": n.daily_auto_time,
+                "updated_at": n.updated_at.isoformat() if n.updated_at else None,
+            }
+            for n in rows
+        ],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 def _get_length_tag(target_chapters: int) -> str:

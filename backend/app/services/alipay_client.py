@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import json
+from urllib.parse import urlencode
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -59,7 +60,7 @@ def _canonical_kv(params: dict[str, Any]) -> str:
     for k, v in params.items():
         if v is None:
             continue
-        if k in ("sign", "sign_type"):
+        if k == "sign":
             continue
         items.append((k, str(v)))
     items.sort(key=lambda x: x[0])
@@ -131,6 +132,17 @@ class AlipayClient:
         }
         return params
 
+    def _build_gateway_request_parts(self, params: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        signed = dict(params)
+        signed["sign"] = self.sign(signed)
+
+        query_params = {k: v for k, v in signed.items() if k != "biz_content"}
+        body_params = {}
+        if "biz_content" in signed:
+            body_params["biz_content"] = signed["biz_content"]
+        action = f"{self.gateway}?{urlencode(query_params)}"
+        return action, body_params
+
     def page_pay_form(
         self,
         out_trade_no: str,
@@ -148,12 +160,12 @@ class AlipayClient:
         params = self.build_params("alipay.trade.page.pay", biz)
         params["notify_url"] = notify_url
         params["return_url"] = return_url
-        params["sign"] = self.sign(params)
+        action, body_params = self._build_gateway_request_parts(params)
 
         inputs = "\n".join(
             [
                 f'<input type="hidden" name="{html.escape(str(k), quote=True)}" value="{html.escape(str(v), quote=True)}"/>'
-                for k, v in params.items()
+                for k, v in body_params.items()
             ]
         )
         page_html = f"""
@@ -166,7 +178,7 @@ class AlipayClient:
   </head>
   <body>
     <p>正在跳转到支付宝支付页…</p>
-    <form id="alipay_form" method="post" action="{self.gateway}">
+    <form id="alipay_form" accept-charset="utf-8" method="post" action="{html.escape(action, quote=True)}">
       {inputs}
       <button type="submit">如未自动跳转，请点击继续</button>
     </form>
@@ -181,10 +193,14 @@ class AlipayClient:
     def trade_query_sync(self, out_trade_no: str) -> AlipayTradeQueryResult:
         biz = {"out_trade_no": out_trade_no}
         params = self.build_params("alipay.trade.query", biz)
-        params["sign"] = self.sign(params)
+        action, body_params = self._build_gateway_request_parts(params)
 
         with httpx.Client(timeout=20.0) as client:
-            resp = client.post(self.gateway, data=params)
+            resp = client.post(
+                action,
+                data=body_params,
+                headers={"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"},
+            )
             resp.raise_for_status()
             data = resp.json()
 
