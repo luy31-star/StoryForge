@@ -9,7 +9,7 @@ import re
 import httpx
 from json_repair import loads as json_repair_loads
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from typing import Any, Literal
 
 from app.core.config import settings
@@ -810,6 +810,76 @@ def _parse_framework_json_from_reply(raw: str) -> dict[str, Any]:
     raise ValueError("生成的大纲结构化 JSON 不完整，疑似输出被截断，请点击重新生成") from last_err
 
 
+def _notify_progress(cb: Callable[[str], None] | None, message: str) -> None:
+    if cb is None:
+        return
+    try:
+        cb(message)
+    except Exception:
+        logger.exception("framework progress callback failed")
+
+
+def _trim_base_framework_markdown(markdown: str) -> str:
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    for idx, line in enumerate(lines):
+        if not line.lstrip().startswith("##"):
+            continue
+        compact = re.sub(r"\s+", "", line)
+        if (
+            "卷级概览" in compact
+            or "分卷剧情大纲" in compact
+            or "(Arcs)" in compact
+            or "（Arcs）" in compact
+        ):
+            return "\n".join(lines[:idx]).rstrip()
+    return text
+
+
+def _strip_leading_markdown_title(markdown: str) -> str:
+    text = str(markdown or "").strip()
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if lines and lines[0].lstrip().startswith("# "):
+        return "\n".join(lines[1:]).lstrip()
+    return text
+
+
+def _merge_framework_markdown_sections(base_markdown: str, arcs_markdown: str) -> str:
+    base = _trim_base_framework_markdown(base_markdown)
+    extra = _strip_leading_markdown_title(arcs_markdown)
+    if not base:
+        return extra
+    if not extra:
+        return base
+    return f"{base.rstrip()}\n\n{extra.lstrip()}"
+
+
+def _sanitize_base_framework_payload(data: dict[str, Any]) -> dict[str, Any]:
+    out = dict(data or {})
+    out.pop("arcs", None)
+    out.pop("volume_overview", None)
+    out.pop("volumes", None)
+    return out
+
+
+def _merge_framework_payloads(
+    base_payload: dict[str, Any],
+    arcs_payload: dict[str, Any],
+) -> dict[str, Any]:
+    merged = _sanitize_base_framework_payload(base_payload)
+    if isinstance(arcs_payload.get("volume_overview"), list):
+        merged["volume_overview"] = arcs_payload["volume_overview"]
+    arcs = arcs_payload.get("arcs")
+    if not isinstance(arcs, list) or not arcs:
+        raise ValueError("二次生成分卷剧情大纲失败：未返回有效的 arcs")
+    merged["arcs"] = arcs
+    return merged
+
+
 def _volume_plan_parse_llm_json_to_dict(raw: str) -> dict[str, Any]:
     """多步容错解析卷章计划 JSON。"""
     s = (raw or "").strip()
@@ -1213,99 +1283,176 @@ class NovelLLMService:
         ):
             yield evt
 
-    async def generate_framework(self, novel: Novel, db: Any = None) -> tuple[str, str]:
-        """返回 (markdown 正文, 尽力解析的 json 字符串)。"""
-        router = self._router(db=db)
-        ref = load_reference_text_for_llm(
-            novel.reference_storage_key,
-            novel.id,
-            novel.reference_public_url,
-        )
-        sys = (
-            "你是资深网文策划与世界观编辑。请输出两部分：1) 完整可读 Markdown 设定与大纲；"
-            "2) 末尾单独一个 JSON 代码块，包含 "
-            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
-            "【框架细化要求】\n"
-            "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
-            "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件（sub_arcs 或 key_events），每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置，禁止宽泛的概括。\n"
-            "参考文本仅借鉴结构与文风，禁止抄袭原句。"
-        )
+    def _framework_style_block_for_novel(self, novel: Novel, db: Any = None) -> str:
+        if not novel.writing_style_id or not db:
+            return ""
+        ws = db.get(WritingStyle, novel.writing_style_id)
+        if not ws:
+            return ""
+        return f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
+
+    def _framework_target_meta(self, novel: Novel) -> tuple[int, int, int]:
         target_chapters = int(getattr(novel, "target_chapters", 0) or 0)
         volume_size = 50
         volume_n = (target_chapters + volume_size - 1) // volume_size if target_chapters > 0 else 0
+        return target_chapters, volume_size, volume_n
 
-        # 获取详细文风
-        ws_block = ""
-        if novel.writing_style_id and db:
-            from app.models.writing_style import WritingStyle
-            ws = db.get(WritingStyle, novel.writing_style_id)
-            if ws:
-                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
-
-        user = (
-            f"书名：{novel.title}\n简介：{novel.intro}\n"
-            f"背景设定：{novel.background}\n文风关键词：{novel.style}\n"
-            f"{ws_block}"
-            f"目标章节数：{target_chapters}\n"
-            f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n"
-            '要求：剧情框架必须按卷拆分 arcs，每个 arc 需明确章节范围（from_chapter/to_chapter 或 chapters: "x-y"），'
-            "并确保覆盖第1章到第N章（N=目标章节数）。\n\n"
-            f"参考文本节选：\n{ref or '（无）'}"
-        )
-        text = await router.chat_text(
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.6,
-            max_tokens=settings.novel_framework_max_tokens,
-            web_search=self._novel_web_search(db, flow="default"),
-            timeout=600.0,
-            **self._bill_kw(db, self._billing_user_id),
-        )
-        parsed = _parse_framework_json_from_reply(text)
-        markdown = _strip_last_fenced_block(text)
-        return markdown or text, json.dumps(parsed, ensure_ascii=False)
-
-    async def regenerate_framework(
-        self, novel: Novel, instruction: str, db: Any = None
-    ) -> tuple[str, str]:
+    async def _generate_framework_base_stage(
+        self,
+        novel: Novel,
+        *,
+        mode: Literal["create", "regen", "characters"],
+        db: Any = None,
+        instruction: str = "",
+        characters: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
         router = self._router(db=db)
         ref = load_reference_text_for_llm(
             novel.reference_storage_key,
             novel.id,
             novel.reference_public_url,
         )
+        target_chapters, _, _ = self._framework_target_meta(novel)
+        ws_block = self._framework_style_block_for_novel(novel, db=db)
+
+        if mode == "create":
+            sys = (
+                "你是资深网文策划与世界观编辑。当前是第一阶段，只生成基础框架：设定、人物、主线，不生成卷级概览，不生成分卷剧情大纲（arcs）。\n"
+                "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
+                "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
+                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                "【Markdown 结构要求】\n"
+                "- 只输出基础框架，建议包含：## 一、世界观与核心设定；## 二、核心人物；## 三、主线剧情与长期矛盾。\n"
+                "【内容要求】\n"
+                "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
+                "- 人物 (characters)：除了姓名和性格，必须提供核心动机(motivation)，并说明阶段目标或成长方向。\n"
+                "- 主线 (main_plot)：明确长期主冲突、阶段性升级路线、终局方向与主要悬念。\n"
+                "参考文本仅借鉴结构与文风，禁止抄袭原句。"
+            )
+            user = (
+                f"书名：{novel.title}\n简介：{novel.intro}\n"
+                f"背景设定：{novel.background}\n文风关键词：{novel.style}\n"
+                f"{ws_block}"
+                f"目标章节数：{target_chapters}\n\n"
+                "本阶段不要写卷级概览，不要写分卷剧情大纲，不要输出 arcs。\n\n"
+                f"参考文本节选：\n{ref or '（无）'}"
+            )
+        elif mode == "regen":
+            fj_block = truncate_framework_json(novel.framework_json or "", 9000)
+            md_block = (novel.framework_markdown or "")[:9000]
+            sys = (
+                "你是资深网文策划与世界观编辑。当前是第一阶段重构，只重写基础框架：设定、人物、主线。"
+                "卷级概览与分卷剧情大纲（arcs）将在第二阶段单独生成。\n"
+                "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
+                "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
+                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                "参考文本仅借鉴结构与文风，禁止抄袭原句。"
+            )
+            user = (
+                f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风关键词：{novel.style}\n"
+                f"{ws_block}"
+                f"目标章节数：{target_chapters}\n\n"
+                f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
+                f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
+                f"【用户修改指令】\n{(instruction or '').strip()}\n\n"
+                "本阶段只处理设定/人物/主线，不要输出卷级概览，不要输出 arcs。\n\n"
+                f"参考文本节选：\n{ref or '（无）'}"
+            )
+        else:
+            fj_block = truncate_framework_json(novel.framework_json or "", 9000)
+            md_block = (novel.framework_markdown or "")[:9000]
+            chars_text = json.dumps(characters or [], ensure_ascii=False)
+            sys = (
+                "你是资深网文策划与世界观编辑。当前是第一阶段人物定向修订，只重写基础框架：设定、人物、主线。"
+                "卷级概览与分卷剧情大纲（arcs）将在第二阶段基于本结果单独生成。\n"
+                "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
+                "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
+                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                "要求：人物列表以用户提供为准；需要时可以补充少量关键配角，但不得删除用户给出的主角。"
+            )
+            user = (
+                f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
+                f"{ws_block}"
+                f"目标章节数：{target_chapters}\n\n"
+                f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
+                f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
+                f"【用户确认后的人物列表（JSON）】\n{chars_text}\n\n"
+                "请将人物变更融入基础框架：\n"
+                "- 若人物改名，需全局替换并保持一致\n"
+                "- traits 要落到动机/行为模式/关系张力上\n"
+                "- 本阶段不要输出卷级概览，不要输出 arcs"
+            )
+
+        text = await router.chat_text(
+            messages=[
+                {"role": "system", "content": sys},
+                {"role": "user", "content": user},
+            ],
+            temperature=0.55 if mode != "create" else 0.6,
+            max_tokens=settings.novel_framework_max_tokens,
+            web_search=self._novel_web_search(db, flow="default"),
+            timeout=600.0,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+        parsed = _sanitize_base_framework_payload(_parse_framework_json_from_reply(text))
+        markdown = _trim_base_framework_markdown(_strip_last_fenced_block(text) or text)
+        return markdown or text, parsed
+
+    async def _generate_framework_arcs_stage(
+        self,
+        novel: Novel,
+        *,
+        base_markdown: str,
+        base_payload: dict[str, Any],
+        db: Any = None,
+        instruction: str = "",
+        characters: list[dict[str, Any]] | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        router = self._router(db=db)
+        ref = load_reference_text_for_llm(
+            novel.reference_storage_key,
+            novel.id,
+            novel.reference_public_url,
+        )
+        target_chapters, volume_size, volume_n = self._framework_target_meta(novel)
+        ws_block = self._framework_style_block_for_novel(novel, db=db)
+        base_json_text = json.dumps(base_payload, ensure_ascii=False)
+        chars_block = (
+            f"\n【最新人物列表（JSON）】\n{json.dumps(characters or [], ensure_ascii=False)}\n"
+            if characters is not None
+            else ""
+        )
+        instruction_block = (
+            f"\n【需要同步遵守的修改指令】\n{instruction.strip()}\n"
+            if instruction.strip()
+            else ""
+        )
         sys = (
-            "你是资深网文策划与世界观编辑。你将基于现有框架草案，并严格执行用户的自然语言修改指令，"
-            "输出一版新的完整框架。\n"
-            "请输出两部分：1) 完整可读 Markdown 设定与大纲；2) 末尾单独一个 JSON 代码块，包含 "
-            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
-            "【框架细化要求】\n"
-            "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
-            "- 人物 (characters)：除了姓名和性格，必须提供“核心动机(motivation)”与各阶段目标。\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件（sub_arcs 或 key_events），每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置。\n"
+            "你是资深网文策划与长篇连载分卷编辑。当前是第二阶段：只负责补完「卷级概览 + 分卷剧情大纲（Arcs）」。\n"
+            "你必须严格沿用既有的世界观、人物、主线，不得重写 world_rules、main_plot、characters、themes，只能在其基础上细化长篇推进节奏。\n"
+            "请输出两部分：1) 只包含新增部分的 Markdown 片段，且只写 `## 四、卷级概览` 与 `## 五、分卷剧情大纲 (Arcs)` 两节；"
+            "2) 末尾单独一个 JSON 代码块，只包含 volume_overview 与 arcs 两个键，其中 arcs 必填。\n"
+            "【卷级概览要求】\n"
+            f"- 默认每卷约 {volume_size} 章；总卷数约 {volume_n if volume_n else '请按目标章节数估算'}。\n"
+            "- 用卷为粒度概括每卷的主目标、核心冲突、阶段成果、卷末钩子。\n"
+            "【Arcs 细化要求】\n"
+            "- arcs 必须覆盖第1章到第N章（N=目标章节数）；每个 arc 需明确章节范围（from_chapter/to_chapter 或 chapters: \"x-y\"）。\n"
+            "- 每个 arc 必须进一步拆解为每 10 章一个固定子阶段（sub_arcs 或 key_events）。\n"
+            "- 每个 10 章子阶段必须足够详细，后半程的细节密度不能下降，禁止越往后越简写。\n"
+            "- 每个子阶段应写清：具体事件推进、人物关系变化、心理转折、伏笔投放/回收、阶段阻碍与阶段结果。\n"
+            "- arcs 的关键节点必须能体现主角成长、冲突升级、资源变化与代价积累。\n"
             "参考文本仅借鉴结构与文风，禁止抄袭原句。"
         )
-        fj_block = truncate_framework_json(novel.framework_json or "", 9000)
-        md_block = (novel.framework_markdown or "")[:9000]
-
-        # 获取详细文风
-        ws_block = ""
-        if novel.writing_style_id and db:
-            from app.models.writing_style import WritingStyle
-            ws = db.get(WritingStyle, novel.writing_style_id)
-            if ws:
-                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
-
         user = (
             f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风关键词：{novel.style}\n"
             f"{ws_block}"
-            f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
-            f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
-            f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
-            f"【用户修改指令】\n{(instruction or '').strip()}\n\n"
+            f"目标章节数：{target_chapters}\n"
+            f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n\n"
+            f"【第一阶段基础框架 Markdown】\n{base_markdown or '（空）'}\n\n"
+            f"【第一阶段基础框架 JSON】\n{base_json_text}\n"
+            f"{instruction_block}"
+            f"{chars_block}\n"
+            "请只补全卷级概览与 arcs，不要重复输出前面已经定好的设定/人物/主线全文。\n\n"
             f"参考文本节选：\n{ref or '（无）'}"
         )
         text = await router.chat_text(
@@ -1321,60 +1468,83 @@ class NovelLLMService:
         )
         parsed = _parse_framework_json_from_reply(text)
         markdown = _strip_last_fenced_block(text)
-        return markdown or text, json.dumps(parsed, ensure_ascii=False)
+        return markdown or text, parsed
+
+    async def generate_framework(
+        self,
+        novel: Novel,
+        db: Any = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> tuple[str, str]:
+        """返回 (markdown 正文, 尽力解析的 json 字符串)。"""
+        _notify_progress(progress_callback, "第一阶段：生成设定、人物与主线")
+        base_markdown, base_payload = await self._generate_framework_base_stage(
+            novel,
+            mode="create",
+            db=db,
+        )
+        _notify_progress(progress_callback, "第二阶段：生成卷级概览与分卷剧情大纲（Arcs）")
+        arcs_markdown, arcs_payload = await self._generate_framework_arcs_stage(
+            novel,
+            base_markdown=base_markdown,
+            base_payload=base_payload,
+            db=db,
+        )
+        final_markdown = _merge_framework_markdown_sections(base_markdown, arcs_markdown)
+        final_payload = _merge_framework_payloads(base_payload, arcs_payload)
+        return final_markdown, json.dumps(final_payload, ensure_ascii=False)
+
+    async def regenerate_framework(
+        self,
+        novel: Novel,
+        instruction: str,
+        db: Any = None,
+        progress_callback: Callable[[str], None] | None = None,
+    ) -> tuple[str, str]:
+        _notify_progress(progress_callback, "第一阶段：按指令重写设定、人物与主线")
+        base_markdown, base_payload = await self._generate_framework_base_stage(
+            novel,
+            mode="regen",
+            db=db,
+            instruction=instruction,
+        )
+        _notify_progress(progress_callback, "第二阶段：基于新主线重建卷级概览与分卷剧情大纲（Arcs）")
+        arcs_markdown, arcs_payload = await self._generate_framework_arcs_stage(
+            novel,
+            base_markdown=base_markdown,
+            base_payload=base_payload,
+            db=db,
+            instruction=instruction,
+        )
+        final_markdown = _merge_framework_markdown_sections(base_markdown, arcs_markdown)
+        final_payload = _merge_framework_payloads(base_payload, arcs_payload)
+        return final_markdown, json.dumps(final_payload, ensure_ascii=False)
 
     async def update_framework_characters(
-        self, novel: Novel, characters: list[dict[str, Any]], db: Any = None
+        self,
+        novel: Novel,
+        characters: list[dict[str, Any]],
+        db: Any = None,
+        progress_callback: Callable[[str], None] | None = None,
     ) -> tuple[str, str]:
-        router = self._router(db=db)
-        sys = (
-            "你是资深网文策划与世界观编辑。你将基于现有框架草案，对人物设定做定向修订，"
-            "并将修订同步反映到剧情大纲、人物关系与冲突设计中。\n"
-            "请输出两部分：1) 完整可读 Markdown 设定与大纲；2) 末尾单独一个 JSON 代码块，包含 "
-            "world_rules, main_plot, arcs, characters[{name,role,traits,motivation}], themes 等键。\n"
-            "【框架细化要求】\n"
-            "- 剧情分卷 (arcs)：每个 arc 必须进一步拆解为每 10 章为一个固定的子阶段/关键事件，每个子阶段的概括必须非常详细（约 300 字左右），涵盖具体情节转折、人物心理变化及伏笔设置。\n"
-            "要求：人物列表以用户提供为准；需要时可以补充少量关键配角，但不得删除用户给出的主角。"
+        _notify_progress(progress_callback, "第一阶段：按新人物设定重写基础框架")
+        base_markdown, base_payload = await self._generate_framework_base_stage(
+            novel,
+            mode="characters",
+            db=db,
+            characters=characters,
         )
-        fj_block = truncate_framework_json(novel.framework_json or "", 9000)
-        md_block = (novel.framework_markdown or "")[:9000]
-        chars_text = json.dumps(characters or [], ensure_ascii=False)
-
-        # 获取详细文风
-        ws_block = ""
-        if novel.writing_style_id and db:
-            from app.models.writing_style import WritingStyle
-
-            ws = db.get(WritingStyle, novel.writing_style_id)
-            if ws:
-                ws_block = f"\n【写作风格深度定制要求】\n{_writing_style_block(ws)}\n"
-
-        user = (
-            f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风：{novel.style}\n"
-            f"{ws_block}"
-            f"目标章节数：{int(getattr(novel, 'target_chapters', 0) or 0)}\n\n"
-            f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
-            f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
-            f"【用户确认后的人物列表（JSON）】\n{chars_text}\n\n"
-            "请将人物变更融入框架：\n"
-            "- 若人物改名，需全局替换并保持一致\n"
-            "- traits 要落到动机/行为模式/关系张力上\n"
-            "- arcs 的关键节点应能体现主角成长与冲突升级"
+        _notify_progress(progress_callback, "第二阶段：按新人物设定重建卷级概览与分卷剧情大纲（Arcs）")
+        arcs_markdown, arcs_payload = await self._generate_framework_arcs_stage(
+            novel,
+            base_markdown=base_markdown,
+            base_payload=base_payload,
+            db=db,
+            characters=characters,
         )
-        text = await router.chat_text(
-            messages=[
-                {"role": "system", "content": sys},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.55,
-            max_tokens=settings.novel_framework_max_tokens,
-            web_search=self._novel_web_search(db, flow="default"),
-            timeout=600.0,
-            **self._bill_kw(db, self._billing_user_id),
-        )
-        parsed = _parse_framework_json_from_reply(text)
-        markdown = _strip_last_fenced_block(text)
-        return markdown or text, json.dumps(parsed, ensure_ascii=False)
+        final_markdown = _merge_framework_markdown_sections(base_markdown, arcs_markdown)
+        final_payload = _merge_framework_payloads(base_payload, arcs_payload)
+        return final_markdown, json.dumps(final_payload, ensure_ascii=False)
 
     async def generate_volume_chapter_plan_batch_json(
         self,

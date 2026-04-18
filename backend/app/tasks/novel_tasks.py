@@ -97,6 +97,26 @@ def _task_set_terminal(
         pass
 
 
+def _make_generation_progress_logger(
+    db,
+    *,
+    novel_id: str,
+    batch_id: str,
+    event: str,
+):
+    def _log(message: str) -> None:
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event=event,
+            message=message,
+        )
+        db.commit()
+
+    return _log
+
+
 def _novel_mem_delta_zkey(novel_id: str) -> str:
     return f"vocalflow:novel:mem_delta:{novel_id}"
 
@@ -1475,13 +1495,22 @@ def novel_ai_create_and_start_task(
 
 
 def _regenerate_framework_sync(
-    llm: NovelLLMService, novel: Novel, instruction: str, db
+    llm: NovelLLMService,
+    novel: Novel,
+    instruction: str,
+    db,
+    progress_callback=None,
 ) -> tuple[str, str]:
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(
-            llm.regenerate_framework(novel, instruction, db=db)
+            llm.regenerate_framework(
+                novel,
+                instruction,
+                db=db,
+                progress_callback=progress_callback,
+            )
         )
     finally:
         asyncio.set_event_loop(None)
@@ -1489,13 +1518,22 @@ def _regenerate_framework_sync(
 
 
 def _update_framework_characters_sync(
-    llm: NovelLLMService, novel: Novel, characters: list[dict[str, Any]], db
+    llm: NovelLLMService,
+    novel: Novel,
+    characters: list[dict[str, Any]],
+    db,
+    progress_callback=None,
 ) -> tuple[str, str]:
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(
-            llm.update_framework_characters(novel, characters, db=db)
+            llm.update_framework_characters(
+                novel,
+                characters,
+                db=db,
+                progress_callback=progress_callback,
+            )
         )
     finally:
         asyncio.set_event_loop(None)
@@ -1564,7 +1602,13 @@ def novel_generate_framework_task(
         
         llm = NovelLLMService(billing_user_id=user_id)
         from app.services.novel_auto_pipeline import _generate_framework_sync
-        md, fj = _generate_framework_sync(llm, n, db)
+        progress_logger = _make_generation_progress_logger(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_generate_progress",
+        )
+        md, fj = _generate_framework_sync(llm, n, db, progress_callback=progress_logger)
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False
@@ -1675,7 +1719,19 @@ def novel_framework_regen_task(
             _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
             return {"status": "not_found", "novel_id": novel_id}
         llm = NovelLLMService(billing_user_id=user_id)
-        md, fj = _regenerate_framework_sync(llm, n, instruction, db)
+        progress_logger = _make_generation_progress_logger(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_regen_progress",
+        )
+        md, fj = _regenerate_framework_sync(
+            llm,
+            n,
+            instruction,
+            db,
+            progress_callback=progress_logger,
+        )
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False
@@ -1786,7 +1842,19 @@ def novel_framework_update_characters_task(
             _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
             return {"status": "not_found", "novel_id": novel_id}
         llm = NovelLLMService(billing_user_id=user_id)
-        md, fj = _update_framework_characters_sync(llm, n, characters or [], db)
+        progress_logger = _make_generation_progress_logger(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_characters_progress",
+        )
+        md, fj = _update_framework_characters_sync(
+            llm,
+            n,
+            characters or [],
+            db,
+            progress_callback=progress_logger,
+        )
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False

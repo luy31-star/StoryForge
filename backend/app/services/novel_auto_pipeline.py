@@ -34,12 +34,14 @@ logger = logging.getLogger(__name__)
 
 
 def _generate_framework_sync(
-    llm: NovelLLMService, novel: Novel, db: Session
+    llm: NovelLLMService, novel: Novel, db: Session, progress_callback=None
 ) -> tuple[str, str]:
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
-        return loop.run_until_complete(llm.generate_framework(novel, db=db))
+        return loop.run_until_complete(
+            llm.generate_framework(novel, db=db, progress_callback=progress_callback)
+        )
     finally:
         asyncio.set_event_loop(None)
         loop.close()
