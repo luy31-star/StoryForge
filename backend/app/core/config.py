@@ -60,6 +60,7 @@ class Settings(BaseSettings):
     alipay_public_key_path: str = ""
     alipay_return_url: str = ""
     alipay_notify_url: str = ""
+    alipay_seller_id: str = ""
     alipay_sign_type: str = "RSA2"
     alipay_reconcile_enabled: bool = False
     alipay_reconcile_interval_minutes: int = 5

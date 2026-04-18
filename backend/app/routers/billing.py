@@ -6,6 +6,7 @@ import json
 import time
 import uuid
 from datetime import datetime
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import PlainTextResponse
@@ -19,7 +20,14 @@ from app.core.deps import get_current_admin, get_current_user
 from app.models.recharge_order import RechargeOrder
 from app.models.user import ModelPrice, PointsTransaction, User
 from app.services.alipay_client import AlipayClient
-from app.services.recharge_service import apply_recharge_paid, fmt_amount_cny
+from app.services.recharge_service import (
+    MIN_CUSTOM_RECHARGE_POINTS,
+    apply_recharge_paid,
+    custom_points_step,
+    fmt_amount_cny,
+    get_recharge_packages_payload,
+    resolve_recharge_plan,
+)
 
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 # 以下 admin_router 路由均通过 Depends(get_current_admin) 校验管理员身份
@@ -68,22 +76,66 @@ class AlipayRechargeCreateOut(BaseModel):
     out_trade_no: str
     amount_cny: int
     points: int
+    package_id: str | None = None
     form_html: str
+
+
+class RechargePackageOut(BaseModel):
+    id: str
+    title: str
+    points: int
+    amount_cny: int
+    badge: str
+    description: str
+    price_per_100_points: float
+
+
+class RechargeConfigOut(BaseModel):
+    min_custom_points: int
+    custom_points_step: int
+    base_points_per_cny: int
+    packages: list[RechargePackageOut]
+
+
+@router.get("/recharge/config", response_model=RechargeConfigOut)
+def get_recharge_config() -> RechargeConfigOut:
+    return RechargeConfigOut(
+        min_custom_points=MIN_CUSTOM_RECHARGE_POINTS,
+        custom_points_step=custom_points_step(),
+        base_points_per_cny=int(settings.points_per_cny or 10),
+        packages=[RechargePackageOut(**item) for item in get_recharge_packages_payload()],
+    )
+
+
+class AlipayRechargeCreateBody(BaseModel):
+    package_id: str | None = Field(None, max_length=64)
+    custom_points: int | None = Field(None, ge=1, le=100_000)
+
+
+def _append_return_order(url: str, out_trade_no: str) -> str:
+    parts = urlsplit(url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["sf_order"] = out_trade_no
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _resolve_return_url(request: Request, out_trade_no: str) -> str:
+    configured = (settings.alipay_return_url or "").strip()
+    base = configured or f"{str(request.base_url).rstrip('/')}/recharge"
+    return _append_return_order(base, out_trade_no)
 
 
 @router.post("/recharge/alipay-form", response_model=AlipayRechargeCreateOut)
 def create_alipay_recharge_form(
-    body: RechargeBody,
+    body: AlipayRechargeCreateBody,
+    request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> AlipayRechargeCreateOut:
-    if not settings.alipay_notify_url or not settings.alipay_return_url:
+    if not settings.alipay_notify_url:
         raise HTTPException(500, "支付未配置，请联系管理员")
 
-    amount_cny = int(body.amount_cny)
-    points = amount_cny * int(settings.points_per_cny)
-    if points <= 0:
-        raise HTTPException(400, "充值金额无效")
+    points, amount_cny, package_id = resolve_recharge_plan(body.package_id, body.custom_points)
 
     out_trade_no = f"sf{int(time.time())}{uuid.uuid4().hex[:10]}"
     order = RechargeOrder(
@@ -97,18 +149,19 @@ def create_alipay_recharge_form(
     db.add(order)
     db.commit()
 
-    subject = f"StoryForge 积分充值 {amount_cny} 元"
+    subject = f"StoryForge 积分充值 {points} 积分"
     form_html = AlipayClient().page_pay_form(
         out_trade_no=out_trade_no,
         total_amount=fmt_amount_cny(amount_cny),
         subject=subject,
         notify_url=settings.alipay_notify_url,
-        return_url=settings.alipay_return_url,
+        return_url=_resolve_return_url(request, out_trade_no),
     )
     return AlipayRechargeCreateOut(
         out_trade_no=out_trade_no,
         amount_cny=amount_cny,
         points=points,
+        package_id=package_id,
         form_html=form_html,
     )
 
@@ -123,15 +176,7 @@ class RechargeOrderOut(BaseModel):
     paid_at: datetime | None = None
 
 
-@router.get("/recharge/orders/{out_trade_no}", response_model=RechargeOrderOut)
-def get_recharge_order(
-    out_trade_no: str,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-) -> RechargeOrderOut:
-    row = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
-    if not row or row.user_id != user.id:
-        raise HTTPException(404, "订单不存在")
+def _serialize_recharge_order(row: RechargeOrder) -> RechargeOrderOut:
     return RechargeOrderOut(
         out_trade_no=row.out_trade_no,
         amount_cny=int(row.amount_cny or 0),
@@ -141,6 +186,52 @@ def get_recharge_order(
         created_at=row.created_at,
         paid_at=row.paid_at,
     )
+
+
+@router.get("/recharge/orders/{out_trade_no}", response_model=RechargeOrderOut)
+def get_recharge_order(
+    out_trade_no: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> RechargeOrderOut:
+    row = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
+    if not row or row.user_id != user.id:
+        raise HTTPException(404, "订单不存在")
+    return _serialize_recharge_order(row)
+
+
+@router.post("/recharge/orders/{out_trade_no}/refresh", response_model=RechargeOrderOut)
+def refresh_recharge_order(
+    out_trade_no: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> RechargeOrderOut:
+    order = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
+    if not order or order.user_id != user.id:
+        raise HTTPException(404, "订单不存在")
+    if order.status in ("paid", "closed"):
+        return _serialize_recharge_order(order)
+
+    q = AlipayClient().trade_query_sync(order.out_trade_no)
+    order.query_raw = json.dumps(q.raw, ensure_ascii=False)
+    order.reconciled_at = datetime.utcnow()
+    order.trade_status = q.trade_status or order.trade_status
+    order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
+
+    if q.total_amount and q.total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+        db.commit()
+        raise HTTPException(400, "订单金额校验失败")
+
+    if q.trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
+        apply_recharge_paid(db, order, q.trade_status, q.alipay_trade_no, q.raw, via="query")
+    elif q.trade_status in ("TRADE_CLOSED",):
+        order.status = "closed"
+    elif order.status == "created":
+        order.status = "pending"
+
+    db.commit()
+    db.refresh(order)
+    return _serialize_recharge_order(order)
 
 
 @router.post("/recharge/alipay-notify")
@@ -153,6 +244,13 @@ async def alipay_notify(request: Request, db: Session = Depends(get_db)):
     client = AlipayClient()
     if not client.verify(params):
         return PlainTextResponse("failure")
+    app_id = params.get("app_id") or ""
+    if app_id and app_id != settings.alipay_app_id:
+        return PlainTextResponse("failure")
+    if settings.alipay_seller_id:
+        seller_id = params.get("seller_id") or ""
+        if seller_id != settings.alipay_seller_id:
+            return PlainTextResponse("failure")
 
     out_trade_no = params.get("out_trade_no") or ""
     trade_status = params.get("trade_status") or ""
@@ -206,7 +304,7 @@ def admin_reconcile_one(
     order.trade_status = q.trade_status or order.trade_status
     order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
 
-    if q.total_amount and q.total_amount != _fmt_amount(int(order.amount_cny or 0)):
+    if q.total_amount and q.total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
         db.commit()
         raise HTTPException(400, "金额不匹配，已记录查询结果")
 

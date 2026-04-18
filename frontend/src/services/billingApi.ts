@@ -1,21 +1,64 @@
 import { apiFetch } from "@/services/api";
 
-export async function createAlipayRechargeForm(amountCny: number) {
+export type RechargePackage = {
+  id: string;
+  title: string;
+  points: number;
+  amount_cny: number;
+  badge: string;
+  description: string;
+  price_per_100_points: number;
+};
+
+export type RechargeConfig = {
+  min_custom_points: number;
+  custom_points_step: number;
+  base_points_per_cny: number;
+  packages: RechargePackage[];
+};
+
+export async function getRechargeConfig() {
+  const r = await apiFetch("/api/billing/recharge/config");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<RechargeConfig>;
+}
+
+export async function createAlipayRechargeForm(body: {
+  package_id?: string;
+  custom_points?: number;
+}) {
   const r = await apiFetch("/api/billing/recharge/alipay-form", {
     method: "POST",
-    body: JSON.stringify({ amount_cny: amountCny }),
+    body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{
     out_trade_no: string;
     amount_cny: number;
     points: number;
+    package_id?: string | null;
     form_html: string;
   }>;
 }
 
 export async function getRechargeOrder(outTradeNo: string) {
   const r = await apiFetch(`/api/billing/recharge/orders/${encodeURIComponent(outTradeNo)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    out_trade_no: string;
+    amount_cny: number;
+    points: number;
+    status: string;
+    trade_status: string;
+    created_at: string;
+    paid_at?: string | null;
+  }>;
+}
+
+export async function refreshRechargeOrder(outTradeNo: string) {
+  const r = await apiFetch(`/api/billing/recharge/orders/${encodeURIComponent(outTradeNo)}/refresh`, {
+    method: "POST",
+  });
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<{
     out_trade_no: string;
