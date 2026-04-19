@@ -6,6 +6,8 @@ import { fetchMe, getRegistrationMode, register as registerApi, sendOtp } from "
 import { useAuthStore } from "@/stores/authStore";
 import { Loader2 } from "lucide-react";
 
+const USERNAME_PATTERN = /^[A-Za-z0-9]+$/;
+
 export function Register() {
   const nav = useNavigate();
   const setAuth = useAuthStore((s) => s.setAuth);
@@ -65,11 +67,16 @@ export function Register() {
   async function onSubmit(e: React.FormEvent) {
     e.preventDefault();
     setErr(null);
+    const normalizedUsername = username.trim();
+    if (!USERNAME_PATTERN.test(normalizedUsername)) {
+      setErr("用户名只允许输入英文字母和数字");
+      return;
+    }
     setBusy(true);
     try {
       const { access_token } = await registerApi(
         email.trim(),
-        username.trim(),
+        normalizedUsername,
         inviteCode.trim(),
         otp.trim(),
         password
@@ -135,13 +142,17 @@ export function Register() {
               <input
                 className="h-10 w-full rounded-md border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
                 value={username}
-                onChange={(e) => setUsername(e.target.value)}
+                onChange={(e) => {
+                  const next = e.target.value.replace(/[^A-Za-z0-9]/g, "");
+                  setUsername(next);
+                }}
                 autoComplete="username"
-                placeholder="请设置您的唯一用户名"
+                placeholder="仅限英文和数字"
                 minLength={2}
                 maxLength={64}
                 required
               />
+              <p className="text-xs text-muted-foreground">用户名只允许英文字母和数字。</p>
             </div>
             <div className="space-y-2">
               <label className="text-sm font-medium">邀请码</label>

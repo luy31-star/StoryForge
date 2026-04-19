@@ -1,5 +1,6 @@
 """注册 / 登录 / 当前用户。"""
 
+import re
 from fastapi import APIRouter, Depends, HTTPException, Request, Body
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import func, or_
@@ -23,6 +24,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9]+$")
 
 
 class RegisterBody(BaseModel):
@@ -94,6 +96,9 @@ async def register(
     email = data.email.strip().lower()
     username = data.username.strip()
     invite_code_raw = (data.invite_code or "").strip().upper()
+
+    if not USERNAME_PATTERN.fullmatch(username):
+        raise HTTPException(400, "用户名只允许输入英文字母和数字")
     
     # 1. 验证 OTP
     saved_otp = await OTPHelper.get_otp(email)

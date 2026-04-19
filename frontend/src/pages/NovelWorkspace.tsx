@@ -1406,11 +1406,11 @@ export function NovelWorkspace() {
   async function runConfirmedLlmAction() {
     const action = llmConfirmActionRef.current;
     if (!action) return;
+    llmConfirmActionRef.current = null;
+    setLlmConfirm(null);
     setLlmConfirmBusy(true);
     try {
       await action();
-      llmConfirmActionRef.current = null;
-      setLlmConfirm(null);
     } finally {
       setLlmConfirmBusy(false);
     }
