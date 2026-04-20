@@ -816,16 +816,11 @@ export function NovelWorkspace() {
     if (!id) return;
     const vs = await listVolumes(id);
     setVolumes(vs);
-    if (vs.length > 0) {
-      const keep =
-        selectedVolumeId && vs.some((x) => x.id === selectedVolumeId)
-          ? selectedVolumeId
-          : vs[0].id;
-      setSelectedVolumeId(keep);
-    } else {
-      setSelectedVolumeId("");
-    }
-  }, [id, selectedVolumeId]);
+    setSelectedVolumeId((current) => {
+      if (vs.length === 0) return "";
+      return current && vs.some((x) => x.id === current) ? current : vs[0].id;
+    });
+  }, [id]);
 
   useEffect(() => {
     if (!id) return;
@@ -871,16 +866,6 @@ export function NovelWorkspace() {
     void reloadGenerationLogs();
   }, [id]);
 
-  useEffect(() => {
-    if (!chapters.length) {
-      setSelectedChapterId("");
-      return;
-    }
-    if (!selectedChapterId || !chapters.some((x) => x.id === selectedChapterId)) {
-      setSelectedChapterId(chapters[0].id);
-    }
-  }, [chapters, selectedChapterId]);
-
   const filteredChapters = useMemo(() => {
     if (!volumes.length) return chapters;
     const vid = chapterVolumeId || (volumes.length > 0 ? volumes[0].id : "");
@@ -893,16 +878,24 @@ export function NovelWorkspace() {
   }, [chapters, volumes, chapterVolumeId]);
 
   useEffect(() => {
-    if (!selectedChapterId || !chapters.length || !volumes.length) return;
-    const ch = chapters.find((x) => x.id === selectedChapterId);
-    if (!ch) return;
-    const v = volumes.find(
-      (x) => ch.chapter_no >= x.from_chapter && ch.chapter_no <= x.to_chapter
-    );
-    if (v && v.id !== chapterVolumeId) {
-      setChapterVolumeId(v.id);
+    if (!volumes.length) {
+      setChapterVolumeId("");
+      return;
     }
-  }, [selectedChapterId, chapters, volumes, chapterVolumeId]);
+    if (!chapterVolumeId || !volumes.some((x) => x.id === chapterVolumeId)) {
+      setChapterVolumeId(volumes[0].id);
+    }
+  }, [volumes, chapterVolumeId]);
+
+  useEffect(() => {
+    if (!filteredChapters.length) {
+      setSelectedChapterId("");
+      return;
+    }
+    if (!selectedChapterId || !filteredChapters.some((x) => x.id === selectedChapterId)) {
+      setSelectedChapterId(filteredChapters[0].id);
+    }
+  }, [filteredChapters, selectedChapterId]);
 
   const selectedChapter = chapters.find((c) => c.id === selectedChapterId) ?? null;
   const selectedChapterWordCount = editContent.trim()
