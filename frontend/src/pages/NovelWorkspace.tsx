@@ -866,16 +866,20 @@ export function NovelWorkspace() {
     void reloadGenerationLogs();
   }, [id]);
 
+  const activeChapterVolume = useMemo(() => {
+    if (!chapterVolumeId) return null;
+    return volumes.find((x) => x.id === chapterVolumeId) ?? null;
+  }, [volumes, chapterVolumeId]);
+
   const filteredChapters = useMemo(() => {
     if (!volumes.length) return chapters;
-    const vid = chapterVolumeId || (volumes.length > 0 ? volumes[0].id : "");
-    if (!vid) return chapters;
-    const v = volumes.find((x) => x.id === vid);
-    if (!v) return chapters;
+    if (!activeChapterVolume) return [];
     return chapters.filter(
-      (c) => c.chapter_no >= v.from_chapter && c.chapter_no <= v.to_chapter
+      (c) =>
+        c.chapter_no >= activeChapterVolume.from_chapter &&
+        c.chapter_no <= activeChapterVolume.to_chapter
     );
-  }, [chapters, volumes, chapterVolumeId]);
+  }, [chapters, volumes, activeChapterVolume]);
 
   useEffect(() => {
     if (!volumes.length) {
@@ -897,7 +901,8 @@ export function NovelWorkspace() {
     }
   }, [filteredChapters, selectedChapterId]);
 
-  const selectedChapter = chapters.find((c) => c.id === selectedChapterId) ?? null;
+  const selectedChapter =
+    filteredChapters.find((c) => c.id === selectedChapterId) ?? null;
   const selectedChapterWordCount = editContent.trim()
     ? editContent.trim().replace(/\s+/g, "").length
     : 0;
@@ -3998,9 +4003,12 @@ export function NovelWorkspace() {
                         <button
                           key={v.id}
                           type="button"
-                          onClick={() => setChapterVolumeId(v.id)}
+                          onClick={() => {
+                            setChapterVolumeId(v.id);
+                            setSelectedChapterId("");
+                          }}
                           className={`rounded-full px-3 py-1 text-[10px] transition-all border font-bold ${
-                            (chapterVolumeId || volumes[0].id) === v.id
+                            chapterVolumeId === v.id
                               ? "bg-primary text-primary-foreground border-primary shadow-sm"
                               : "bg-background/40 text-foreground/60 dark:text-muted-foreground border-border/50 hover:bg-muted/30"
                           }`}
