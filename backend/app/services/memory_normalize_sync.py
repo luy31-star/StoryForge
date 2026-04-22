@@ -98,10 +98,14 @@ def _skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             name = str(item.get("name") or "").strip()
             inf, is_active = _parse_influence_active(item)
+            introduced_chapter = coerce_int(item.get("introduced_chapter"), default=0)
+            last_used_chapter = coerce_int(item.get("last_used_chapter"), default=0)
+            expired_raw = item.get("expired_chapter")
+            expired_chapter = coerce_int(expired_raw, default=0) if expired_raw is not None else None
             rest = {
                 k: v
                 for k, v in item.items()
-                if k not in ("name", "influence_score", "is_active")
+                if k not in ("name", "influence_score", "is_active", "introduced_chapter", "last_used_chapter", "expired_chapter")
             }
             out.append(
                 {
@@ -110,6 +114,9 @@ def _skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "detail_json": json.dumps(rest, ensure_ascii=False),
                     "influence_score": inf,
                     "is_active": is_active,
+                    "introduced_chapter": introduced_chapter,
+                    "last_used_chapter": last_used_chapter,
+                    "expired_chapter": expired_chapter,
                 }
             )
         else:
@@ -122,6 +129,9 @@ def _skill_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "detail_json": "{}",
                         "influence_score": 0,
                         "is_active": True,
+                        "introduced_chapter": 0,
+                        "last_used_chapter": 0,
+                        "expired_chapter": None,
                     }
                 )
     return out
@@ -136,10 +146,14 @@ def _item_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             name = _inventory_label_from_detail(item)
             inf, is_active = _parse_influence_active(item)
+            introduced_chapter = coerce_int(item.get("introduced_chapter"), default=0)
+            last_used_chapter = coerce_int(item.get("last_used_chapter"), default=0)
+            expired_raw = item.get("expired_chapter")
+            expired_chapter = coerce_int(expired_raw, default=0) if expired_raw is not None else None
             rest = {
                 k: v
                 for k, v in item.items()
-                if k not in ("influence_score", "is_active")
+                if k not in ("influence_score", "is_active", "introduced_chapter", "last_used_chapter", "expired_chapter")
             }
             out.append(
                 {
@@ -148,6 +162,9 @@ def _item_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                     "detail_json": json.dumps(rest, ensure_ascii=False),
                     "influence_score": inf,
                     "is_active": is_active,
+                    "introduced_chapter": introduced_chapter,
+                    "last_used_chapter": last_used_chapter,
+                    "expired_chapter": expired_chapter,
                 }
             )
         else:
@@ -160,6 +177,9 @@ def _item_rows(payload: dict[str, Any]) -> list[dict[str, Any]]:
                         "detail_json": "{}",
                         "influence_score": 0,
                         "is_active": True,
+                        "introduced_chapter": 0,
+                        "last_used_chapter": 0,
+                        "expired_chapter": None,
                     }
                 )
     return out
@@ -385,6 +405,9 @@ def replace_normalized_from_payload(
                 detail_json=row["detail_json"],
                 influence_score=int(row.get("influence_score") or 0),
                 is_active=bool(row.get("is_active", True)),
+                introduced_chapter=int(row.get("introduced_chapter") or 0),
+                last_used_chapter=int(row.get("last_used_chapter") or 0),
+                expired_chapter=row.get("expired_chapter"),
             )
         )
     for row in _item_rows(data):
@@ -397,6 +420,9 @@ def replace_normalized_from_payload(
                 detail_json=row["detail_json"],
                 influence_score=int(row.get("influence_score") or 0),
                 is_active=bool(row.get("is_active", True)),
+                introduced_chapter=int(row.get("introduced_chapter") or 0),
+                last_used_chapter=int(row.get("last_used_chapter") or 0),
+                expired_chapter=row.get("expired_chapter"),
             )
         )
     for row in _pet_rows(data):
@@ -498,6 +524,41 @@ def replace_normalized_from_payload(
             )
         )
 
+    # 过期清理：expired_chapter <= 当前最新章节号 且 is_active=True 的记录，自动设置 is_active=False
+    latest_chapter = (
+        db.query(NovelMemoryNormChapter.chapter_no)
+        .filter(NovelMemoryNormChapter.novel_id == novel_id)
+        .order_by(NovelMemoryNormChapter.chapter_no.desc())
+        .limit(1)
+        .scalar()
+    ) or 0
+    if latest_chapter > 0:
+        expired_items = (
+            db.query(NovelMemoryNormItem)
+            .filter(
+                NovelMemoryNormItem.novel_id == novel_id,
+                NovelMemoryNormItem.is_active == True,
+                NovelMemoryNormItem.expired_chapter != None,
+                NovelMemoryNormItem.expired_chapter <= latest_chapter,
+            )
+            .all()
+        )
+        for item_row in expired_items:
+            item_row.is_active = False
+
+        expired_skills = (
+            db.query(NovelMemoryNormSkill)
+            .filter(
+                NovelMemoryNormSkill.novel_id == novel_id,
+                NovelMemoryNormSkill.is_active == True,
+                NovelMemoryNormSkill.expired_chapter != None,
+                NovelMemoryNormSkill.expired_chapter <= latest_chapter,
+            )
+            .all()
+        )
+        for skill_row in expired_skills:
+            skill_row.is_active = False
+
 
 def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | None:
     """从表组装为前端可用的嵌套结构；若无 outline 行则返回 None。"""
@@ -558,6 +619,9 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
                 "aliases": aliases,
                 "influence_score": getattr(s, "influence_score", 0) or 0,
                 "is_active": getattr(s, "is_active", True),
+                "introduced_chapter": getattr(s, "introduced_chapter", 0) or 0,
+                "last_used_chapter": getattr(s, "last_used_chapter", 0) or 0,
+                "expired_chapter": getattr(s, "expired_chapter", None),
             })(*_detail_with_aliases(s.detail_json))
             for s in skills
         ],
@@ -569,6 +633,9 @@ def normalized_memory_to_dict(db: Session, novel_id: str) -> dict[str, Any] | No
                 "aliases": aliases,
                 "influence_score": getattr(s, "influence_score", 0) or 0,
                 "is_active": getattr(s, "is_active", True),
+                "introduced_chapter": getattr(s, "introduced_chapter", 0) or 0,
+                "last_used_chapter": getattr(s, "last_used_chapter", 0) or 0,
+                "expired_chapter": getattr(s, "expired_chapter", None),
             })(*_detail_with_aliases(s.detail_json))
             for s in items
         ],

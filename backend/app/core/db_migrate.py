@@ -105,6 +105,13 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN auto_style_polish BOOLEAN DEFAULT 0")
                     )
                     logger.info("db migrate: added novels.auto_style_polish (sqlite)")
+                if _has_column_sqlite(conn, "novels", "base_framework_confirmed"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN base_framework_confirmed BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.base_framework_confirmed (sqlite)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, 0)"
@@ -289,6 +296,15 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.auto_style_polish (mysql)")
+                if _has_column_mysql(conn, "novels", "base_framework_confirmed"):
+                    pass
+                else:
+                    conn.execute(
+                        text(
+                            "ALTER TABLE novels ADD COLUMN base_framework_confirmed BOOLEAN DEFAULT FALSE"
+                        )
+                    )
+                    logger.info("db migrate: added novels.base_framework_confirmed (mysql)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
@@ -715,7 +731,7 @@ def ensure_writing_style_id_column(engine: Engine) -> None:
     table = "novels"
     col = "writing_style_id"
     ddl = "VARCHAR(36) NULL"
-    
+
     try:
         with engine.begin() as conn:
             dialect = engine.dialect.name
@@ -732,3 +748,102 @@ def ensure_writing_style_id_column(engine: Engine) -> None:
                 logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
     except Exception:
         logger.exception("db migrate: ensure_writing_style_id_column failed")
+
+
+def ensure_item_skill_lifecycle_columns(engine: Engine) -> None:
+    """补齐 NovelMemoryNormItem / NovelMemoryNormSkill 的引入/过期追踪列。"""
+    sqlite_alters: list[tuple[str, str]] = [
+        ("novel_memory_norm_items", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "last_used_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_skills", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_skills", "last_used_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_skills", "expired_chapter INTEGER DEFAULT NULL"),
+    ]
+    pg_alters: list[tuple[str, str]] = [
+        ("novel_memory_norm_items", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "last_used_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_skills", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_skills", "last_used_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_skills", "expired_chapter INTEGER DEFAULT NULL"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            alters = sqlite_alters if dialect == "sqlite" else pg_alters
+            for table, ddl in alters:
+                col = ddl.split()[0]
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, table, col)
+                elif dialect == "mysql":
+                    exists = _has_column_mysql(conn, table, col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, table, col)
+                if exists:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_item_skill_lifecycle_columns failed")
+
+
+def ensure_volume_outline_columns(engine: Engine) -> None:
+    """补齐 novel_volumes 表 outline_json / outline_markdown 列。"""
+    table = "novel_volumes"
+    sqlite_specs = [
+        ("outline_json", "TEXT DEFAULT '{}'"),
+        ("outline_markdown", "TEXT DEFAULT ''"),
+    ]
+    pg_specs = [
+        ("outline_json", "TEXT DEFAULT '{}'"),
+        ("outline_markdown", "TEXT DEFAULT ''"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "mysql":
+                # 与 ORM LONGTEXT 一致；避免 TEXT + DEFAULT 在部分 MySQL 配置下 ALTER 失败被静默跳过
+                for col in ("outline_json", "outline_markdown"):
+                    if _has_column_mysql(conn, table, col):
+                        continue
+                    conn.execute(
+                        text(f"ALTER TABLE {table} ADD COLUMN {col} LONGTEXT NULL")
+                    )
+                    logger.info("db migrate: added %s.%s (mysql)", table, col)
+                if _has_column_mysql(conn, table, "outline_json"):
+                    conn.execute(
+                        text(
+                            f"UPDATE {table} SET outline_json = '{{}}' "
+                            "WHERE outline_json IS NULL OR outline_json = ''"
+                        )
+                    )
+                if _has_column_mysql(conn, table, "outline_markdown"):
+                    conn.execute(
+                        text(
+                            f"UPDATE {table} SET outline_markdown = '' "
+                            "WHERE outline_markdown IS NULL"
+                        )
+                    )
+                return
+
+            specs = sqlite_specs if dialect == "sqlite" else pg_specs
+            for col, ddl in specs:
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, table, col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, table, col)
+                else:
+                    logger.warning(
+                        "db migrate: ensure_volume_outline_columns unsupported dialect=%s",
+                        dialect,
+                    )
+                    return
+                if exists:
+                    continue
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col} {ddl}"))
+                logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_volume_outline_columns failed")

@@ -30,6 +30,7 @@ import {
   clearVolumeChapterPlans,
   clearGenerationLogs,
   confirmFramework,
+  confirmBaseFramework,
   deleteChapter,
   deleteMemoryCharacter,
   deleteMemoryItem,
@@ -41,6 +42,7 @@ import {
   formatChapter,
   generateChapters,
   autoGenerateChapters,
+  generateArcs,
   generateVolumeChapterPlan,
   generateVolumes,
   getMemory,
@@ -77,6 +79,7 @@ import {
   waitForChapterGenerationBatch,
   waitForChapterPolishBatch,
   waitForChapterReviseBatch,
+  waitForArcsGenerateBatch,
   waitForFrameworkGenerateBatch,
   waitForMemoryRefreshBatch,
   waitForVolumePlanBatch,
@@ -87,7 +90,7 @@ const STRUCTURED_LIST_PAGE = 8;
 /** 剧情承接与微调区：每类行列表分页，避免单屏过长 */
 const CONTINUITY_LINE_PAGE = 8;
 const CHAPTER_PAGE_SIZE = 3;
-type WorkspaceTab = "framework" | "volumes" | "chapters" | "memory";
+type WorkspaceTab = "studio" | "memory";
 
 const MEMORY_ATLAS_POINTS = [
   { left: "10%", top: "18%" },
@@ -536,7 +539,7 @@ export function NovelWorkspace() {
   const [fwMd, setFwMd] = useState("");
   const [fwJson, setFwJson] = useState("{}");
   const [frameworkWizardOpen, setFrameworkWizardOpen] = useState(false);
-  const [activeTab, setActiveTab] = useState<WorkspaceTab>("framework");
+  const [activeTab, setActiveTab] = useState<WorkspaceTab>("studio");
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
@@ -617,6 +620,12 @@ export function NovelWorkspace() {
   const [chapterThinkExpanded, setChapterThinkExpanded] = useState(false);
   const [chapterChatAbort, setChapterChatAbort] = useState<AbortController | null>(null);
   const [volumes, setVolumes] = useState<Awaited<ReturnType<typeof listVolumes>>>([]);
+  const studioOutlineRef = useRef<HTMLDivElement>(null);
+  const studioVolumesRef = useRef<HTMLDivElement>(null);
+  const studioChaptersRef = useRef<HTMLDivElement>(null);
+  const [arcsTargetVolumes, setArcsTargetVolumes] = useState<number[]>([]);
+  const [arcsInstruction, setArcsInstruction] = useState("");
+  const [arcsBusy, setArcsBusy] = useState(false);
   const [selectedVolumeId, setSelectedVolumeId] = useState<string>("");
   const [chapterVolumeId, setChapterVolumeId] = useState<string>("");
   const [volumePlan, setVolumePlan] = useState<
@@ -793,7 +802,9 @@ export function NovelWorkspace() {
       setMemoryNorm(null);
     }
     setFwMd(String(n.framework_markdown ?? ""));
-    setFwJson(String(n.framework_json ?? "{}"));
+    // 优先编辑「基础大纲」JSON；无该字段时回退到 framework_json（旧客户端/旧数据）
+    const baseJson = (n as { framework_json_base?: string }).framework_json_base;
+    setFwJson(String(baseJson ?? n.framework_json ?? "{}"));
   }, [id]);
 
   const openNormDetail = useCallback((title: string, data: unknown) => {
@@ -821,6 +832,52 @@ export function NovelWorkspace() {
       return current && vs.some((x) => x.id === current) ? current : vs[0].id;
     });
   }, [id]);
+
+  const totalStudioVolumes = useMemo(() => {
+    const tc = Number(novel?.target_chapters || 0);
+    if (!tc || tc <= 0) return 1;
+    return Math.max(1, Math.ceil(tc / 50));
+  }, [novel?.target_chapters]);
+
+  const runInlineGenerateArcs = useCallback(async () => {
+    if (!id) return;
+    if (!novel?.base_framework_confirmed) {
+      setErr("请先确认基础大纲，再生成分卷 Arcs。");
+      return;
+    }
+    if (arcsTargetVolumes.length === 0) {
+      setErr("请在下方的卷号里至少选择一卷。");
+      return;
+    }
+    setArcsBusy(true);
+    setErr(null);
+    try {
+      await ensureLlmReady();
+      const r = await generateArcs(id, {
+        target_volume_nos: arcsTargetVolumes,
+        instruction: arcsInstruction.trim(),
+      });
+      if (r.status === "queued" && r.batch_id) {
+        setTaskNotice("正在生成分卷 Arcs…");
+        const o = await waitForArcsGenerateBatch(id, r.batch_id);
+        if (o === "failed") throw new Error("分卷 Arcs 生成失败，请查看生成日志");
+      }
+      setNotice("分卷 Arcs 已更新。");
+      await reloadVolumes();
+      await reload();
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "分卷 Arcs 生成失败");
+    } finally {
+      setArcsBusy(false);
+    }
+  }, [
+    id,
+    novel?.base_framework_confirmed,
+    arcsTargetVolumes,
+    arcsInstruction,
+    reload,
+    reloadVolumes,
+  ]);
 
   useEffect(() => {
     if (!id) return;
@@ -910,7 +967,7 @@ export function NovelWorkspace() {
   const generateDisabledReason = busy
     ? "当前有任务执行中，请稍候"
     : !frameworkConfirmed
-      ? "请先在“设定与框架”中确认框架"
+      ? "请先在「创作工作台」中确认框架"
       : "";
 
   useEffect(() => {
@@ -3076,13 +3133,26 @@ export function NovelWorkspace() {
           open={frameworkWizardOpen}
           onOpenChange={setFrameworkWizardOpen}
           frameworkConfirmed={frameworkConfirmed}
+          baseFrameworkConfirmed={Boolean(novel?.base_framework_confirmed)}
           frameworkMarkdown={fwMd}
           frameworkJson={fwJson}
           status={String(novel?.status || "")}
+          targetChapters={Number(novel?.target_chapters || 0)}
+          volumes={volumes.map((v) => ({
+            volume_no: v.volume_no,
+            title: v.title,
+            outline_json: v.outline_json,
+            outline_markdown: v.outline_markdown,
+          }))}
           onReload={reload}
           onConfirmFramework={async () => {
             await confirmFramework(id, fwMd, fwJson);
             setNotice("框架已确认，可继续生成卷计划与正文。");
+            await reload();
+          }}
+          onConfirmBaseFramework={async () => {
+            await confirmBaseFramework(id, fwMd, fwJson);
+            setNotice("基础大纲已确认，现在可以为各卷生成 Arcs。");
             await reload();
           }}
         />
@@ -3156,18 +3226,76 @@ export function NovelWorkspace() {
 
         <Tabs value={activeTab} onValueChange={(value) => setActiveTab(value as WorkspaceTab)} className="w-full">
           <TabsList className="w-full">
-            <TabsTrigger value="framework">设定与框架</TabsTrigger>
-            <TabsTrigger value="volumes">卷与章计划</TabsTrigger>
-            <TabsTrigger value="chapters">章节</TabsTrigger>
-            <TabsTrigger value="memory">记忆</TabsTrigger>
+            <TabsTrigger value="studio" className="flex-1 sm:flex-none">
+              创作工作台
+            </TabsTrigger>
+            <TabsTrigger value="memory" className="flex-1 sm:flex-none">
+              记忆
+            </TabsTrigger>
           </TabsList>
 
-          <TabsContent value="framework" className="glass-panel space-y-4 p-5 md:p-6">
+          <TabsContent value="studio" className="mt-4 border-0 bg-transparent p-0 shadow-none">
+            <div className="sticky top-0 z-20 border-b border-border/70 bg-background/92 px-4 py-2.5 backdrop-blur-xl md:px-6">
+              <div className="novel-container flex flex-wrap items-center gap-2">
+                <span className="hidden text-[10px] font-bold uppercase tracking-wider text-foreground/45 sm:inline">
+                  定位
+                </span>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  className="h-8 rounded-full px-3 text-xs font-bold"
+                  onClick={() =>
+                    studioOutlineRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                >
+                  ① 大纲与分卷
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  className="h-8 rounded-full px-3 text-xs font-bold"
+                  onClick={() =>
+                    studioVolumesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                >
+                  ② 卷与章计划
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  className="h-8 rounded-full px-3 text-xs font-bold"
+                  onClick={() =>
+                    studioChaptersRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+                  }
+                >
+                  ③ 章节创作
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  className="ml-auto h-8 rounded-full px-3 text-xs font-bold"
+                  onClick={() => setFrameworkWizardOpen(true)}
+                >
+                  打开完整向导
+                </Button>
+              </div>
+            </div>
+
+            <div className="novel-container space-y-10 py-6 md:space-y-12 md:py-8">
+            <section
+              ref={studioOutlineRef}
+              id="studio-outline"
+              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+            >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">小说概览与创作基线</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  先沉淀世界观、主线和写作约束，再进入卷规划与续写。框架确认后，后续章节和记忆都会以这里为准。
+                  在同一页完成：基础大纲、分卷 Arcs、章计划与正文。下方可按区块跳转；分卷 Arcs 按卷存储，可单独覆盖。
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -3200,7 +3328,7 @@ export function NovelWorkspace() {
                 <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议下一步</p>
                 <p className="mt-2 text-sm font-bold text-foreground">
                   {frameworkConfirmed
-                    ? "去卷与计划区推进章节"
+                    ? "向下滚动到「卷与章计划」或「章节创作」"
                     : novel?.status === "failed"
                       ? "AI 构思似乎失败了，请尝试重试"
                       : !fwMd && novel?.status === "draft"
@@ -3210,7 +3338,12 @@ export function NovelWorkspace() {
               </div>
             </div>
             <div className="relative">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定大纲文本（可编辑后再确认）</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                一、基础大纲（世界观 / 人物 / 主线）
+              </Label>
+              <p className="mt-1 text-xs text-foreground/55 dark:text-muted-foreground">
+                不包含分卷 Arcs；卷级剧情见下方「分卷概览」。
+              </p>
               {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
                 <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
                   {novel?.status === "failed" ? (
@@ -3258,21 +3391,158 @@ export function NovelWorkspace() {
               )}
             </div>
             <div>
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">设定结构化配置</Label>
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                基础大纲 JSON（与卷级 arcs 分离）
+              </Label>
               <textarea
                 value={fwJson}
                 onChange={(e) => setFwJson(e.target.value)}
                 className="mt-2 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
               />
             </div>
-          </TabsContent>
 
-          <TabsContent value="volumes" className="glass-panel space-y-4 p-5 md:p-6">
+            <div className="space-y-3 border-t border-border/60 pt-6">
+              <div className="space-y-1">
+                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                  二、分卷剧情概览（Arcs）
+                </Label>
+                <p className="text-xs text-foreground/55 dark:text-muted-foreground">
+                  每卷单独保存。可在下方「快捷生成」直接选卷，也可用顶部「完整向导」。续写与章计划会优先读卷上的 outline。
+                </p>
+              </div>
+              {volumes.length === 0 ? (
+                <div className="rounded-2xl border border-dashed border-border/70 bg-background/40 p-6 text-sm text-foreground/60">
+                  尚未生成卷列表。请向下滚动到「② 卷与章计划」区块，点击「生成卷列表」，再回本区查看与生成 Arcs。
+                </div>
+              ) : (
+                <div className="grid gap-3 md:grid-cols-2">
+                  {volumes
+                    .slice()
+                    .sort((a, b) => a.volume_no - b.volume_no)
+                    .map((v) => {
+                      const om = (v.outline_markdown || "").trim();
+                      const hasArc = om.length > 0;
+                      return (
+                        <div
+                          key={v.id}
+                          className="rounded-2xl border border-border/70 bg-background/60 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.2)]"
+                        >
+                          <div className="flex items-start justify-between gap-2">
+                            <div>
+                              <p className="text-xs font-bold uppercase tracking-wide text-foreground/50">
+                                第 {v.volume_no} 卷
+                              </p>
+                              <p className="mt-1 text-base font-bold text-foreground">
+                                {v.title || "（未命名）"}
+                              </p>
+                            </div>
+                            <span
+                              className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
+                                hasArc
+                                  ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                                  : "bg-muted text-muted-foreground"
+                              }`}
+                            >
+                              {hasArc ? "已有 Arcs" : "未生成"}
+                            </span>
+                          </div>
+                          {v.summary ? (
+                            <p className="mt-2 text-xs text-foreground/65 line-clamp-3">{v.summary}</p>
+                          ) : null}
+                          {hasArc ? (
+                            <pre className="mt-3 max-h-[200px] overflow-auto whitespace-pre-wrap rounded-xl border border-border/50 bg-background/80 p-3 font-mono text-[11px] leading-relaxed text-foreground/90">
+                              {om}
+                            </pre>
+                          ) : (
+                            <p className="mt-3 text-xs text-foreground/50">暂无卷级 Arcs，使用上方「三、快捷生成」或顶部「完整向导」。</p>
+                          )}
+                        </div>
+                      );
+                    })}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3 border-t border-border/60 pt-6">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                三、快捷生成分卷 Arcs
+              </Label>
+              <p className="text-xs text-foreground/55 dark:text-muted-foreground">
+                需已确认基础大纲。异步生成，选中卷上已有 Arcs 会被覆盖。
+              </p>
+              {!Boolean(novel?.base_framework_confirmed) ? (
+                <p className="text-xs font-bold text-amber-600 dark:text-amber-400">
+                  请先在向导中确认基础大纲，或使用确认按钮。
+                </p>
+              ) : null}
+              <div className="flex flex-wrap gap-2">
+                {Array.from({ length: totalStudioVolumes }, (_, i) => i + 1).map((volNo) => {
+                  const hasOutline = volumes.some(
+                    (vv) =>
+                      vv.volume_no === volNo && (vv.outline_markdown || "").trim().length > 0
+                  );
+                  const selected = arcsTargetVolumes.includes(volNo);
+                  return (
+                    <button
+                      key={`arc-vol-${volNo}`}
+                      type="button"
+                      disabled={arcsBusy || busy}
+                      onClick={() =>
+                        setArcsTargetVolumes((prev) =>
+                          prev.includes(volNo)
+                            ? prev.filter((x) => x !== volNo)
+                            : [...prev, volNo].sort((a, b) => a - b)
+                        )
+                      }
+                      className={`rounded-xl border px-3 py-1.5 text-xs font-bold transition-colors ${
+                        selected
+                          ? "border-primary bg-primary text-primary-foreground"
+                          : hasOutline
+                            ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
+                            : "border-border/70 bg-background/70 text-foreground/80 hover:bg-muted/40"
+                      }`}
+                    >
+                      第{volNo}卷{hasOutline ? " ✓" : ""}
+                    </button>
+                  );
+                })}
+              </div>
+              <Input
+                value={arcsInstruction}
+                onChange={(e) => setArcsInstruction(e.target.value)}
+                placeholder="可选：如「第二卷加强感情线」「第三卷节奏加快」"
+                className="mt-2"
+                disabled={arcsBusy}
+              />
+              <div className="mt-3 flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  size="sm"
+                  className="font-bold"
+                  disabled={
+                    arcsBusy ||
+                    busy ||
+                    !Boolean(novel?.base_framework_confirmed) ||
+                    arcsTargetVolumes.length === 0
+                  }
+                  onClick={() => void runInlineGenerateArcs()}
+                >
+                  {arcsBusy ? "生成中…" : `生成第 ${arcsTargetVolumes.join("、")} 卷 Arcs`}
+                </Button>
+              </div>
+            </div>
+            </section>
+
+            <section
+              ref={studioVolumesRef}
+              id="studio-volumes"
+              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+            >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading text-foreground font-bold">卷与计划区</p>
+                <p className="section-heading text-foreground font-bold">卷与章计划</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  推荐流程：先生成卷列表，再给当前卷分批生成章计划，最后从计划直接进入正文生成。
+                  生成卷列表 → 为当前卷分批生成章计划 → 在下方章节区从计划生成正文。
                 </p>
               </div>
               <div className="glass-chip font-bold text-foreground/80">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
@@ -3885,14 +4155,18 @@ export function NovelWorkspace() {
                 )}
               </section>
             </div>
-          </TabsContent>
+            </section>
 
-          <TabsContent value="chapters" className="glass-panel space-y-4 p-5 md:p-6">
+            <section
+              ref={studioChaptersRef}
+              id="studio-chapters"
+              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+            >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading text-foreground font-bold">创作区</p>
+                <p className="section-heading text-foreground font-bold">章节创作</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  这里集中处理续写、审定、日志和章节助手，把最常用的动作放在页面最上方，减少反复滚动寻找按钮。
+                  续写、审定、章节助手与单章编辑集中在此；上方章计划里也可点「生成正文」跳到对应章节。
                 </p>
               </div>
               <div className="glass-chip font-bold text-foreground/80">
@@ -4360,6 +4634,8 @@ export function NovelWorkspace() {
                   </div>
                 )}
               </section>
+            </div>
+            </section>
             </div>
           </TabsContent>
 
@@ -5507,57 +5783,20 @@ export function NovelWorkspace() {
       <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
         <div className="novel-container space-y-2 px-4">
           <p className="text-[11px] font-medium text-foreground/60">
-            {activeTab === "framework"
-              ? frameworkConfirmed
-                ? "框架已确认，可继续微调或查看全局设置"
-                : "先确认框架，再进入卷计划和正文创作"
-              : activeTab === "volumes"
-                ? selectedVolumeId
-                  ? "已选中当前卷，可继续按批次推进章计划"
-                  : "先生成卷列表，再逐卷推进章计划"
-                : activeTab === "chapters"
-                  ? selectedChapter
-                    ? `正在编辑第 ${selectedChapter.chapter_no} 章`
-                    : "先选章节，或直接启动自动续写"
-                  : approvedChapterCount > 0
-                    ? "章节审定后建议及时刷新记忆"
-                    : "尚无已审定章节，记忆刷新暂不可用"}
+            {activeTab === "studio"
+              ? selectedChapter
+                ? `正在编辑第 ${selectedChapter.chapter_no} 章 · 可上滑查看大纲与章计划`
+                : selectedVolumeId
+                  ? "已选卷 · 可上滑生成章计划或自动续写"
+                  : frameworkConfirmed
+                    ? "框架已确认 · 上滑使用顶部导航快速跳转"
+                    : "先确认框架，再生成卷与章节"
+              : approvedChapterCount > 0
+                ? "章节审定后建议到「记忆」页刷新"
+                : "尚无已审定章节，记忆刷新暂不可用"}
           </p>
 
-          {activeTab === "framework" ? (
-            <div className="grid grid-cols-2 gap-2">
-              <Button type="button" variant="outline" className="font-semibold" onClick={() => setFrameworkWizardOpen(true)}>
-                修改向导
-              </Button>
-              <Button type="button" className="font-bold" onClick={openNovelSettings}>
-                小说设置
-              </Button>
-            </div>
-          ) : null}
-
-          {activeTab === "volumes" ? (
-            <div className="grid grid-cols-2 gap-2">
-              <Button
-                type="button"
-                variant="outline"
-                className="font-semibold"
-                disabled={busy || volumeBusy}
-                onClick={() => confirmGenerateVolumes()}
-              >
-                生成卷列表
-              </Button>
-              <Button
-                type="button"
-                className="font-bold"
-                disabled={busy || volumeBusy || !selectedVolumeId}
-                onClick={() => confirmGenerateVolumePlan(false)}
-              >
-                下一批计划
-              </Button>
-            </div>
-          ) : null}
-
-          {activeTab === "chapters" ? (
+          {activeTab === "studio" ? (
             selectedChapter ? (
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
                 <Button
@@ -5603,7 +5842,7 @@ export function NovelWorkspace() {
                   className="font-semibold"
                   onClick={() => setSelectedChapterId("")}
                 >
-                  章节目录
+                  目录
                 </Button>
               </div>
             ) : (
@@ -5612,6 +5851,23 @@ export function NovelWorkspace() {
                   type="button"
                   variant="outline"
                   className="font-semibold"
+                  disabled={busy || volumeBusy}
+                  onClick={() => confirmGenerateVolumes()}
+                >
+                  生成卷
+                </Button>
+                <Button
+                  type="button"
+                  className="font-bold"
+                  disabled={busy || volumeBusy || !selectedVolumeId}
+                  onClick={() => confirmGenerateVolumePlan(false)}
+                >
+                  下一批计划
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="font-bold"
                   disabled={busy || !frameworkConfirmed}
                   onClick={() => confirmGenerateChapters()}
                 >
@@ -5619,7 +5875,8 @@ export function NovelWorkspace() {
                 </Button>
                 <Button
                   type="button"
-                  className="font-bold"
+                  variant="outline"
+                  className="font-semibold"
                   onClick={() => setChapterChatOpen(true)}
                 >
                   章节助手

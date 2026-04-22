@@ -154,6 +154,42 @@ def memory_schema_guide() -> dict[str, Any]:
                 "已退场、失效、死亡、替换的实体标记 is_active=false。",
             ],
         },
+        "inventory": {
+            "purpose": "追踪物品/道具的引入、使用与过期。",
+            "rules": [
+                "每个物品必须填写 introduced_chapter（首次出现的章节号）。",
+                "若物品已被消耗/损毁/遗失/替换，填写 expired_chapter 并标记 is_active=false。",
+                "last_used_chapter 填写最近一次被使用或提及的章节号。",
+                "新出现的物品必须先有发现/获得/赠予等引入过程，不得凭空持有。",
+            ],
+            "template": {
+                "item_name": "玄铁令牌",
+                "detail": "由师门长老授予的身份凭证",
+                "introduced_chapter": 12,
+                "last_used_chapter": 25,
+                "expired_chapter": None,
+                "influence_score": 70,
+                "is_active": True,
+            },
+        },
+        "skills": {
+            "purpose": "追踪技能/能力的习得与使用。",
+            "rules": [
+                "每个技能必须填写 introduced_chapter（首次习得/觉醒的章节号）。",
+                "若技能被封印/失去/禁用，填写 expired_chapter 并标记 is_active=false。",
+                "last_used_chapter 填写最近一次施展的章节号。",
+                "新技能必须先有习得/觉醒/传授等引入过程，不得凭空掌握。",
+            ],
+            "template": {
+                "name": "破军斩",
+                "detail": "师门绝学，需玄铁令牌方可施展",
+                "introduced_chapter": 15,
+                "last_used_chapter": 28,
+                "expired_chapter": None,
+                "influence_score": 85,
+                "is_active": True,
+            },
+        },
     }
 
 

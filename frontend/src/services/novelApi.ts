@@ -126,21 +126,24 @@ export async function generateVolumes(
   }>;
 }
 
+export type NovelVolumeListItem = {
+  id: string;
+  volume_no: number;
+  title: string;
+  summary: string;
+  from_chapter: number;
+  to_chapter: number;
+  status: string;
+  chapter_plan_count: number;
+  /** 本卷剧情弧线 JSON（与小说级 framework_json 分离） */
+  outline_json?: string;
+  outline_markdown?: string;
+};
+
 export async function listVolumes(novelId: string) {
   const r = await apiFetch(`${BASE}/${novelId}/volumes`);
   if (!r.ok) throw new Error(await r.text());
-  return r.json() as Promise<
-    {
-      id: string;
-      volume_no: number;
-      title: string;
-      summary: string;
-      from_chapter: number;
-      to_chapter: number;
-      status: string;
-      chapter_plan_count: number;
-    }[]
-  >;
+  return r.json() as Promise<NovelVolumeListItem[]>;
 }
 
 export async function patchVolume(
@@ -513,6 +516,11 @@ export async function getNovel(id: string) {
     auto_plan_guard_fix: boolean;
     auto_style_polish: boolean;
     framework_confirmed: boolean;
+    base_framework_confirmed: boolean;
+    /** 兼容：含 arcs 的完整框架 JSON（卷表或旧库内嵌） */
+    framework_json: string;
+    /** 仅基础大纲（无 arcs），工作台编辑用 */
+    framework_json_base?: string;
     status: string;
     [key: string]: any;
   }>;
@@ -585,6 +593,34 @@ export async function confirmFramework(
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+export async function confirmBaseFramework(
+  novelId: string,
+  framework_markdown: string,
+  framework_json: string
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/confirm-base-framework`, {
+    method: "POST",
+    body: JSON.stringify({ framework_markdown, framework_json }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export async function generateArcs(
+  novelId: string,
+  payload: { target_volume_nos?: number[]; instruction?: string }
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/generate-arcs`, {
+    method: "POST",
+    body: JSON.stringify({
+      target_volume_nos: payload.target_volume_nos,
+      instruction: payload.instruction || "",
+    }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; batch_id?: string; task_id?: string | null }>;
 }
 
 export async function listChapters(novelId: string) {
@@ -920,6 +956,24 @@ export async function waitForFrameworkCharactersBatch(
     await sleep(intervalMs);
   }
   throw new Error("等待更新人物设定超时，请稍后在生成日志中查看");
+}
+
+export async function waitForArcsGenerateBatch(
+  novelId: string,
+  batchId: string,
+  options?: { intervalMs?: number; maxWaitMs?: number }
+): Promise<"done" | "failed"> {
+  const intervalMs = options?.intervalMs ?? 2000;
+  const maxWaitMs = options?.maxWaitMs ?? 3_600_000;
+  const deadline = Date.now() + maxWaitMs;
+  while (Date.now() < deadline) {
+    const r = await listGenerationLogs(novelId, { batch_id: batchId, limit: 160 });
+    const ev = new Set(r.items.map((x) => x.event));
+    if (ev.has("arcs_generate_done")) return "done";
+    if (ev.has("arcs_generate_failed") || ev.has("arcs_generate_enqueue_failed")) return "failed";
+    await sleep(intervalMs);
+  }
+  throw new Error("等待 Arcs 生成超时，请稍后在生成日志中查看");
 }
 
 export async function patchChapter(

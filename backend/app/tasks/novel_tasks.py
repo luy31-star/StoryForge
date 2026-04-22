@@ -15,10 +15,14 @@ from sqlalchemy import func
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.novel import Chapter, ChapterFeedback, Novel, NovelGenerationLog, NovelMemory
-from app.models.volume import NovelChapterPlan
+from app.models.volume import NovelChapterPlan, NovelVolume
 from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.memory_normalize_sync import sync_json_snapshot_from_normalized
-from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_llm_service import (
+    NovelLLMService,
+    coerce_novel_outline_base_fields,
+    render_volume_arcs_markdown,
+)
 from app.services.novel_repo import (
     chapter_content_metrics,
     format_approved_chapters_summary,
@@ -1501,15 +1505,19 @@ def _regenerate_framework_sync(
     db,
     progress_callback=None,
 ) -> tuple[str, str]:
+    """同步包装：按指令重写 base framework（设定/人物/主线），不含 arcs。
+    重写后需要用户重新确认 base，然后手动触发 arcs 生成。
+    """
     loop = asyncio.new_event_loop()
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(
-            llm.regenerate_framework(
+            llm.generate_base_framework(
                 novel,
-                instruction,
                 db=db,
                 progress_callback=progress_callback,
+                mode="regen",
+                instruction=instruction,
             )
         )
     finally:
@@ -1531,6 +1539,48 @@ def _update_framework_characters_sync(
             llm.update_framework_characters(
                 novel,
                 characters,
+                db=db,
+                progress_callback=progress_callback,
+            )
+        )
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _generate_base_framework_sync(
+    llm: NovelLLMService, novel: Novel, db, progress_callback=None
+) -> tuple[str, str]:
+    """同步包装：只生成 base framework（设定/人物/主线），不含 arcs。"""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            llm.generate_base_framework(novel, db=db, progress_callback=progress_callback)
+        )
+    finally:
+        asyncio.set_event_loop(None)
+        loop.close()
+
+
+def _generate_arcs_for_volumes_sync(
+    llm: NovelLLMService,
+    novel: Novel,
+    *,
+    target_volume_nos: list[int] | None = None,
+    instruction: str = "",
+    db=None,
+    progress_callback=None,
+) -> tuple[str, str]:
+    """同步包装：为指定卷生成 arcs 并增量合并。"""
+    loop = asyncio.new_event_loop()
+    try:
+        asyncio.set_event_loop(loop)
+        return loop.run_until_complete(
+            llm.generate_arcs_for_volumes(
+                novel,
+                target_volume_nos=target_volume_nos,
+                instruction=instruction,
                 db=db,
                 progress_callback=progress_callback,
             )
@@ -1591,7 +1641,7 @@ def novel_generate_framework_task(
             novel_id=novel_id,
             batch_id=batch_id,
             event="framework_generate_started",
-            message="正在生成全书大纲框架...",
+            message="正在生成设定、人物与主线大纲...",
         )
         db.commit()
 
@@ -1601,17 +1651,18 @@ def novel_generate_framework_task(
             return {"status": "not_found", "novel_id": novel_id}
         
         llm = NovelLLMService(billing_user_id=user_id)
-        from app.services.novel_auto_pipeline import _generate_framework_sync
         progress_logger = _make_generation_progress_logger(
             db,
             novel_id=novel_id,
             batch_id=batch_id,
             event="framework_generate_progress",
         )
-        md, fj = _generate_framework_sync(llm, n, db, progress_callback=progress_logger)
+        # 只生成 base（设定/人物/主线），不生成 arcs
+        md, fj = _generate_base_framework_sync(llm, n, db, progress_callback=progress_logger)
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False
+        n.base_framework_confirmed = False
         db.commit()
         
         append_generation_log(
@@ -1619,7 +1670,7 @@ def novel_generate_framework_task(
             novel_id=novel_id,
             batch_id=batch_id,
             event="framework_generate_done",
-            message="大纲框架生成完毕（待确认）",
+            message="基础大纲生成完毕（待确认）",
         )
         db.commit()
         _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
@@ -1735,6 +1786,7 @@ def novel_framework_regen_task(
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False
+        n.base_framework_confirmed = False
         db.commit()
         append_generation_log(
             db,
@@ -1858,6 +1910,7 @@ def novel_framework_update_characters_task(
         n.framework_markdown = md
         n.framework_json = fj
         n.framework_confirmed = False
+        n.base_framework_confirmed = False
         db.commit()
         append_generation_log(
             db,
@@ -1902,6 +1955,217 @@ def novel_framework_update_characters_task(
             except Exception:
                 logger.exception(
                     "framework_characters lock release failed | novel_id=%s batch_id=%s",
+                    novel_id,
+                    batch_id,
+                )
+        db.close()
+
+
+@celery_app.task(name="novel.generate_arcs_task")
+def novel_generate_arcs_task(
+    novel_id: str,
+    user_id: str | None,
+    batch_id: str,
+    target_volume_nos: list[int] | None = None,
+    instruction: str = "",
+) -> dict[str, Any]:
+    """为指定卷生成 arcs：写入各卷 outline_*；小说表仅保留基础大纲（不含 arcs）。"""
+    db = SessionLocal()
+    r = _redis_for_novel_queue()
+    lock = None
+    acquired = False
+    try:
+        if r is not None:
+            lock = r.lock(
+                _novel_auto_pipeline_lock_key(novel_id),
+                timeout=6 * 60 * 60,
+                blocking=False,
+            )
+            acquired = lock.acquire(blocking=False)
+            if not acquired:
+                recover_stale_auto_pipeline_state(
+                    db,
+                    novel_id,
+                    exclude_batch_id=batch_id,
+                    exclude_task_ids={str(novel_generate_arcs_task.request.id or "")},
+                )
+                acquired = lock.acquire(blocking=False)
+            if not acquired:
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="arcs_generate_failed",
+                    level="error",
+                    message="生成 Arcs 跳过：同一小说已有任务在执行",
+                    meta={"reason": "locked"},
+                )
+                db.commit()
+                _task_set_terminal(
+                    db,
+                    batch_id=batch_id,
+                    status="skipped",
+                    message="已跳过：同一小说已有任务在执行",
+                )
+                return {"status": "skipped", "reason": "locked"}
+
+        _task_set_started(db, batch_id=batch_id, message="Arcs 生成任务已开始")
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="arcs_generate_started",
+            message=f"正在生成第{','.join(str(v) for v in (target_volume_nos or []))}卷的 Arcs...",
+            meta={"target_volume_nos": target_volume_nos},
+        )
+        db.commit()
+
+        n = db.get(Novel, novel_id)
+        if not n:
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message="小说不存在")
+            return {"status": "not_found", "novel_id": novel_id}
+
+        if not n.base_framework_confirmed:
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="arcs_generate_failed",
+                level="error",
+                message="基础大纲尚未确认，无法生成 Arcs",
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message="基础大纲尚未确认")
+            return {"status": "failed", "reason": "base_not_confirmed"}
+
+        llm = NovelLLMService(billing_user_id=user_id)
+        progress_logger = _make_generation_progress_logger(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="arcs_generate_progress",
+        )
+        md, fj = _generate_arcs_for_volumes_sync(
+            llm,
+            n,
+            target_volume_nos=target_volume_nos,
+            instruction=instruction,
+            db=db,
+            progress_callback=progress_logger,
+        )
+        base_md, base_j = coerce_novel_outline_base_fields(md, fj)
+        n.framework_markdown = base_md
+        n.framework_json = base_j
+
+        def _arc_overlaps_volume(
+            a_lo: int, a_hi: int, vol_lo: int, vol_hi: int
+        ) -> bool:
+            return not (a_hi < vol_lo or a_lo > vol_hi)
+
+        # 将 arcs 写入对应卷的 outline_json / outline_markdown（与小说级大纲分离）
+        try:
+            arcs_data = json.loads(fj) if fj else {}
+        except json.JSONDecodeError:
+            arcs_data = {}
+        arcs_list = arcs_data.get("arcs", []) if isinstance(arcs_data, dict) else []
+        if isinstance(arcs_list, list) and arcs_list and target_volume_nos:
+            volume_size = 50
+            for vol_no in target_volume_nos:
+                vol_lo = (vol_no - 1) * volume_size + 1
+                vol_hi = vol_no * volume_size
+                vol_arcs: list[Any] = []
+                for arc in arcs_list:
+                    if not isinstance(arc, dict):
+                        continue
+                    a_lo = arc.get("from_chapter") if isinstance(arc.get("from_chapter"), int) else arc.get("from")
+                    a_hi = arc.get("to_chapter") if isinstance(arc.get("to_chapter"), int) else arc.get("to")
+                    if isinstance(a_lo, int) and isinstance(a_hi, int):
+                        if _arc_overlaps_volume(a_lo, a_hi, vol_lo, vol_hi):
+                            vol_arcs.append(arc)
+                vol_row = (
+                    db.query(NovelVolume)
+                    .filter(
+                        NovelVolume.novel_id == novel_id,
+                        NovelVolume.volume_no == vol_no,
+                    )
+                    .first()
+                )
+                if vol_row:
+                    if vol_arcs:
+                        vol_row.outline_json = json.dumps(
+                            {"volume_no": vol_no, "arcs": vol_arcs}, ensure_ascii=False
+                        )
+                        vol_row.outline_markdown = render_volume_arcs_markdown(vol_no, vol_arcs)
+                    else:
+                        vol_row.outline_json = "{}"
+                        vol_row.outline_markdown = ""
+        else:
+            volumes = (
+                db.query(NovelVolume)
+                .filter(NovelVolume.novel_id == novel_id)
+                .order_by(NovelVolume.volume_no.asc())
+                .all()
+            )
+            if isinstance(arcs_list, list) and arcs_list and volumes:
+                for vol in volumes:
+                    vol_lo = vol.from_chapter
+                    vol_hi = vol.to_chapter
+                    vol_arcs = []
+                    for arc in arcs_list:
+                        if not isinstance(arc, dict):
+                            continue
+                        a_lo = arc.get("from_chapter") if isinstance(arc.get("from_chapter"), int) else arc.get("from")
+                        a_hi = arc.get("to_chapter") if isinstance(arc.get("to_chapter"), int) else arc.get("to")
+                        if isinstance(a_lo, int) and isinstance(a_hi, int):
+                            if _arc_overlaps_volume(a_lo, a_hi, vol_lo, vol_hi):
+                                vol_arcs.append(arc)
+                    if vol_arcs:
+                        vn = int(vol.volume_no)
+                        vol.outline_json = json.dumps(
+                            {"volume_no": vn, "arcs": vol_arcs}, ensure_ascii=False
+                        )
+                        vol.outline_markdown = render_volume_arcs_markdown(vn, vol_arcs)
+        db.commit()
+
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="arcs_generate_done",
+            message=f"第{','.join(str(v) for v in (target_volume_nos or []))}卷 Arcs 生成完毕",
+            meta={"target_volume_nos": target_volume_nos},
+        )
+        db.commit()
+        _task_set_terminal(db, batch_id=batch_id, status="done", message="已完成")
+        return {"status": "ok", "batch_id": batch_id, "target_volume_nos": target_volume_nos}
+    except Exception as e:
+        logger.exception("novel_generate_arcs_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
+        try:
+            db.rollback()
+            n = db.get(Novel, novel_id)
+            if n:
+                n.status = "failed"
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="arcs_generate_failed",
+                level="error",
+                message=f"生成 Arcs 失败：{e}",
+                meta={"error": str(e)},
+            )
+            db.commit()
+            _task_set_terminal(db, batch_id=batch_id, status="failed", message=f"失败：{e}")
+        except Exception:
+            db.rollback()
+        raise
+    finally:
+        if lock is not None and acquired:
+            try:
+                lock.release()
+            except Exception:
+                logger.exception(
+                    "arcs_generate lock release failed | novel_id=%s batch_id=%s",
                     novel_id,
                     batch_id,
                 )

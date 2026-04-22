@@ -40,22 +40,26 @@ from app.services.memory_readable import (
     memory_payload_readable_zh_auto,
     memory_payload_to_readable_zh,
 )
-from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_llm_service import NovelLLMService, coerce_novel_outline_base_fields
 from app.services.novel_repo import (
+    _select_arc_for_chapter,
+    _select_arc_for_chapter_db,
     build_memory_health_summary,
     build_memory_schema_guide,
     chapter_content_metrics,
     chapter_plan_exists,
+    effective_framework_json_for_prompt,
     format_approved_chapters_summary,
     format_continuity_excerpts,
-    format_recent_approved_fulltext_context,
+    format_previous_chapter_fulltext,
     format_volume_event_summary,
     format_volume_progress_anchor,
+    framework_json_base_str,
+    framework_json_merged_compat_str,
     has_any_chapter_plan,
     latest_memory_json,
     next_chapter_no_from_approved,
     planned_chapter_numbers_needing_body,
-    _select_arc_for_chapter,
 )
 from app.services.memory_normalize_sync import (
     normalized_memory_to_dict,
@@ -98,13 +102,16 @@ def _novel_llm(user: User) -> NovelLLMService:
     return NovelLLMService(billing_user_id=user.id)
 
 
-def _snapshot_novel_prompt_view(novel: Novel) -> Any:
+def _snapshot_novel_prompt_view(novel: Novel, db: Session | None = None) -> Any:
+    """章节助手快照：framework_json 为合并 arcs 后的有效 JSON（兼容旧库内嵌 arcs）。"""
+    fw_md, _ = coerce_novel_outline_base_fields(novel.framework_markdown, novel.framework_json)
+    fw_j = effective_framework_json_for_prompt(db, novel) if db is not None else effective_framework_json_for_prompt(None, novel)
     return SimpleNamespace(
         id=str(novel.id),
         title=str(novel.title or ""),
-        framework_markdown=str(novel.framework_markdown or ""),
+        framework_markdown=fw_md,
         background=str(novel.background or ""),
-        framework_json=str(novel.framework_json or ""),
+        framework_json=fw_j,
     )
 
 
@@ -232,20 +239,27 @@ class RegenerateFrameworkBody(BaseModel):
     instruction: str = Field(..., min_length=1)
 
 
+class GenerateArcsBody(BaseModel):
+    target_volume_nos: list[int] | None = None
+    instruction: str = ""
+
+
+class ConfirmBaseFrameworkBody(BaseModel):
+    framework_markdown: str
+    framework_json: str = "{}"
+
+
 class UpdateFrameworkCharactersBody(BaseModel):
     characters: list[dict[str, Any]] = Field(default_factory=list, max_length=50)
 
 
 class FrameworkUpdateBody(BaseModel):
     """
-    仅更新 novels.framework_json/framework_markdown，不重置章节、不写入初始记忆。
-    用于在已有写作进度下迭代大纲与节拍（例如补齐 arcs 范围与 beats）。
+    仅更新 novels 表中的「基础大纲」字段；卷级 arcs 在 novel_volumes.outline_* 维护。
     """
 
     framework_markdown: str | None = None
     framework_json: str = Field(..., min_length=2)
-    auto_fill_arcs: bool = True
-    auto_fill_beats: bool = True
 
 
 class ChapterFeedbackBody(BaseModel):
@@ -593,7 +607,7 @@ async def chapter_context_chat_stream(
     user: User = Depends(get_current_user),
 ) -> StreamingResponse:
     n = require_novel_access(db, novel_id, user)
-    n_prompt = _snapshot_novel_prompt_view(n)
+    n_prompt = _snapshot_novel_prompt_view(n, db)
     mem = latest_memory_json(db, novel_id)
     approved = (
         db.query(Chapter)
@@ -876,6 +890,9 @@ def get_novel(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     n = require_novel_access(db, novel_id, user)
+    fw_md, _ = coerce_novel_outline_base_fields(n.framework_markdown, n.framework_json)
+    fw_merged = framework_json_merged_compat_str(db, n)
+    fw_base = framework_json_base_str(n)
     return {
         "id": n.id,
         "title": n.title,
@@ -897,8 +914,12 @@ def get_novel(
         "reference_filename": n.reference_filename,
         "reference_public_url": n.reference_public_url,
         "framework_confirmed": n.framework_confirmed,
-        "framework_markdown": n.framework_markdown,
-        "framework_json": n.framework_json,
+        "base_framework_confirmed": n.base_framework_confirmed,
+        "framework_markdown": fw_md,
+        # 兼容旧版/外部集成：含 arcs 的完整 JSON（arcs 来自卷表或小说行内嵌）
+        "framework_json": fw_merged,
+        # 新工作台「仅基础大纲」编辑用（不含 arcs）
+        "framework_json_base": fw_base,
         "status": n.status,
         "created_at": n.created_at.isoformat() if n.created_at else None,
         "updated_at": n.updated_at.isoformat() if n.updated_at else None,
@@ -1172,9 +1193,11 @@ def confirm_framework(
         json.loads(body.framework_json)
     except json.JSONDecodeError:
         raise HTTPException(400, "framework_json 不是合法 JSON")
-    n.framework_markdown = body.framework_markdown
-    n.framework_json = body.framework_json
+    fw_md, fw_j = coerce_novel_outline_base_fields(body.framework_markdown, body.framework_json)
+    n.framework_markdown = fw_md
+    n.framework_json = fw_j
     n.framework_confirmed = True
+    n.base_framework_confirmed = True
     n.status = "active"
     # 初始记忆：先落规范化表，再由分表派生 JSON 快照（单一真源）
     ver = (
@@ -1182,10 +1205,90 @@ def confirm_framework(
         or 0
     )
     new_ver = ver + 1
-    replace_normalized_from_payload(db, novel_id, new_ver, body.framework_json)
+    replace_normalized_from_payload(db, novel_id, new_ver, fw_j)
     sync_json_snapshot_from_normalized(db, novel_id, summary="自确认框架初始化")
     db.commit()
     return {"status": "ok"}
+
+
+@router.post("/{novel_id}/confirm-base-framework")
+def confirm_base_framework(
+    novel_id: str,
+    body: ConfirmBaseFrameworkBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, str]:
+    """确认基础大纲（设定/人物/主线），允许后续生成 Arcs。"""
+    n = require_novel_access(db, novel_id, user)
+    try:
+        json.loads(body.framework_json)
+    except json.JSONDecodeError:
+        raise HTTPException(400, "framework_json 不是合法 JSON")
+    fw_md, fw_j = coerce_novel_outline_base_fields(body.framework_markdown, body.framework_json)
+    n.framework_markdown = fw_md
+    n.framework_json = fw_j
+    n.base_framework_confirmed = True
+    n.status = "draft"
+    db.commit()
+    return {"status": "ok"}
+
+
+@router.post("/{novel_id}/generate-arcs")
+def generate_arcs(
+    novel_id: str,
+    body: GenerateArcsBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """为指定卷号生成 arcs 并增量合并。需要 base_framework_confirmed=True。"""
+    n = require_novel_access(db, novel_id, user)
+    if not n.base_framework_confirmed:
+        raise HTTPException(400, "基础大纲尚未确认，请先确认基础大纲")
+
+    target_volume_nos = body.target_volume_nos
+    instruction = (body.instruction or "").strip()
+    batch_id = f"arcs-gen-{int(time.time())}-{novel_id[:8]}"
+    _append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="arcs_generate_queued",
+        message=f"已入队：异步生成第{','.join(str(v) for v in (target_volume_nos or []))}卷 Arcs",
+        meta={"target_volume_nos": target_volume_nos, "instruction": instruction[:500]},
+    )
+    db.commit()
+    try:
+        from app.tasks.novel_tasks import novel_generate_arcs_task
+        task = novel_generate_arcs_task.delay(
+            novel_id, str(user.id), batch_id, target_volume_nos, instruction
+        )
+        task_id = getattr(task, "id", None)
+    except Exception as e:
+        logger.exception("arcs generate enqueue failed | novel_id=%s", novel_id)
+        _append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="arcs_generate_enqueue_failed",
+            level="error",
+            message=f"Arcs 生成任务入队失败：{e}",
+        )
+        db.commit()
+        raise HTTPException(503, f"后台任务入队失败：{e}") from e
+    try:
+        create_user_task(
+            db,
+            user_id=str(user.id),
+            batch_id=batch_id,
+            task_type="arcs_generate",
+            task_name="Arcs 生成",
+            message=f"正在生成第{','.join(str(v) for v in (target_volume_nos or []))}卷 Arcs",
+            celery_task_id=str(task_id or ""),
+        )
+        db.commit()
+    except Exception:
+        logger.exception("create_user_task for arcs generate failed | novel_id=%s", novel_id)
+    return {"status": "queued", "batch_id": batch_id, "task_id": task_id}
 
 
 def _parse_range_text(v: Any) -> tuple[int | None, int | None]:
@@ -1310,18 +1413,19 @@ def update_framework(
     if not isinstance(fw, dict):
         raise HTTPException(400, "framework_json 顶层必须是 JSON 对象")
 
-    if body.auto_fill_arcs:
-        fw = _auto_fill_framework_arcs(fw, fill_beats=bool(body.auto_fill_beats))
-
-    n.framework_json = json.dumps(fw, ensure_ascii=False)
-    if body.framework_markdown is not None:
-        n.framework_markdown = body.framework_markdown
+    md_src = (
+        body.framework_markdown
+        if body.framework_markdown is not None
+        else (n.framework_markdown or "")
+    )
+    out_md, out_j = coerce_novel_outline_base_fields(md_src, json.dumps(fw, ensure_ascii=False))
+    n.framework_json = out_j
+    n.framework_markdown = out_md
     db.commit()
     return {
         "status": "ok",
         "framework_confirmed": n.framework_confirmed,
         "framework_json_chars": len(n.framework_json or ""),
-        "arcs_count": len(fw.get("arcs") or []) if isinstance(fw.get("arcs"), list) else 0,
     }
 
 
@@ -3277,9 +3381,9 @@ def get_novel_metrics(
                 canonical_last_editable.get("open_plots_resolved") or []
             )
 
-    # 节奏对齐：基于 framework_json.arcs 推导当前弧线（以“下一章”作为写作目标）
+    # 节奏对齐：基于卷级 outline_json 推导当前弧线（以”下一章”作为写作目标）
     next_no = next_chapter_no_from_approved(db, novel_id)
-    arc = _select_arc_for_chapter(n.framework_json or "", next_no)
+    arc = _select_arc_for_chapter_db(db, novel_id, next_no)
     arc_title = ""
     arc_from = None
     arc_to = None

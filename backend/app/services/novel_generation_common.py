@@ -289,6 +289,101 @@ def build_chapter_plan_hint(
     return "\n".join(lines)
 
 
+def build_future_plan_summary(
+    chapter_no: int,
+    plan_title: str,
+    beats: dict[str, Any],
+) -> str:
+    """构建后续章节的精简摘要（用于多章执行卡注入）。
+
+    只保留最核心的信息：章名 + 目标 + 冲突 + 结尾钩子 + must_not + reserved_for_later。
+    不包含场景分解、交付要求等详细内容，控制在 100-200 字/章。
+    """
+    normalized = normalize_beats_to_v2(beats)
+    card = (
+        normalized.get("execution_card", {}) if isinstance(normalized, dict) else {}
+    )
+
+    parts: list[str] = [f"第{chapter_no}章「{plan_title or '待定'}」"]
+
+    goal = card.get("chapter_goal", "")
+    conflict = card.get("core_conflict", "")
+    turn = card.get("key_turn", "")
+    hook = card.get("ending_hook", "")
+
+    if isinstance(goal, str) and goal.strip():
+        parts.append(f"  目标：{goal.strip()}")
+    if isinstance(conflict, str) and conflict.strip():
+        parts.append(f"  冲突：{conflict.strip()}")
+    if isinstance(turn, str) and turn.strip():
+        parts.append(f"  转折：{turn.strip()}")
+    if isinstance(hook, str) and hook.strip():
+        parts.append(f"  钩子：{hook.strip()}")
+
+    must_happen = card.get("must_happen")
+    if isinstance(must_happen, list) and must_happen:
+        items = [str(x).strip() for x in must_happen if str(x).strip()]
+        if items:
+            parts.append(f"  必须发生：{'；'.join(items[:3])}")
+
+    must_not = card.get("must_not")
+    if isinstance(must_not, list) and must_not:
+        items = [str(x).strip() for x in must_not if str(x).strip()]
+        if items:
+            parts.append(f"  禁止：{'；'.join(items[:3])}")
+
+    rsv = card.get("reserved_for_later")
+    if isinstance(rsv, list) and rsv:
+        items = []
+        for it in rsv:
+            if not isinstance(it, dict):
+                continue
+            item_name = it.get("item", "")
+            if isinstance(item_name, str) and item_name.strip():
+                nb = it.get("not_before_chapter")
+                if isinstance(nb, int):
+                    items.append(f"{item_name.strip()}（第{nb}章后）")
+                else:
+                    items.append(f"{item_name.strip()}（后续）")
+        if items:
+            parts.append(f"  延后解锁：{'；'.join(items[:3])}")
+
+    return "\n".join(parts)
+
+
+def build_multi_chapter_plan_hint(
+    current_plan_hint: str,
+    future_plans: list[dict[str, Any]],
+    max_future: int = 9,
+) -> str:
+    """将当前章完整执行卡与后续章摘要组合为多章执行卡。"""
+    if not future_plans:
+        return current_plan_hint
+
+    lines: list[str] = [current_plan_hint]
+    lines.append("")
+    lines.append("【后续章节计划摘要（仅供参考，只需写当前章）】")
+
+    shown = 0
+    for fp in future_plans[:max_future]:
+        summary = fp.get("summary", "")
+        if summary:
+            lines.append(summary)
+            shown += 1
+
+    if shown == 0:
+        # 没有可用的后续章摘要，不添加
+        return current_plan_hint
+
+    lines.append("")
+    lines.append(
+        "注意：上方【后续章节计划摘要】仅供你了解故事走向，帮助提前埋伏笔和避免冲突；"
+        "你只需完成当前章的执行清单，不得提前写后续章节的内容。"
+    )
+
+    return "\n".join(lines)
+
+
 def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
     """
     是否存在未结束的章节生成批次（已入队 batch_start 或 chapter_generation_queued，

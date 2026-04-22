@@ -43,6 +43,9 @@ class NovelMemoryNormSkill(Base):
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
 
 class NovelMemoryNormItem(Base):
@@ -62,6 +65,9 @@ class NovelMemoryNormItem(Base):
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    last_used_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
 
 
 class NovelMemoryNormPet(Base):

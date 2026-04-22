@@ -19,13 +19,15 @@ from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.novel_generation_common import (
     append_generation_log,
     build_chapter_plan_hint,
+    build_future_plan_summary,
+    build_multi_chapter_plan_hint,
     ensure_chapter_heading,
 )
 from app.services.novel_llm_service import NovelLLMService
 from app.services.novel_repo import (
     chapter_content_metrics,
     format_continuity_excerpts,
-    format_recent_approved_fulltext_context,
+    format_previous_chapter_fulltext,
     latest_memory_json,
 )
 from app.services.task_cancel import is_cancel_requested
@@ -127,11 +129,7 @@ def run_generate_chapters_batch_sync(
             }
         step_start = time.perf_counter()
         continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
-        full_context = format_recent_approved_fulltext_context(
-            db,
-            novel_id,
-            max_chapters=max(1, settings.novel_recent_full_context_chapters),
-        )
+        full_context = format_previous_chapter_fulltext(db, novel_id)
         plan = (
             db.query(NovelChapterPlan)
             .filter(NovelChapterPlan.novel_id == novel_id, NovelChapterPlan.chapter_no == no)
@@ -155,6 +153,33 @@ def run_generate_chapters_batch_sync(
             resolved = []
         chapter_plan_hint = build_chapter_plan_hint(
             no, plan.chapter_title, beats, added, resolved
+        )
+
+        # 查询后续章计划摘要（最多9章）
+        future_plans: list[dict[str, Any]] = []
+        future_rows = (
+            db.query(NovelChapterPlan)
+            .filter(
+                NovelChapterPlan.novel_id == novel_id,
+                NovelChapterPlan.chapter_no > no,
+            )
+            .order_by(NovelChapterPlan.chapter_no.asc())
+            .limit(9)
+            .all()
+        )
+        for fp in future_rows:
+            try:
+                fp_beats = json.loads(fp.beats_json or "{}")
+            except Exception:
+                fp_beats = {}
+            fp_beats = normalize_beats_to_v2(fp_beats)
+            summary = build_future_plan_summary(
+                fp.chapter_no, fp.chapter_title, fp_beats
+            )
+            future_plans.append({"summary": summary})
+
+        chapter_plan_hint = build_multi_chapter_plan_hint(
+            chapter_plan_hint, future_plans
         )
         effective_title_hint = (plan.chapter_title or title_hint or "").strip()
         append_generation_log(

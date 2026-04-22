@@ -266,6 +266,8 @@ def list_volumes(
                 "to_chapter": v.to_chapter,
                 "status": v.status,
                 "chapter_plan_count": int(plan_count),
+                "outline_json": v.outline_json or "{}",
+                "outline_markdown": v.outline_markdown or "",
             }
         )
     return out

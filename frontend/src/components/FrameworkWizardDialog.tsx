@@ -14,9 +14,11 @@ import { Label } from "@/components/ui/label";
 import {
   autoGenerateChapters,
   batchReplaceNames,
+  generateArcs,
   generateFramework,
   regenerateFramework,
   updateFrameworkCharacters,
+  waitForArcsGenerateBatch,
   waitForFrameworkCharactersBatch,
   waitForFrameworkGenerateBatch,
   waitForFrameworkRegenerateBatch,
@@ -52,16 +54,75 @@ function parseCharactersFromFrameworkJson(fwJson: string): CharacterRow[] {
     return [];
   }
 }
+
+/** 从 framework_json 解析出已有的 arcs 按卷号列表（兼容旧数据） */
+function parseVolumeNosFromFrameworkJson(fwJson: string): number[] {
+  try {
+    const data = JSON.parse(fwJson || "{}") as Record<string, unknown>;
+    const arcs = data.arcs;
+    if (!Array.isArray(arcs)) return [];
+    const volSet = new Set<number>();
+    for (const arc of arcs) {
+      if (!arc || typeof arc !== "object") continue;
+      const o = arc as Record<string, unknown>;
+      const volNo = o.volume_no;
+      if (typeof volNo === "number" && volNo > 0) volSet.add(volNo);
+    }
+    return Array.from(volSet).sort((a, b) => a - b);
+  } catch {
+    return [];
+  }
+}
+
+type VolumeOutlineRow = {
+  volume_no: number;
+  title: string;
+  outline_json?: string;
+  outline_markdown?: string;
+};
+
+/** 优先从卷表判断哪些卷已有 Arcs */
+function volumeNosWithArcsFromVolumes(volumes: VolumeOutlineRow[]): number[] {
+  const ns: number[] = [];
+  for (const v of volumes) {
+    const md = (v.outline_markdown || "").trim();
+    if (md) {
+      ns.push(v.volume_no);
+      continue;
+    }
+    const raw = (v.outline_json || "").trim();
+    if (!raw || raw === "{}") continue;
+    try {
+      const o = JSON.parse(raw) as { arcs?: unknown };
+      if (Array.isArray(o.arcs) && o.arcs.length > 0) ns.push(v.volume_no);
+    } catch {
+      /* ignore */
+    }
+  }
+  return ns.sort((a, b) => a - b);
+}
+
+/** 根据目标章节数计算总卷数（50章/卷） */
+function calcTotalVolumes(targetChapters: number): number {
+  if (!targetChapters || targetChapters <= 0) return 1;
+  return Math.ceil(targetChapters / 50);
+}
+
 export function FrameworkWizardDialog(props: {
   novelId: string;
   open: boolean;
   onOpenChange: (next: boolean) => void;
   frameworkConfirmed: boolean;
+  baseFrameworkConfirmed: boolean;
   frameworkMarkdown: string;
   frameworkJson: string;
   status: string;
+  targetChapters: number;
+  /** 各卷 outline（与小说级大纲分离）；用于 Arcs 步骤展示与「已有卷」标记 */
+  volumes?: VolumeOutlineRow[];
   onReload: () => Promise<void>;
   onConfirmFramework: () => Promise<void>;
+  onConfirmBaseFramework: () => Promise<void>;
 }) {
   const navigate = useNavigate();
   const [step, setStep] = useState(0);
@@ -71,20 +132,57 @@ export function FrameworkWizardDialog(props: {
   const [notice, setNotice] = useState<React.ReactNode | null>(null);
   const [taskStartedOpen, setTaskStartedOpen] = useState(false);
 
+  // Arcs 相关状态
+  const [arcsInstruction, setArcsInstruction] = useState("");
+  const [arcsTargetVolumes, setArcsTargetVolumes] = useState<number[]>([]);
+
   const originalChars = useMemo(
     () => parseCharactersFromFrameworkJson(props.frameworkJson),
     [props.frameworkJson]
   );
+  const existingVolumeNos = useMemo(() => {
+    const rows = props.volumes ?? [];
+    if (rows.length > 0) {
+      return volumeNosWithArcsFromVolumes(rows);
+    }
+    return parseVolumeNosFromFrameworkJson(props.frameworkJson);
+  }, [props.volumes, props.frameworkJson]);
+
+  const volumeArcsPreviewMd = useMemo(() => {
+    const rows = props.volumes ?? [];
+    return rows
+      .filter((v) => (v.outline_markdown || "").trim().length > 0)
+      .sort((a, b) => a.volume_no - b.volume_no)
+      .map(
+        (v) =>
+          `### 第${v.volume_no}卷 ${(v.title || "").trim()}\n\n${(v.outline_markdown || "").trim()}`
+      )
+      .join("\n\n---\n\n");
+  }, [props.volumes]);
+  const totalVolumes = useMemo(
+    () => calcTotalVolumes(props.targetChapters),
+    [props.targetChapters]
+  );
+
   const [characters, setCharacters] = useState<CharacterRow[]>([]);
   const [shouldSyncNames, setShouldSyncNames] = useState(false);
 
   useEffect(() => {
     if (!props.open) return;
-    setStep(0);
+    // 根据确认状态决定初始步骤
+    if (props.frameworkConfirmed) {
+      setStep(2); // 已确认框架，直接跳到 arcs 步骤
+    } else if (props.baseFrameworkConfirmed) {
+      setStep(1); // base 已确认，跳到人物步骤
+    } else {
+      setStep(0);
+    }
     setErr(null);
     setRegenInstruction("");
+    setArcsInstruction("");
+    setArcsTargetVolumes([]);
     setCharacters(originalChars.length ? originalChars : []);
-  }, [props.open, originalChars]);
+  }, [props.open, originalChars, props.baseFrameworkConfirmed, props.frameworkConfirmed]);
 
   const warningText = props.frameworkConfirmed
     ? "你正在修改已确认的框架：确认新版本后，可能影响之前已生成的章节一致性；后续续写会以新框架为准。"
@@ -264,6 +362,62 @@ export function FrameworkWizardDialog(props: {
     }
   }
 
+  async function runGenerateArcs() {
+    if (!arcsTargetVolumes.length) {
+      setErr("请至少选择一卷");
+      return;
+    }
+    setErr(null);
+    setBusy(true);
+    try {
+      const r = await generateArcs(props.novelId, {
+        target_volume_nos: arcsTargetVolumes,
+        instruction: arcsInstruction.trim(),
+      });
+      const bid = r.batch_id;
+      if (r.status === "queued" && bid) {
+        setNotice(
+          <div className="flex items-center justify-between w-full">
+            <span>正在生成第 {arcsTargetVolumes.join("、")} 卷的 Arcs...</span>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-auto p-0 text-emerald-600 dark:text-emerald-300 font-bold underline decoration-2 underline-offset-4 ml-2 hover:bg-transparent"
+              onClick={() => {
+                props.onOpenChange(false);
+                navigate("/tasks");
+              }}
+            >
+              前往任务页查看进度
+            </Button>
+          </div>
+        );
+        const o = await waitForArcsGenerateBatch(props.novelId, bid);
+        if (o === "failed") throw new Error("生成 Arcs 失败，请查看生成日志");
+      }
+      setNotice(null);
+      await props.onReload();
+      setArcsInstruction("");
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "生成 Arcs 失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function runConfirmBaseFramework() {
+    setErr(null);
+    setBusy(true);
+    try {
+      await props.onConfirmBaseFramework();
+      setStep(1);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "确认基础大纲失败");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function runConfirmFramework() {
     setErr(null);
     setBusy(true);
@@ -296,13 +450,16 @@ export function FrameworkWizardDialog(props: {
     }
   }
 
+  const stepLabels = ["大纲", "人物", "Arcs", "确认"];
+  const totalSteps = 4;
+
   return (
     <>
     <Dialog open={props.open} onOpenChange={props.onOpenChange}>
       <DialogContent className="max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle className="text-xl font-bold text-foreground">
-            修改向导（{step + 1}/3）
+            修改向导（{step + 1}/{totalSteps} · {stepLabels[step]}）
           </DialogTitle>
           <DialogDescription className="text-foreground/80 dark:text-muted-foreground leading-relaxed">
             {warningText}
@@ -323,6 +480,7 @@ export function FrameworkWizardDialog(props: {
           </div>
         ) : null}
 
+        {/* Step 0: 大纲修改 */}
         {step === 0 ? (
           <div className="space-y-4 py-2">
             <div className="space-y-2">
@@ -406,9 +564,15 @@ export function FrameworkWizardDialog(props: {
                     type="button"
                     className="font-bold"
                     disabled={busy}
-                    onClick={() => setStep(1)}
+                    onClick={() => {
+                      if (props.baseFrameworkConfirmed) {
+                        setStep(1);
+                      } else {
+                        void runConfirmBaseFramework();
+                      }
+                    }}
                   >
-                    大纲没问题，下一步
+                    {busy ? "确认中…" : props.baseFrameworkConfirmed ? "大纲已确认，下一步" : "大纲没问题，确认并下一步"}
                   </Button>
                 </div>
               </div>
@@ -416,6 +580,7 @@ export function FrameworkWizardDialog(props: {
           </div>
         ) : null}
 
+        {/* Step 1: 人物修改 */}
         {step === 1 ? (
           <div className="space-y-4 py-2">
             <div className="space-y-2">
@@ -520,12 +685,125 @@ export function FrameworkWizardDialog(props: {
           </div>
         ) : null}
 
+        {/* Step 2: Arcs 修改（选卷 + 自然语言指令） */}
         {step === 2 ? (
+          <div className="space-y-4 py-2">
+            <div className="space-y-2">
+              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                分卷剧情大纲（Arcs）
+              </Label>
+              <p className="text-xs text-foreground/60 dark:text-muted-foreground">
+                Arcs 按卷存储（与上方小说级设定分离）。选择要生成或覆盖的卷号，每卷约 50 章。
+              </p>
+
+              {/* 卷号选择 */}
+              <div className="flex flex-wrap gap-2 mt-2">
+                {Array.from({ length: totalVolumes }, (_, i) => i + 1).map((volNo) => {
+                  const isExisting = existingVolumeNos.includes(volNo);
+                  const isSelected = arcsTargetVolumes.includes(volNo);
+                  return (
+                    <button
+                      key={volNo}
+                      type="button"
+                      className={`px-3 py-1.5 rounded-lg text-sm font-bold border transition-colors ${
+                        isSelected
+                          ? "bg-primary text-primary-foreground border-primary"
+                          : isExisting
+                            ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20"
+                            : "bg-background text-foreground/70 border-border/70 hover:bg-primary/10 hover:text-primary"
+                      }`}
+                      onClick={() => {
+                        setArcsTargetVolumes((prev) =>
+                          prev.includes(volNo)
+                            ? prev.filter((v) => v !== volNo)
+                            : [...prev, volNo].sort((a, b) => a - b)
+                        );
+                      }}
+                      disabled={busy}
+                    >
+                      第{volNo}卷
+                      {isExisting && " ✓"}
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-foreground/50 dark:text-muted-foreground mt-1">
+                共 {totalVolumes} 卷 · 已选 {arcsTargetVolumes.length} 卷 · 
+                带 ✓ 的卷已有 Arcs 数据，重新生成会覆盖
+              </p>
+
+              {/* 修改指令 */}
+              <div className="space-y-1 mt-3">
+                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                  修改指令（可选）
+                </Label>
+                <Input
+                  value={arcsInstruction}
+                  onChange={(e) => setArcsInstruction(e.target.value)}
+                  placeholder="例如：第二卷加入更多感情线；第三卷节奏加快..."
+                  disabled={busy}
+                />
+              </div>
+
+              {/* 已有卷级 Arcs 预览（来自各卷 outline，不是小说级大纲） */}
+              <div className="mt-3 space-y-1">
+                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                  当前已生成的卷级 Arcs
+                </Label>
+                <textarea
+                  value={
+                    volumeArcsPreviewMd ||
+                    (existingVolumeNos.length > 0
+                      ? "（旧版数据：Arcs 可能仍在大纲 JSON 中，请重新生成各卷以迁移到卷存储）"
+                      : "暂无。请先选择卷号并点击生成。")
+                  }
+                  readOnly
+                  className="mt-1 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                />
+              </div>
+
+              <div className="flex flex-wrap gap-2 mt-3">
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="font-bold"
+                  disabled={busy}
+                  onClick={() => setStep(1)}
+                >
+                  上一步
+                </Button>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  className="font-bold"
+                  disabled={busy || arcsTargetVolumes.length === 0}
+                  onClick={() => void runGenerateArcs()}
+                >
+                  {busy ? "生成中…" : `生成第 ${arcsTargetVolumes.join("、")} 卷 Arcs`}
+                </Button>
+                <Button
+                  type="button"
+                  className="font-bold"
+                  disabled={busy}
+                  onClick={() => setStep(3)}
+                >
+                  Arcs 没问题，下一步
+                </Button>
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        {/* Step 3: 最终确认 */}
+        {step === 3 ? (
           <div className="space-y-4 py-2">
             <div className="space-y-2">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
                 最终确认（可返回继续修改）
               </Label>
+              <p className="text-xs text-foreground/60 dark:text-muted-foreground">
+                以下为小说级「基础大纲」（世界观、人物、主线）。分卷 Arcs 不在此文本中，而在各卷的卷级概览里。
+              </p>
               <textarea
                 value={props.frameworkMarkdown || ""}
                 readOnly
@@ -550,6 +828,15 @@ export function FrameworkWizardDialog(props: {
                 onClick={() => setStep(1)}
               >
                 再改人物
+              </Button>
+              <Button
+                type="button"
+                variant="outline"
+                className="font-bold"
+                disabled={busy}
+                onClick={() => setStep(2)}
+              >
+                再改 Arcs
               </Button>
               <Button
                 type="button"

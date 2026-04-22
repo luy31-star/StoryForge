@@ -4,6 +4,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy.dialects.mysql import LONGTEXT
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -19,6 +20,9 @@ class NovelVolume(Base):
     volume_no: Mapped[int] = mapped_column(Integer, index=True)  # 1..N
     title: Mapped[str] = mapped_column(String(512), default="")
     summary: Mapped[str] = mapped_column(Text, default="")
+    # 本卷的概览大纲（从 framework_json.arcs 拆分而来，独立存储）
+    outline_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
+    outline_markdown: Mapped[str] = mapped_column(LONGTEXT, default="")
     from_chapter: Mapped[int] = mapped_column(Integer, index=True)
     to_chapter: Mapped[int] = mapped_column(Integer, index=True)
     status: Mapped[str] = mapped_column(

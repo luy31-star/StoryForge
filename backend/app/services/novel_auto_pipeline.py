@@ -26,7 +26,7 @@ from app.services.novel_repo import (
     next_chapter_no_from_approved,
 )
 from app.services.novel_chapter_generate_batch import run_generate_chapters_batch_sync
-from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_llm_service import NovelLLMService, _ANTI_AI_FLAVOR_BLOCK
 from app.services.novel_volume_plan_batch import run_volume_chapter_plan_batch_sync
 from app.services.task_cancel import is_cancel_requested
 
@@ -40,7 +40,7 @@ def _generate_framework_sync(
     try:
         asyncio.set_event_loop(loop)
         return loop.run_until_complete(
-            llm.generate_framework(novel, db=db, progress_callback=progress_callback)
+            llm.generate_base_framework(novel, db=db, progress_callback=progress_callback)
         )
     finally:
         asyncio.set_event_loop(None)
@@ -388,7 +388,8 @@ def run_ai_create_and_start_sync(
                     "content": (
                         "你是结构化小说策划输出器。"
                         "你的唯一任务是输出一个可被 Python json.loads() 直接解析的 JSON 对象。"
-                        "禁止输出 JSON 之外的任何字符。"
+                        "禁止输出 JSON 之外的任何字符。\n"
+                        f"{_ANTI_AI_FLAVOR_BLOCK}"
                     ),
                 },
                 {"role": "user", "content": prompt},

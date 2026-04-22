@@ -9,7 +9,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.novel import Chapter, NovelMemory
+from app.models.novel import Chapter, Novel, NovelMemory
 from app.models.volume import NovelChapterPlan, NovelVolume
 from app.models.novel_memory_norm import (
     NovelMemoryNormChapter,
@@ -910,6 +910,116 @@ def forbidden_future_arcs_block(chapter_no: int, framework_json: str) -> str:
     )
 
 
+def load_volume_arcs_for_chapter(db: Session, novel_id: str, chapter_no: int) -> list[dict]:
+    """Load arcs from the volume that contains chapter_no."""
+    volume = (
+        db.query(NovelVolume)
+        .filter(
+            NovelVolume.novel_id == novel_id,
+            NovelVolume.from_chapter <= chapter_no,
+            NovelVolume.to_chapter >= chapter_no,
+        )
+        .first()
+    )
+    if not volume or not (volume.outline_json or "").strip():
+        return []
+    try:
+        data = json.loads(volume.outline_json)
+    except json.JSONDecodeError:
+        return []
+    arcs = data.get("arcs", [])
+    return arcs if isinstance(arcs, list) else []
+
+
+def load_all_volume_arcs(db: Session, novel_id: str) -> list[dict]:
+    """Load all arcs from all volumes of a novel, in volume order."""
+    volumes = (
+        db.query(NovelVolume)
+        .filter(NovelVolume.novel_id == novel_id)
+        .order_by(NovelVolume.volume_no.asc())
+        .all()
+    )
+    all_arcs: list[dict] = []
+    for vol in volumes:
+        if not (vol.outline_json or "").strip():
+            continue
+        try:
+            data = json.loads(vol.outline_json)
+        except json.JSONDecodeError:
+            continue
+        arcs = data.get("arcs", [])
+        if isinstance(arcs, list):
+            all_arcs.extend(arcs)
+    return all_arcs
+
+
+def _framework_base_dict_from_stored(framework_json: str) -> dict[str, Any]:
+    """与 novel_llm_service 中 sanitize 对齐：小说行内存的「基础」键（不含 arcs 等）。"""
+    try:
+        data = json.loads(framework_json or "{}")
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    out = dict(data)
+    out.pop("arcs", None)
+    out.pop("volume_overview", None)
+    out.pop("volumes", None)
+    return out
+
+
+def _arcs_list_from_stored_novel_json(framework_json: str) -> list[Any]:
+    """旧版：arcs 直接内嵌在 novels.framework_json。"""
+    try:
+        data = json.loads(framework_json or "{}")
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(data, dict):
+        return []
+    arcs = data.get("arcs")
+    return arcs if isinstance(arcs, list) else []
+
+
+def merged_arcs_list_for_compat(db: Session, novel: Novel) -> list[dict]:
+    """
+    供续写/API 兼容：优先 novel_volumes.outline_json 中的 arcs；
+    若卷表尚无弧线数据，则回退到 novels.framework_json 内嵌 arcs（旧版单表格式）。
+    """
+    vol_arcs = load_all_volume_arcs(db, novel.id)
+    if vol_arcs:
+        return vol_arcs
+    return _arcs_list_from_stored_novel_json(novel.framework_json or "{}")
+
+
+def effective_framework_json_for_prompt(db: Session | None, novel: Novel) -> str:
+    """
+    注入到 LLM 的「有效」框架 JSON：基础字段 + arcs（来自卷表或旧库行）。
+    db 为 None 时无法读卷表，仅使用小说行内嵌 arcs。
+    """
+    base = _framework_base_dict_from_stored(novel.framework_json or "{}")
+    if db is None:
+        legacy = _arcs_list_from_stored_novel_json(novel.framework_json or "{}")
+        out = dict(base)
+        if legacy:
+            out["arcs"] = legacy
+        return json.dumps(out, ensure_ascii=False)
+    arcs = merged_arcs_list_for_compat(db, novel)
+    out = dict(base)
+    if arcs:
+        out["arcs"] = arcs
+    return json.dumps(out, ensure_ascii=False)
+
+
+def framework_json_base_str(novel: Novel) -> str:
+    """仅基础大纲 JSON 字符串（不含 arcs），用于基础阶段重生成等。"""
+    return json.dumps(_framework_base_dict_from_stored(novel.framework_json or "{}"), ensure_ascii=False)
+
+
+def framework_json_merged_compat_str(db: Session, novel: Novel) -> str:
+    """与旧版 API 一致：含 arcs 的完整框架 JSON（arcs 来自卷表或内嵌）。"""
+    return effective_framework_json_for_prompt(db, novel)
+
+
 def _select_arc_for_chapter(framework_json: str, chapter_no: int) -> dict[str, object] | None:
     """
     从 framework_json.arcs 中选取命中 chapter_no 的弧线。
@@ -967,6 +1077,58 @@ def _select_arc_for_chapter(framework_json: str, chapter_no: int) -> dict[str, o
             last_arc = arc
             break
     return last_arc
+
+
+def _select_arc_from_arcs(arcs: list[dict], chapter_no: int) -> dict[str, object] | None:
+    """从预加载的 arcs 列表中选取命中 chapter_no 的弧线。逻辑同 _select_arc_for_chapter。"""
+    if not arcs:
+        return None
+    for arc in arcs:
+        if not isinstance(arc, dict):
+            continue
+        lo = _parse_int(arc.get("from_chapter") or arc.get("from"))
+        hi = _parse_int(arc.get("to_chapter") or arc.get("to"))
+        if lo is None or hi is None:
+            lo2, hi2 = _parse_chapter_range(arc.get("chapter_range") or arc.get("chapters"))
+            lo = lo if lo is not None else lo2
+            hi = hi if hi is not None else hi2
+        if isinstance(lo, int) and isinstance(hi, int) and lo <= chapter_no <= hi:
+            return arc
+    fallback = None
+    min_lo = None
+    for arc in arcs:
+        if not isinstance(arc, dict):
+            continue
+        lo = _parse_int(arc.get("from_chapter") or arc.get("from"))
+        hi = _parse_int(arc.get("to_chapter") or arc.get("to"))
+        if lo is None or hi is None:
+            lo2, hi2 = _parse_chapter_range(arc.get("chapter_range") or arc.get("chapters"))
+            lo = lo if lo is not None else lo2
+            hi = hi if hi is not None else hi2
+        if isinstance(lo, int) and isinstance(hi, int) and chapter_no < lo:
+            if min_lo is None or lo < min_lo:
+                min_lo = lo
+                fallback = arc
+    if fallback:
+        return fallback
+    last_arc: dict | None = None
+    for arc in reversed(arcs):
+        if isinstance(arc, dict):
+            last_arc = arc
+            break
+    return last_arc
+
+
+def _select_arc_for_chapter_db(db: Session, novel_id: str, chapter_no: int) -> dict[str, object] | None:
+    """从卷级 outline_json 中选取命中 chapter_no 的弧线（优先），回退到 framework_json。"""
+    arcs = load_volume_arcs_for_chapter(db, novel_id, chapter_no)
+    if arcs:
+        return _select_arc_from_arcs(arcs, chapter_no)
+    # fallback: read from novel.framework_json
+    novel = db.get(Novel, novel_id)
+    if novel and novel.framework_json:
+        return _select_arc_for_chapter(novel.framework_json, chapter_no)
+    return None
 
 
 def pacing_guard_block(chapter_no: int, framework_json: str, memory_json: str) -> str:
@@ -2134,3 +2296,255 @@ def format_cold_recall_from_db(db: Session, novel_id: str, *, max_items: int = 5
             lines.append(f"  - {str(x)[:180]}")
 
     return "\n".join(lines) if len(lines) > 1 else ""
+
+
+def format_previous_chapter_fulltext(
+    db: Session, novel_id: str, *, max_chars: int = 12000
+) -> str:
+    """前一章完整正文（用于逐章连贯性），替代最近5章的巨大上下文。"""
+    row = (
+        db.query(Chapter)
+        .filter(Chapter.novel_id == novel_id, Chapter.status == "approved")
+        .order_by(Chapter.chapter_no.desc())
+        .first()
+    )
+    if not row:
+        return ""
+    content = (row.content or "").strip()
+    if not content:
+        return ""
+    if len(content) > max_chars:
+        content = content[-max_chars:]
+    return f"【前一章（第{row.chapter_no}章《{row.title}》）完整正文】\n{content}"
+
+
+def format_available_entities_for_chapter(
+    db: Session, novel_id: str, chapter_no: int
+) -> str:
+    """查询当前章节可用的物品和技能，生成约束提示。"""
+    items = (
+        db.query(NovelMemoryNormItem)
+        .filter(
+            NovelMemoryNormItem.novel_id == novel_id,
+            NovelMemoryNormItem.is_active == True,
+            NovelMemoryNormItem.introduced_chapter <= chapter_no,
+            or_(NovelMemoryNormItem.expired_chapter == None, NovelMemoryNormItem.expired_chapter > chapter_no),
+        )
+        .order_by(NovelMemoryNormItem.sort_order)
+        .all()
+    )
+    skills = (
+        db.query(NovelMemoryNormSkill)
+        .filter(
+            NovelMemoryNormSkill.novel_id == novel_id,
+            NovelMemoryNormSkill.is_active == True,
+            NovelMemoryNormSkill.introduced_chapter <= chapter_no,
+            or_(NovelMemoryNormSkill.expired_chapter == None, NovelMemoryNormSkill.expired_chapter > chapter_no),
+        )
+        .order_by(NovelMemoryNormSkill.sort_order)
+        .all()
+    )
+    if not items and not skills:
+        return ""
+    lines: list[str] = ["【当前可用物品与技能（禁止使用未列入的物品/技能）】"]
+    if items:
+        lines.append("已引入物品：")
+        for it in items:
+            intro = f"第{it.introduced_chapter}章引入" if it.introduced_chapter > 0 else "已引入"
+            try:
+                detail = json.loads(it.detail_json or "{}")
+            except json.JSONDecodeError:
+                detail = {}
+            desc = ""
+            if isinstance(detail, dict):
+                for k in ("detail", "description", "desc", "说明"):
+                    v = detail.get(k)
+                    if isinstance(v, str) and v.strip():
+                        desc = v.strip()[:100]
+                        break
+            label = (it.label or "").strip() or "未命名物品"
+            line = f"  · {label}（{intro}"
+            if desc:
+                line += f"，{desc}"
+            line += "）"
+            lines.append(line)
+    if skills:
+        lines.append("已掌握技能：")
+        for sk in skills:
+            intro = f"第{sk.introduced_chapter}章习得" if sk.introduced_chapter > 0 else "已习得"
+            try:
+                detail = json.loads(sk.detail_json or "{}")
+            except json.JSONDecodeError:
+                detail = {}
+            desc = ""
+            if isinstance(detail, dict):
+                for k in ("detail", "description", "desc", "说明"):
+                    v = detail.get(k)
+                    if isinstance(v, str) and v.strip():
+                        desc = v.strip()[:100]
+                        break
+            name = (sk.name or "").strip() or "未命名技能"
+            line = f"  · {name}（{intro}"
+            if desc:
+                line += f"，{desc}"
+            line += "）"
+            lines.append(line)
+    lines.append("")
+    lines.append(
+        "约束：若正文需要使用某物品或技能，必须在上述清单中；"
+        "如需引入新物品/技能，必须在本章中先写发现/获得/习得过程。"
+    )
+    return "\n".join(lines)
+
+
+def _split_markdown_by_h2(md: str) -> list[tuple[str, str]]:
+    """按 Markdown 二级标题（## ）切分文档，返回 (标题, 内容) 列表。"""
+    sections: list[tuple[str, str]] = []
+    current_title = ""
+    current_lines: list[str] = []
+    for line in md.splitlines():
+        if line.startswith("## "):
+            if current_title or current_lines:
+                sections.append((current_title, "\n".join(current_lines).strip()))
+            current_title = line[3:].strip()
+            current_lines = []
+        else:
+            current_lines.append(line)
+    if current_title or current_lines:
+        sections.append((current_title, "\n".join(current_lines).strip()))
+    return sections
+
+
+def format_stage_aware_framework_bible(
+    novel: Novel,
+    chapter_no: int,
+    *,
+    max_chars: int = 6000,
+    framework_json_for_arcs: str | None = None,
+) -> str:
+    """按当前章节所处阶段，从 framework_markdown 中提取相关部分。
+
+    策略：
+    1. 始终包含：world_rules、人物核心设定
+    2. 只包含当前及前一个 arc 的摘要（不包含后续 arc）
+    3. 从 framework_json 中确定当前 arc 的章节范围
+    4. 按 markdown 标题切分，选择性保留
+
+    framework_json_for_arcs：若提供，用于解析 arcs（兼容 arcs 仅在卷表中的情况）。
+    """
+    md = novel.framework_markdown or ""
+    if not md:
+        return novel.background or ""
+    if len(md) <= max_chars:
+        return md
+
+    # 解析 framework_json 确定当前 arc 范围
+    current_arc_range: tuple[int, int] | None = None
+    prev_arc_range: tuple[int, int] | None = None
+    current_arc_title = ""
+    prev_arc_title = ""
+    fj = framework_json_for_arcs if framework_json_for_arcs is not None else (novel.framework_json or "")
+    if fj:
+        try:
+            data = json.loads(fj)
+            arcs = data.get("arcs", [])
+            prev = None
+            for arc in arcs:
+                if not isinstance(arc, dict):
+                    continue
+                b = arc_bounds_from_dict(arc)
+                if not b:
+                    continue
+                lo, hi = b
+                if lo <= chapter_no <= hi:
+                    current_arc_range = (lo, hi)
+                    current_arc_title = str(arc.get("title") or arc.get("name") or "")
+                    if prev:
+                        prev_arc_range = prev[1]
+                        prev_arc_title = prev[2]
+                    break
+                prev = (lo, hi, str(arc.get("title") or arc.get("name") or ""))
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    # 按 markdown 二级标题切分
+    sections = _split_markdown_by_h2(md)
+    if not sections:
+        return md[:max_chars]
+
+    # 分类保留
+    always_keep_keywords = [
+        "世界", "规则", "设定", "人物", "角色", "world", "character",
+        "world_rules", "背景", "主线", "main_plot",
+    ]
+
+    kept: list[str] = []
+    total_len = 0
+    for title, content in sections:
+        title_lower = title.lower()
+        is_core = any(kw in title_lower for kw in always_keep_keywords)
+        is_current_arc = current_arc_title and current_arc_title.lower() in title_lower
+        is_prev_arc = prev_arc_title and prev_arc_title.lower() in title_lower
+
+        if is_core:
+            block = f"## {title}\n{content}"
+        elif is_current_arc:
+            block = f"## {title}\n{content}"
+        elif is_prev_arc:
+            block = f"## {title}\n{content[:600]}"
+        else:
+            block = f"## {title}\n{content[:400]}"
+
+        if total_len + len(block) + 2 > max_chars:
+            remaining = max_chars - total_len - 2
+            if remaining > 100:
+                kept.append(block[:remaining] + "…")
+            break
+        kept.append(block)
+        total_len += len(block) + 2
+
+    result = "\n\n".join(kept)
+    if not result.strip():
+        return md[:max_chars]
+    return result
+
+
+def truncate_framework_json_stage_aware(
+    framework_json: str, chapter_no: int, *, max_len: int = 6000
+) -> str:
+    """按当前阶段裁剪 framework_json，保留 world_rules + 当前 arc + 人物，去掉后续 arc。"""
+    raw = (framework_json or "").strip()
+    if not raw:
+        return "（无框架 JSON）"
+    if len(raw) <= max_len:
+        return raw
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw[:max_len] + "\n…(framework_json 已截断)"
+    if not isinstance(data, dict):
+        return raw[:max_len] + "\n…(framework_json 已截断)"
+
+    # 确定当前 arc 索引
+    arcs = data.get("arcs", [])
+    current_arc_idx = None
+    if isinstance(arcs, list):
+        for i, arc in enumerate(arcs):
+            if not isinstance(arc, dict):
+                continue
+            b = arc_bounds_from_dict(arc)
+            if b and b[0] <= chapter_no <= b[1]:
+                current_arc_idx = i
+                break
+
+    # 裁剪 arcs：只保留到当前 arc + 1（给下一 arc 留预览）
+    if isinstance(arcs, list) and current_arc_idx is not None and len(arcs) > current_arc_idx + 2:
+        trimmed_arcs = arcs[: current_arc_idx + 2]
+        data = dict(data)
+        data["arcs"] = trimmed_arcs
+        data["_arcs_trimmed"] = True
+
+    result = json.dumps(data, ensure_ascii=False)
+    if len(result) > max_len:
+        result = result[:max_len] + '\n…(framework_json 已按阶段裁剪截断)'
+    return result

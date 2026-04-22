@@ -58,6 +58,8 @@ class Novel(Base):
     framework_json: Mapped[str] = mapped_column(LONGTEXT, default="")
     framework_markdown: Mapped[str] = mapped_column(LONGTEXT, default="")
     framework_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 大纲（base framework）已确认，允许生成 arcs
+    base_framework_confirmed: Mapped[bool] = mapped_column(Boolean, default=False)
     status: Mapped[str] = mapped_column(
         String(32), default="draft"
     )  # draft | active | completed

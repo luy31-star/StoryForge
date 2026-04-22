@@ -13,11 +13,13 @@ from app.core.db_migrate import (
     ensure_app_config_row,
     ensure_model_price_split_columns,
     ensure_novel_memory_norm_extended_columns,
+    ensure_item_skill_lifecycle_columns,
     ensure_novel_target_chapters,
     ensure_user_config_columns,
     ensure_user_email_column,
     ensure_user_isolation_columns,
     ensure_user_status_columns,
+    ensure_volume_outline_columns,
     ensure_writing_style_id_column,
     relax_novel_memory_norm_columns,
 )
@@ -111,6 +113,8 @@ def on_startup() -> None:
     ensure_novel_target_chapters(engine)
     ensure_writing_style_id_column(engine)
     ensure_novel_memory_norm_extended_columns(engine)
+    ensure_item_skill_lifecycle_columns(engine)
+    ensure_volume_outline_columns(engine)
     relax_novel_memory_norm_columns(engine)
     ensure_model_price_split_columns(engine)
     ensure_app_config_columns(engine)
