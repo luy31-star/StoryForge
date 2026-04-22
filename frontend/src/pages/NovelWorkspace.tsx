@@ -93,7 +93,7 @@ const CHAPTER_PAGE_SIZE = 3;
 type WorkspaceTab = "studio" | "memory";
 /** 创作工作台主区域：单屏 IDE 式切换，避免整页极长滚动 */
 type StudioMode = "outline" | "volumes" | "chapters";
-type StudioOutlinePane = "baseline" | "arcs" | "arcsQuick";
+type StudioOutlinePane = "baseline" | "arcs";
 
 const MEMORY_ATLAS_POINTS = [
   { left: "10%", top: "18%" },
@@ -3296,9 +3296,8 @@ export function NovelWorkspace() {
                           <div className="flex flex-col gap-1.5">
                             {(
                               [
-                                ["baseline", "基线与 JSON"],
-                                ["arcs", "分卷 Arcs 概览"],
-                                ["arcsQuick", "快捷生成 Arcs"],
+                                ["baseline", "基础大纲"],
+                                ["arcs", "分卷 Arcs"],
                               ] as const
                             ).map(([key, label]) => (
                               <button
@@ -3566,7 +3565,7 @@ export function NovelWorkspace() {
                 一、基础大纲（世界观 / 人物 / 主线）
               </Label>
               <p className="mt-1 text-xs text-foreground/55 dark:text-muted-foreground">
-                不包含分卷 Arcs；卷级剧情在左侧「分卷 Arcs 概览」。
+                不包含分卷 Arcs；卷级剧情见左侧「分卷 Arcs」。
               </p>
               {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
                 <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
@@ -3614,26 +3613,16 @@ export function NovelWorkspace() {
                 />
               )}
             </div>
-            <div>
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                基础大纲 JSON（与卷级 arcs 分离）
-              </Label>
-              <textarea
-                value={fwJson}
-                onChange={(e) => setFwJson(e.target.value)}
-                className="mt-2 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
-              />
-            </div>
             </>
             ) : null}
             {studioOutlinePane === "arcs" ? (
             <div className="space-y-3 border-t border-border/60 pt-6">
               <div className="space-y-1">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                  二、分卷剧情概览（Arcs）
+                  分卷 Arcs（概览与生成）
                 </Label>
                 <p className="text-xs text-foreground/55 dark:text-muted-foreground">
-                  每卷单独保存。可在下方「快捷生成」直接选卷，也可用顶部「完整向导」。续写与章计划会优先读卷上的 outline。
+                  每卷单独保存；下方可勾选卷并生成/覆盖 Arcs，也可用顶部「完整向导」。续写与章计划会优先读卷上的 outline。
                 </p>
               </div>
               {volumes.length === 0 ? (
@@ -3680,82 +3669,81 @@ export function NovelWorkspace() {
                               {om}
                             </pre>
                           ) : (
-                            <p className="mt-3 text-xs text-foreground/50">暂无卷级 Arcs，使用上方「三、快捷生成」或顶部「完整向导」。</p>
+                            <p className="mt-3 text-xs text-foreground/50">暂无卷级 Arcs，可在下方选卷生成或使用「完整向导」。</p>
                           )}
                         </div>
                       );
                     })}
                 </div>
               )}
-            </div>
-            ) : null}
-            {studioOutlinePane === "arcsQuick" ? (
-            <div className="space-y-3 border-t border-border/60 pt-6">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                三、快捷生成分卷 Arcs
-              </Label>
-              <p className="text-xs text-foreground/55 dark:text-muted-foreground">
-                需已确认基础大纲。异步生成，选中卷上已有 Arcs 会被覆盖。
-              </p>
-              {!Boolean(novel?.base_framework_confirmed) ? (
-                <p className="text-xs font-bold text-amber-600 dark:text-amber-400">
-                  请先在向导中确认基础大纲，或使用确认按钮。
+
+              <div className="space-y-3 border-t border-border/50 pt-6">
+                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
+                  生成或覆盖 Arcs
+                </Label>
+                <p className="text-xs text-foreground/55 dark:text-muted-foreground">
+                  需已确认基础大纲。异步生成，选中卷上已有 Arcs 会被覆盖。
                 </p>
-              ) : null}
-              <div className="flex flex-wrap gap-2">
-                {Array.from({ length: totalStudioVolumes }, (_, i) => i + 1).map((volNo) => {
-                  const hasOutline = volumes.some(
-                    (vv) =>
-                      vv.volume_no === volNo && (vv.outline_markdown || "").trim().length > 0
-                  );
-                  const selected = arcsTargetVolumes.includes(volNo);
-                  return (
-                    <button
-                      key={`arc-vol-${volNo}`}
-                      type="button"
-                      disabled={arcsBusy || busy}
-                      onClick={() =>
-                        setArcsTargetVolumes((prev) =>
-                          prev.includes(volNo)
-                            ? prev.filter((x) => x !== volNo)
-                            : [...prev, volNo].sort((a, b) => a - b)
-                        )
-                      }
-                      className={`rounded-xl border px-3 py-1.5 text-xs font-bold transition-colors ${
-                        selected
-                          ? "border-primary bg-primary text-primary-foreground"
-                          : hasOutline
-                            ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
-                            : "border-border/70 bg-background/70 text-foreground/80 hover:bg-muted/40"
-                      }`}
-                    >
-                      第{volNo}卷{hasOutline ? " ✓" : ""}
-                    </button>
-                  );
-                })}
-              </div>
-              <Input
-                value={arcsInstruction}
-                onChange={(e) => setArcsInstruction(e.target.value)}
-                placeholder="可选：如「第二卷加强感情线」「第三卷节奏加快」"
-                className="mt-2"
-                disabled={arcsBusy}
-              />
-              <div className="mt-3 flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  className="font-bold"
-                  disabled={
-                    arcsBusy ||
-                    busy ||
-                    !Boolean(novel?.base_framework_confirmed) ||
-                    arcsTargetVolumes.length === 0
-                  }
-                  onClick={() => void runInlineGenerateArcs()}
-                >
-                  {arcsBusy ? "生成中…" : `生成第 ${arcsTargetVolumes.join("、")} 卷 Arcs`}
-                </Button>
+                {!Boolean(novel?.base_framework_confirmed) ? (
+                  <p className="text-xs font-bold text-amber-600 dark:text-amber-400">
+                    请先在向导中确认基础大纲，或使用确认按钮。
+                  </p>
+                ) : null}
+                <div className="flex flex-wrap gap-2">
+                  {Array.from({ length: totalStudioVolumes }, (_, i) => i + 1).map((volNo) => {
+                    const hasOutline = volumes.some(
+                      (vv) =>
+                        vv.volume_no === volNo && (vv.outline_markdown || "").trim().length > 0
+                    );
+                    const selected = arcsTargetVolumes.includes(volNo);
+                    return (
+                      <button
+                        key={`arc-vol-${volNo}`}
+                        type="button"
+                        disabled={arcsBusy || busy}
+                        onClick={() =>
+                          setArcsTargetVolumes((prev) =>
+                            prev.includes(volNo)
+                              ? prev.filter((x) => x !== volNo)
+                              : [...prev, volNo].sort((a, b) => a - b)
+                          )
+                        }
+                        className={`rounded-xl border px-3 py-1.5 text-xs font-bold transition-colors ${
+                          selected
+                            ? "border-primary bg-primary text-primary-foreground"
+                            : hasOutline
+                              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
+                              : "border-border/70 bg-background/70 text-foreground/80 hover:bg-muted/40"
+                        }`}
+                      >
+                        第{volNo}卷{hasOutline ? " ✓" : ""}
+                      </button>
+                    );
+                  })}
+                </div>
+                <Input
+                  value={arcsInstruction}
+                  onChange={(e) => setArcsInstruction(e.target.value)}
+                  placeholder="可选：如「第二卷加强感情线」「第三卷节奏加快」"
+                  className="mt-1"
+                  disabled={arcsBusy}
+                />
+                <div className="mt-2 flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="font-bold"
+                    disabled={
+                      arcsBusy ||
+                      busy ||
+                      !Boolean(novel?.base_framework_confirmed) ||
+                      arcsTargetVolumes.length === 0
+                    }
+                    onClick={() => void runInlineGenerateArcs()}
+                  >
+                    {arcsBusy ? "生成中…" : `生成第 ${arcsTargetVolumes.join("、")} 卷 Arcs`}
+                  </Button>
+                </div>
               </div>
             </div>
             ) : null}
