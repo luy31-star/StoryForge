@@ -91,6 +91,9 @@ const STRUCTURED_LIST_PAGE = 8;
 const CONTINUITY_LINE_PAGE = 8;
 const CHAPTER_PAGE_SIZE = 3;
 type WorkspaceTab = "studio" | "memory";
+/** 创作工作台主区域：单屏 IDE 式切换，避免整页极长滚动 */
+type StudioMode = "outline" | "volumes" | "chapters";
+type StudioOutlinePane = "baseline" | "arcs" | "arcsQuick";
 
 const MEMORY_ATLAS_POINTS = [
   { left: "10%", top: "18%" },
@@ -540,6 +543,8 @@ export function NovelWorkspace() {
   const [fwJson, setFwJson] = useState("{}");
   const [frameworkWizardOpen, setFrameworkWizardOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<WorkspaceTab>("studio");
+  const [studioMode, setStudioMode] = useState<StudioMode>("volumes");
+  const [studioOutlinePane, setStudioOutlinePane] = useState<StudioOutlinePane>("baseline");
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
@@ -620,9 +625,6 @@ export function NovelWorkspace() {
   const [chapterThinkExpanded, setChapterThinkExpanded] = useState(false);
   const [chapterChatAbort, setChapterChatAbort] = useState<AbortController | null>(null);
   const [volumes, setVolumes] = useState<Awaited<ReturnType<typeof listVolumes>>>([]);
-  const studioOutlineRef = useRef<HTMLDivElement>(null);
-  const studioVolumesRef = useRef<HTMLDivElement>(null);
-  const studioChaptersRef = useRef<HTMLDivElement>(null);
   const [arcsTargetVolumes, setArcsTargetVolumes] = useState<number[]>([]);
   const [arcsInstruction, setArcsInstruction] = useState("");
   const [arcsBusy, setArcsBusy] = useState(false);
@@ -3235,49 +3237,45 @@ export function NovelWorkspace() {
           </TabsList>
 
           <TabsContent value="studio" className="mt-4 border-0 bg-transparent p-0 shadow-none">
-            <div className="sticky top-0 z-20 border-b border-border/70 bg-background/92 px-4 py-2.5 backdrop-blur-xl md:px-6">
-              <div className="novel-container flex flex-wrap items-center gap-2">
+            <div className="sticky top-0 z-20 border-b border-border/70 bg-background/92 px-3 py-2 backdrop-blur-xl sm:px-4 md:px-6">
+              <div className="novel-container flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-2">
                 <span className="hidden text-[10px] font-bold uppercase tracking-wider text-foreground/45 sm:inline">
-                  定位
+                  工作台
                 </span>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="h-8 rounded-full px-3 text-xs font-bold"
-                  onClick={() =>
-                    studioOutlineRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-                  }
-                >
-                  ① 大纲与分卷
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="h-8 rounded-full px-3 text-xs font-bold"
-                  onClick={() =>
-                    studioVolumesRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-                  }
-                >
-                  ② 卷与章计划
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="h-8 rounded-full px-3 text-xs font-bold"
-                  onClick={() =>
-                    studioChaptersRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
-                  }
-                >
-                  ③ 章节创作
-                </Button>
+                <div className="flex flex-wrap gap-1.5">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={studioMode === "outline" ? "default" : "secondary"}
+                    className="h-8 rounded-full px-3 text-xs font-bold"
+                    onClick={() => setStudioMode("outline")}
+                  >
+                    ① 大纲与分卷
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={studioMode === "volumes" ? "default" : "secondary"}
+                    className="h-8 rounded-full px-3 text-xs font-bold"
+                    onClick={() => setStudioMode("volumes")}
+                  >
+                    ② 卷与章计划
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={studioMode === "chapters" ? "default" : "secondary"}
+                    className="h-8 rounded-full px-3 text-xs font-bold"
+                    onClick={() => setStudioMode("chapters")}
+                  >
+                    ③ 章节创作
+                  </Button>
+                </div>
                 <Button
                   type="button"
                   size="sm"
                   variant="outline"
-                  className="ml-auto h-8 rounded-full px-3 text-xs font-bold"
+                  className="h-8 rounded-full px-3 text-xs font-bold sm:ml-auto"
                   onClick={() => setFrameworkWizardOpen(true)}
                 >
                   打开完整向导
@@ -3285,17 +3283,241 @@ export function NovelWorkspace() {
               </div>
             </div>
 
-            <div className="novel-container space-y-10 py-6 md:space-y-12 md:py-8">
+            <div className="novel-container py-4 md:py-5">
+              <div className="flex max-h-[min(85dvh,920px)] min-h-[min(52dvh,420px)] flex-col overflow-hidden rounded-2xl border border-border/60 bg-background/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+                <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
+                  <aside className="flex max-h-[34vh] w-full shrink-0 flex-col border-b border-border/60 bg-muted/15 lg:max-h-none lg:w-[min(18rem,92vw)] lg:border-b-0 lg:border-r border-border/60">
+                    <div className="soft-scroll min-h-0 flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
+                      {studioMode === "outline" ? (
+                        <>
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
+                            大纲分区
+                          </p>
+                          <div className="flex flex-col gap-1.5">
+                            {(
+                              [
+                                ["baseline", "基线与 JSON"],
+                                ["arcs", "分卷 Arcs 概览"],
+                                ["arcsQuick", "快捷生成 Arcs"],
+                              ] as const
+                            ).map(([key, label]) => (
+                              <button
+                                key={key}
+                                type="button"
+                                onClick={() => {
+                                  setStudioOutlinePane(key);
+                                  setStudioMode("outline");
+                                }}
+                                className={`w-full rounded-xl border px-3 py-2.5 text-left text-xs font-bold transition-colors ${
+                                  studioOutlinePane === key
+                                    ? "border-primary/40 bg-primary/12 text-foreground"
+                                    : "border-border/60 bg-background/50 text-foreground/75 hover:bg-muted/40"
+                                }`}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        </>
+                      ) : null}
+                      {studioMode === "volumes" ? (
+                        <>
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
+                            卷列表
+                          </p>
+                          <div className="space-y-2">
+                            {volumes.map((v) => (
+                              <button
+                                key={v.id}
+                                type="button"
+                                onClick={() => setSelectedVolumeId(v.id)}
+                                className={`w-full rounded-2xl border px-3 py-3 text-left text-xs transition-all duration-300 ${
+                                  selectedVolumeId === v.id
+                                    ? "border-primary/35 bg-primary/10 shadow-[0_14px_30px_hsl(var(--primary)/0.16)]"
+                                    : "border-border bg-background/40 hover:bg-muted/30"
+                                }`}
+                              >
+                                <div className="flex items-center justify-between gap-2 font-bold text-foreground">
+                                  <span>
+                                    第{v.volume_no}卷 {v.title}
+                                  </span>
+                                  <span className="text-[11px] text-foreground/60 dark:text-muted-foreground">
+                                    计划{v.chapter_plan_count}
+                                  </span>
+                                </div>
+                                <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium">
+                                  第{v.from_chapter}—{v.to_chapter}章 · {v.status}
+                                </div>
+                                {v.summary ? (
+                                  <div className="mt-1 line-clamp-2 text-foreground/70 dark:text-muted-foreground font-medium">
+                                    {v.summary}
+                                  </div>
+                                ) : null}
+                                <div className="mt-3">
+                                  <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground/50">
+                                    <span>轨道覆盖</span>
+                                    <span>
+                                      {Math.round(
+                                        clamp01(
+                                          v.chapter_plan_count /
+                                            Math.max(1, v.to_chapter - v.from_chapter + 1)
+                                        ) * 100
+                                      )}
+                                      %
+                                    </span>
+                                  </div>
+                                  <div className="mt-1 h-1.5 rounded-full bg-background/70">
+                                    <div
+                                      className={`h-full rounded-full ${
+                                        selectedVolumeId === v.id
+                                          ? "bg-gradient-to-r from-primary via-accent to-cyan-300"
+                                          : "bg-gradient-to-r from-foreground/40 via-foreground/20 to-transparent"
+                                      }`}
+                                      style={{
+                                        width: `${Math.max(
+                                          10,
+                                          Math.round(
+                                            clamp01(
+                                              v.chapter_plan_count /
+                                                Math.max(1, v.to_chapter - v.from_chapter + 1)
+                                            ) * 100
+                                          )
+                                        )}%`,
+                                      }}
+                                    />
+                                  </div>
+                                </div>
+                              </button>
+                            ))}
+                            {volumes.length === 0 ? (
+                              <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
+                                暂无卷。在右侧用「生成卷列表」创建。
+                              </p>
+                            ) : null}
+                          </div>
+                        </>
+                      ) : null}
+                      {studioMode === "chapters" ? (
+                        <>
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
+                            章节目录
+                          </p>
+                          <div className="shrink-0 space-y-2">
+                            {volumes.length > 0 ? (
+                              <div className="no-scrollbar flex gap-1.5 overflow-x-auto pb-1">
+                                {volumes.map((v, i) => (
+                                  <button
+                                    key={v.id}
+                                    type="button"
+                                    onClick={() => {
+                                      setChapterVolumeId(v.id);
+                                      setSelectedChapterId("");
+                                    }}
+                                    className={`rounded-full px-3 py-1 text-[10px] transition-all border font-bold ${
+                                      chapterVolumeId === v.id
+                                        ? "bg-primary text-primary-foreground border-primary shadow-sm"
+                                        : "bg-background/40 text-foreground/60 dark:text-muted-foreground border-border/50 hover:bg-muted/30"
+                                    }`}
+                                    title={v.title || `第${i + 1}卷`}
+                                  >
+                                    第{i + 1}卷
+                                  </button>
+                                ))}
+                              </div>
+                            ) : (
+                              <p className="text-[10px] text-foreground/50 dark:text-muted-foreground italic font-medium">
+                                尚无分卷
+                              </p>
+                            )}
+                          </div>
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">章节</p>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-7 text-[10px] text-primary hover:text-primary hover:bg-primary/10 font-bold"
+                              onClick={() => {
+                                setExportContent("");
+                                setExportOpen(true);
+                              }}
+                            >
+                              导出正文
+                            </Button>
+                          </div>
+                          <div className="soft-scroll max-h-[min(38dvh,320px)] space-y-2 overflow-y-auto pr-0.5 lg:max-h-[min(58dvh,560px)]">
+                            {filteredChapters.map((ch) => (
+                              <button
+                                key={ch.id}
+                                type="button"
+                                onClick={() => setSelectedChapterId(ch.id)}
+                                className={`w-full rounded-2xl border px-3 py-3 text-left text-xs transition-all duration-300 ${
+                                  selectedChapterId === ch.id
+                                    ? "border-primary/35 bg-primary/10 shadow-[0_14px_30px_hsl(var(--primary)/0.16)]"
+                                    : "border-border bg-background/40 hover:bg-muted/30"
+                                }`}
+                              >
+                                <div className="flex items-center gap-2 font-bold text-foreground">
+                                  <span>
+                                    第{ch.chapter_no}章 {ch.title}
+                                  </span>
+                                  {ch.pending_content ? (
+                                    <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 font-bold">
+                                      <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
+                                      待确认
+                                    </span>
+                                  ) : null}
+                                </div>
+                                <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium italic">
+                                  {ch.status} · {ch.source}
+                                </div>
+                                <div className="mt-2">
+                                  <span
+                                    role="button"
+                                    tabIndex={0}
+                                    className={`inline-block rounded-full px-2.5 py-1 text-[11px] transition-colors font-bold ${
+                                      busy
+                                        ? "cursor-not-allowed text-foreground/40 dark:text-muted-foreground"
+                                        : "cursor-pointer text-destructive hover:bg-destructive/10"
+                                    }`}
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      if (busy) return;
+                                      void runDeleteChapter(ch);
+                                    }}
+                                    onKeyDown={(e) => {
+                                      if (e.key !== "Enter" && e.key !== " ") return;
+                                      e.preventDefault();
+                                      e.stopPropagation();
+                                      if (busy) return;
+                                      void runDeleteChapter(ch);
+                                    }}
+                                  >
+                                    删除
+                                  </span>
+                                </div>
+                              </button>
+                            ))}
+                            {filteredChapters.length === 0 ? (
+                              <p className="py-6 text-center text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
+                                当前卷暂无章节
+                              </p>
+                            ) : null}
+                          </div>
+                        </>
+                      ) : null}
+                    </div>
+                  </aside>
+                  <div className="min-h-0 flex-1 overflow-y-auto soft-scroll p-4 md:p-5">
+            {studioMode === "outline" ? (
             <section
-              ref={studioOutlineRef}
               id="studio-outline"
-              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+              className="glass-panel space-y-4 p-5 md:p-6"
             >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">小说概览与创作基线</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  在同一页完成：基础大纲、分卷 Arcs、章计划与正文。下方可按区块跳转；分卷 Arcs 按卷存储，可单独覆盖。
+                  左侧切换子区块；右侧为当前内容。分卷 Arcs 存于各卷，可单独覆盖。
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -3328,7 +3550,7 @@ export function NovelWorkspace() {
                 <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议下一步</p>
                 <p className="mt-2 text-sm font-bold text-foreground">
                   {frameworkConfirmed
-                    ? "向下滚动到「卷与章计划」或「章节创作」"
+                    ? "用顶部 ②③ 切换卷计划与章节"
                     : novel?.status === "failed"
                       ? "AI 构思似乎失败了，请尝试重试"
                       : !fwMd && novel?.status === "draft"
@@ -3337,12 +3559,14 @@ export function NovelWorkspace() {
                 </p>
               </div>
             </div>
+            {studioOutlinePane === "baseline" ? (
+            <>
             <div className="relative">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
                 一、基础大纲（世界观 / 人物 / 主线）
               </Label>
               <p className="mt-1 text-xs text-foreground/55 dark:text-muted-foreground">
-                不包含分卷 Arcs；卷级剧情见下方「分卷概览」。
+                不包含分卷 Arcs；卷级剧情在左侧「分卷 Arcs 概览」。
               </p>
               {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
                 <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
@@ -3400,7 +3624,9 @@ export function NovelWorkspace() {
                 className="mt-2 min-h-[140px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-xs text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
               />
             </div>
-
+            </>
+            ) : null}
+            {studioOutlinePane === "arcs" ? (
             <div className="space-y-3 border-t border-border/60 pt-6">
               <div className="space-y-1">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
@@ -3412,7 +3638,7 @@ export function NovelWorkspace() {
               </div>
               {volumes.length === 0 ? (
                 <div className="rounded-2xl border border-dashed border-border/70 bg-background/40 p-6 text-sm text-foreground/60">
-                  尚未生成卷列表。请向下滚动到「② 卷与章计划」区块，点击「生成卷列表」，再回本区查看与生成 Arcs。
+                  尚未生成卷列表。请点击顶部「② 卷与章计划」，生成卷列表后再回到本区。
                 </div>
               ) : (
                 <div className="grid gap-3 md:grid-cols-2">
@@ -3462,7 +3688,8 @@ export function NovelWorkspace() {
                 </div>
               )}
             </div>
-
+            ) : null}
+            {studioOutlinePane === "arcsQuick" ? (
             <div className="space-y-3 border-t border-border/60 pt-6">
               <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
                 三、快捷生成分卷 Arcs
@@ -3531,18 +3758,19 @@ export function NovelWorkspace() {
                 </Button>
               </div>
             </div>
+            ) : null}
             </section>
-
+            ) : null}
+            {studioMode === "volumes" ? (
             <section
-              ref={studioVolumesRef}
               id="studio-volumes"
-              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+              className="glass-panel space-y-4 p-5 md:p-6"
             >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">卷与章计划</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  生成卷列表 → 为当前卷分批生成章计划 → 在下方章节区从计划生成正文。
+                  生成卷列表 → 为本卷分批生成章计划 → 在「③ 章节创作」续写与编辑正文。
                 </p>
               </div>
               <div className="glass-chip font-bold text-foreground/80">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
@@ -3711,81 +3939,10 @@ export function NovelWorkspace() {
               </div>
             ) : null}
 
-            <div className="grid gap-4 lg:grid-cols-12">
-              <aside className="glass-panel-subtle soft-scroll order-1 lg:col-span-4 p-4">
-                <p className="mb-2 text-xs font-bold text-foreground/60 dark:text-muted-foreground">卷列表</p>
-                <div className="max-h-[38vh] space-y-2 overflow-auto pr-1 sm:max-h-[48vh] lg:max-h-[70vh]">
-                  {volumes.map((v) => (
-                    <button
-                      key={v.id}
-                      type="button"
-                      onClick={() => setSelectedVolumeId(v.id)}
-                      className={`w-full rounded-2xl border px-3 py-3 text-left text-xs transition-all duration-300 ${
-                        selectedVolumeId === v.id
-                          ? "border-primary/35 bg-primary/10 shadow-[0_14px_30px_hsl(var(--primary)/0.16)]"
-                          : "border-border bg-background/40 hover:bg-muted/30"
-                      }`}
-                    >
-                      <div className="flex items-center justify-between gap-2 font-bold text-foreground">
-                        <span>
-                          第{v.volume_no}卷 {v.title}
-                        </span>
-                        <span className="text-[11px] text-foreground/60 dark:text-muted-foreground">
-                          计划{v.chapter_plan_count}
-                        </span>
-                      </div>
-                      <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium">
-                        第{v.from_chapter}—{v.to_chapter}章 · {v.status}
-                      </div>
-                      {v.summary ? (
-                        <div className="mt-1 line-clamp-2 text-foreground/70 dark:text-muted-foreground font-medium">
-                          {v.summary}
-                        </div>
-                      ) : null}
-                      <div className="mt-3">
-                        <div className="flex items-center justify-between gap-2 text-[10px] font-semibold text-foreground/50">
-                          <span>轨道覆盖</span>
-                          <span>
-                            {Math.round(
-                              clamp01(
-                                v.chapter_plan_count /
-                                  Math.max(1, v.to_chapter - v.from_chapter + 1)
-                              ) * 100
-                            )}
-                            %
-                          </span>
-                        </div>
-                        <div className="mt-1 h-1.5 rounded-full bg-background/70">
-                          <div
-                            className={`h-full rounded-full ${
-                              selectedVolumeId === v.id
-                                ? "bg-gradient-to-r from-primary via-accent to-cyan-300"
-                                : "bg-gradient-to-r from-foreground/40 via-foreground/20 to-transparent"
-                            }`}
-                            style={{
-                              width: `${Math.max(
-                                10,
-                                Math.round(
-                                  clamp01(
-                                    v.chapter_plan_count /
-                                      Math.max(1, v.to_chapter - v.from_chapter + 1)
-                                  ) * 100
-                                )
-                              )}%`,
-                            }}
-                          />
-                        </div>
-                      </div>
-                    </button>
-                  ))}
-                  {volumes.length === 0 ? (
-                    <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">暂无卷。点击上方按钮生成。</p>
-                  ) : null}
-                </div>
-              </aside>
-              <section className="glass-panel-subtle order-2 lg:col-span-8 p-5">
+            <div>
+              <section className="glass-panel-subtle p-5">
                 {!selectedVolumeId ? (
-                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧卷。</p>
+                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请在左侧栏选择一卷。</p>
                 ) : (
                   <div className="space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
@@ -4156,11 +4313,11 @@ export function NovelWorkspace() {
               </section>
             </div>
             </section>
-
+            ) : null}
+            {studioMode === "chapters" ? (
             <section
-              ref={studioChaptersRef}
               id="studio-chapters"
-              className="glass-panel scroll-mt-32 space-y-4 p-5 md:p-6"
+              className="glass-panel space-y-4 p-5 md:p-6"
             >
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
@@ -4267,112 +4424,10 @@ export function NovelWorkspace() {
               <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">{generateTrace}</p>
             ) : null}
             
-            <div className="grid gap-4 lg:grid-cols-12">
-              <aside className={`glass-panel-subtle lg:col-span-4 p-4 flex flex-col overflow-hidden ${selectedChapter ? "order-2" : "order-1"} max-h-[45vh] sm:max-h-[52vh] lg:order-1 lg:max-h-[85vh]`}>
-                <div className="mb-4 shrink-0 space-y-2">
-                  <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">按卷浏览</p>
-                  {volumes.length > 0 ? (
-                    <div className="no-scrollbar flex gap-1.5 overflow-x-auto pb-1">
-                      {volumes.map((v, i) => (
-                        <button
-                          key={v.id}
-                          type="button"
-                          onClick={() => {
-                            setChapterVolumeId(v.id);
-                            setSelectedChapterId("");
-                          }}
-                          className={`rounded-full px-3 py-1 text-[10px] transition-all border font-bold ${
-                            chapterVolumeId === v.id
-                              ? "bg-primary text-primary-foreground border-primary shadow-sm"
-                              : "bg-background/40 text-foreground/60 dark:text-muted-foreground border-border/50 hover:bg-muted/30"
-                          }`}
-                          title={v.title || `第${i + 1}卷`}
-                        >
-                          第{i + 1}卷
-                        </button>
-                      ))}
-                    </div>
-                  ) : (
-                    <p className="text-[10px] text-foreground/50 dark:text-muted-foreground italic font-medium">尚无分卷</p>
-                  )}
-                </div>
-                
-                <div className="mb-2 flex items-center justify-between shrink-0">
-                  <p className="text-xs font-bold text-foreground/60 dark:text-muted-foreground">章节目录</p>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-7 text-[10px] text-primary hover:text-primary hover:bg-primary/10 font-bold"
-                    onClick={() => {
-                      setExportContent("");
-                      setExportOpen(true);
-                    }}
-                  >
-                    一键导出正文
-                  </Button>
-                </div>
-                <div className="soft-scroll space-y-2 overflow-auto pr-1 flex-1">
-                  {filteredChapters.map((ch) => (
-                    <button
-                      key={ch.id}
-                      type="button"
-                      onClick={() => setSelectedChapterId(ch.id)}
-                      className={`w-full rounded-2xl border px-3 py-3 text-left text-xs transition-all duration-300 ${
-                        selectedChapterId === ch.id
-                          ? "border-primary/35 bg-primary/10 shadow-[0_14px_30px_hsl(var(--primary)/0.16)]"
-                          : "border-border bg-background/40 hover:bg-muted/30"
-                      }`}
-                    >
-                      <div className="flex items-center gap-2 font-bold text-foreground">
-                        <span>
-                          第{ch.chapter_no}章 {ch.title}
-                        </span>
-                        {ch.pending_content ? (
-                          <span className="inline-flex items-center gap-1 rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] text-amber-600 font-bold">
-                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-400" />
-                            待确认修订
-                          </span>
-                        ) : null}
-                      </div>
-                      <div className="mt-1 text-foreground/60 dark:text-muted-foreground font-medium italic">
-                        {ch.status} · {ch.source}
-                      </div>
-                      <div className="mt-2">
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          className={`inline-block rounded-full px-2.5 py-1 text-[11px] transition-colors font-bold ${
-                            busy
-                              ? "cursor-not-allowed text-foreground/40 dark:text-muted-foreground"
-                              : "cursor-pointer text-destructive hover:bg-destructive/10"
-                          }`}
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            if (busy) return;
-                            void runDeleteChapter(ch);
-                          }}
-                          onKeyDown={(e) => {
-                            if (e.key !== "Enter" && e.key !== " ") return;
-                            e.preventDefault();
-                            e.stopPropagation();
-                            if (busy) return;
-                            void runDeleteChapter(ch);
-                          }}
-                        >
-                          删除
-                        </span>
-                      </div>
-                    </button>
-                  ))}
-                  {filteredChapters.length === 0 ? (
-                    <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium py-8 text-center">当前卷暂无章节</p>
-                  ) : null}
-                </div>
-              </aside>
-
-              <section className={`glass-panel-subtle lg:col-span-8 p-5 ${selectedChapter ? "order-1" : "order-2"} lg:order-2`}>
+            <div>
+              <section className="glass-panel-subtle p-5">
                 {!selectedChapter ? (
-                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请选择左侧章节。</p>
+                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请在左侧栏选择一章。</p>
                 ) : (
                   <div className="space-y-4">
                     <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
@@ -4636,6 +4691,10 @@ export function NovelWorkspace() {
               </section>
             </div>
             </section>
+            ) : null}
+                  </div>
+                </div>
+              </div>
             </div>
           </TabsContent>
 
@@ -5785,11 +5844,11 @@ export function NovelWorkspace() {
           <p className="text-[11px] font-medium text-foreground/60">
             {activeTab === "studio"
               ? selectedChapter
-                ? `正在编辑第 ${selectedChapter.chapter_no} 章 · 可上滑查看大纲与章计划`
+                ? `正在编辑第 ${selectedChapter.chapter_no} 章 · 顶部可切到大纲/卷计划`
                 : selectedVolumeId
-                  ? "已选卷 · 可上滑生成章计划或自动续写"
+                  ? "已选卷 · 顶部①②③切换区块"
                   : frameworkConfirmed
-                    ? "框架已确认 · 上滑使用顶部导航快速跳转"
+                    ? "框架已确认 · 用①②③切换，避免长页滚动"
                     : "先确认框架，再生成卷与章节"
               : approvedChapterCount > 0
                 ? "章节审定后建议到「记忆」页刷新"
