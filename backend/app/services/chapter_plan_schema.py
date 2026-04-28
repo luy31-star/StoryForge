@@ -4,12 +4,20 @@ from copy import deepcopy
 from datetime import datetime, timezone
 from typing import Any
 
-CHAPTER_PLAN_SCHEMA_VERSION = 2
+CHAPTER_PLAN_SCHEMA_VERSION = 3
 
 _DISPLAY_SUMMARY_STRING_KEYS = (
     "plot_summary",
     "stage_position",
     "pacing_justification",
+)
+_EXPRESSIVE_BRIEF_STRING_KEYS = (
+    "pov_strategy",
+    "emotional_curve",
+    "sensory_focus",
+    "dialogue_strategy",
+    "scene_tempo",
+    "reveal_strategy",
 )
 _EXECUTION_CARD_STRING_KEYS = (
     "chapter_goal",
@@ -122,6 +130,11 @@ def _clean_scene_cards(value: Any) -> list[dict[str, Any]]:
             content = _clean_text(item.get("content") or item.get("summary"))
             outcome = _clean_text(item.get("outcome") or item.get("result"))
             words = _coerce_optional_int(item.get("words") or item.get("target_words"))
+            emotion_beat = _clean_text(item.get("emotion_beat") or item.get("emotion"))
+            camera = _clean_text(item.get("camera") or item.get("camera_language"))
+            dialogue_density = _clean_text(
+                item.get("dialogue_density") or item.get("dialogue_pressure")
+            )
         else:
             label = f"场景{idx}"
             goal = ""
@@ -129,6 +142,9 @@ def _clean_scene_cards(value: Any) -> list[dict[str, Any]]:
             content = _clean_text(item)
             outcome = ""
             words = None
+            emotion_beat = ""
+            camera = ""
+            dialogue_density = ""
         if not any([goal, conflict, content, outcome]):
             continue
         row: dict[str, Any] = {"label": label}
@@ -142,7 +158,23 @@ def _clean_scene_cards(value: Any) -> list[dict[str, Any]]:
             row["outcome"] = outcome
         if words is not None and words > 0:
             row["words"] = words
+        if emotion_beat:
+            row["emotion_beat"] = emotion_beat
+        if camera:
+            row["camera"] = camera
+        if dialogue_density:
+            row["dialogue_density"] = dialogue_density
         out.append(row)
+    return out
+
+
+def _clean_expressive_brief(value: Any) -> dict[str, str]:
+    raw = value if isinstance(value, dict) else {}
+    out: dict[str, str] = {}
+    for key in _EXPRESSIVE_BRIEF_STRING_KEYS:
+        text = _clean_text(raw.get(key))
+        if text:
+            out[key] = text
     return out
 
 
@@ -164,7 +196,8 @@ def _scene_cards_summary(scene_cards: list[dict[str, Any]]) -> str:
         goal = _clean_text(item.get("goal"))
         conflict = _clean_text(item.get("conflict"))
         outcome = _clean_text(item.get("outcome"))
-        segments = [text for text in [content, goal, conflict, outcome] if text]
+        emotion_beat = _clean_text(item.get("emotion_beat"))
+        segments = [text for text in [content, goal, conflict, outcome, emotion_beat] if text]
         if segments:
             parts.append(f"{label}：{'；'.join(segments[:3])}")
     return "\n".join(parts)
@@ -189,6 +222,7 @@ def _attach_legacy_aliases(data: dict[str, Any]) -> dict[str, Any]:
     out["progress_allowed"] = deepcopy(card.get("allowed_progress") or [])
     out["must_not"] = deepcopy(card.get("must_not") or [])
     out["reserved_for_later"] = deepcopy(card.get("reserved_for_later") or [])
+    out["expressive_brief"] = deepcopy(out.get("expressive_brief") or {})
     return out
 
 
@@ -217,6 +251,10 @@ def normalize_beats_to_v2(beats: Any) -> dict[str, Any]:
     )
     if not display_plot_summary and scene_cards:
         display_plot_summary = _scene_cards_summary(scene_cards)
+
+    expressive_in = (
+        raw.get("expressive_brief") if isinstance(raw.get("expressive_brief"), dict) else {}
+    )
 
     execution_card = {
         "chapter_goal": _clean_text(
@@ -273,6 +311,24 @@ def normalize_beats_to_v2(beats: Any) -> dict[str, Any]:
         ),
     }
 
+    expressive_brief = _clean_expressive_brief(
+        {
+            **expressive_in,
+            "pov_strategy": expressive_in.get("pov_strategy")
+            or raw.get("pov_strategy")
+            or raw.get("pov"),
+            "emotional_curve": expressive_in.get("emotional_curve")
+            or raw.get("emotional_curve")
+            or raw.get("emotion"),
+            "sensory_focus": expressive_in.get("sensory_focus") or raw.get("sensory_focus"),
+            "dialogue_strategy": expressive_in.get("dialogue_strategy")
+            or raw.get("dialogue_strategy")
+            or raw.get("dialogue_style"),
+            "scene_tempo": expressive_in.get("scene_tempo") or raw.get("scene_tempo"),
+            "reveal_strategy": expressive_in.get("reveal_strategy") or raw.get("reveal_strategy"),
+        }
+    )
+
     normalized = {
         "schema_version": CHAPTER_PLAN_SCHEMA_VERSION,
         "meta": {
@@ -293,6 +349,7 @@ def normalize_beats_to_v2(beats: Any) -> dict[str, Any]:
                 else raw.get("pacing_justification")
             ),
         },
+        "expressive_brief": expressive_brief,
         "execution_card": execution_card,
     }
     return _attach_legacy_aliases(normalized)
@@ -304,6 +361,12 @@ def _normalize_display_summary_field(key: str, value: Any) -> Any:
             return _scene_cards_summary(_clean_scene_cards(value))
         return _clean_text(value)
     if key in _DISPLAY_SUMMARY_STRING_KEYS:
+        return _clean_text(value)
+    return ""
+
+
+def _normalize_expressive_brief_field(key: str, value: Any) -> str:
+    if key in _EXPRESSIVE_BRIEF_STRING_KEYS:
         return _clean_text(value)
     return ""
 
@@ -355,6 +418,20 @@ def merge_execution_card_patch(
         if key in patch:
             merged["display_summary"][key] = _normalize_display_summary_field(key, patch.get(key))
 
+    patch_expressive = (
+        patch.get("expressive_brief") if isinstance(patch.get("expressive_brief"), dict) else {}
+    )
+    merged.setdefault("expressive_brief", {})
+    for key in _EXPRESSIVE_BRIEF_STRING_KEYS:
+        if key in patch_expressive:
+            merged["expressive_brief"][key] = _normalize_expressive_brief_field(
+                key, patch_expressive.get(key)
+            )
+        elif key in patch:
+            merged["expressive_brief"][key] = _normalize_expressive_brief_field(
+                key, patch.get(key)
+            )
+
     legacy_exec_string_map = {
         "goal": "chapter_goal",
         "conflict": "core_conflict",
@@ -399,6 +476,10 @@ def chapter_plan_display_summary(beats: Any) -> dict[str, Any]:
 
 def chapter_plan_execution_card(beats: Any) -> dict[str, Any]:
     return normalize_beats_to_v2(beats).get("execution_card", {})
+
+
+def chapter_plan_expressive_brief(beats: Any) -> dict[str, Any]:
+    return normalize_beats_to_v2(beats).get("expressive_brief", {})
 
 
 def chapter_plan_plot_summary(beats: Any) -> str:
@@ -452,6 +533,9 @@ def chapter_plan_guard_payload(
             "stage_position": _clean_text(summary.get("stage_position")),
             "pacing_justification": _clean_text(summary.get("pacing_justification")),
         },
+        "expressive_brief": _clean_expressive_brief(
+            normalized.get("expressive_brief")
+        ),
         "hard_requirements": {
             "chapter_goal": _clean_text(card.get("chapter_goal")),
             "core_conflict": _clean_text(card.get("core_conflict")),

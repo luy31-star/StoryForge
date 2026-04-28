@@ -95,7 +95,7 @@ export function Recharge() {
   const [orderMessage, setOrderMessage] = useState<string>("");
   const [checkingOrder, setCheckingOrder] = useState(false);
 
-  const currentOrderNo = searchParams.get("sf_order") || "";
+  const currentOrderNo = searchParams.get("sf_order") || searchParams.get("out_trade_no") || "";
 
   useEffect(() => {
     let cancelled = false;
@@ -149,6 +149,11 @@ export function Recharge() {
         if (cancelled) return;
         const message = error instanceof Error ? error.message : "订单查询失败";
         setOrderMessage(message);
+        if (attempts < 9) {
+          attempts += 1;
+          timer = window.setTimeout(poll, 2500);
+          return;
+        }
       } finally {
         if (!cancelled) setCheckingOrder(false);
       }

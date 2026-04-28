@@ -50,6 +50,11 @@ class Novel(Base):
     auto_plan_guard_fix: Mapped[bool] = mapped_column(Boolean, default=False)
     # 保存前是否执行风格润色
     auto_style_polish: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 去 AI 味之后是否再跑一轮「表现力增强」（不得改事实）
+    auto_expressive_enhance: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 每本书独立的长期检索/Story Bible 开关；旧书默认关闭，新书由创建入口显式开启。
+    rag_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
+    story_bible_enabled: Mapped[bool] = mapped_column(Boolean, default=False)
     # 记录最后一次执行每日自动撰写的日期（YYYY-MM-DD），防止重复执行
     last_auto_date: Mapped[str] = mapped_column(String(10), default="")
     reference_storage_key: Mapped[str] = mapped_column(String(1024), default="")

@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import logging
 import re
 from datetime import datetime, timedelta
 from typing import Any
@@ -17,10 +18,20 @@ from sqlalchemy.orm import Session
 
 from app.core.config import settings
 from app.models.novel import NovelGenerationLog
+from app.models.task import UserTask
 from app.services.chapter_plan_schema import normalize_beats_to_v2
+from app.services.user_task_service import TERMINAL_STATUSES
 
 
 _CHAPTER_POLISH_STALE_GRACE = timedelta(minutes=30)
+_CHAPTER_GENERATION_MIN_STALE_GRACE = timedelta(minutes=30)
+_CHAPTER_GENERATION_PER_CHAPTER_BUFFER_SECONDS = 900
+# Worker 内已无对应 Celery 任务时，尽快回收僵尸批次（进程重启、任务丢失）
+_CHAPTER_GENERATION_IF_WORKER_GONE_GRACE = timedelta(minutes=5)
+_VOLUME_PLAN_BASE_STALE_GRACE = timedelta(minutes=45)
+_VOLUME_PLAN_IF_WORKER_GONE_GRACE = timedelta(minutes=5)
+
+logger = logging.getLogger(__name__)
 
 
 def memory_refresh_confirmation_token(
@@ -55,6 +66,31 @@ def append_generation_log(
         meta_json=json.dumps(meta or {}, ensure_ascii=False),
     )
     db.add(row)
+
+
+def _safe_log_meta(raw: str | None) -> dict[str, Any]:
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _chapter_generation_stale_grace(meta: dict[str, Any]) -> timedelta:
+    raw_count = (
+        meta.get("actual_count")
+        or meta.get("requested_count")
+        or meta.get("count")
+        or len(meta.get("chapter_nos") or [])
+        or 1
+    )
+    try:
+        count = max(1, int(raw_count))
+    except Exception:
+        count = 1
+    per_chapter = float(settings.novel_chapter_timeout or 900.0)
+    seconds = count * per_chapter + _CHAPTER_GENERATION_PER_CHAPTER_BUFFER_SECONDS
+    return max(_CHAPTER_GENERATION_MIN_STALE_GRACE, timedelta(seconds=seconds))
 
 
 def extract_title_from_generated_content(chapter_no: int, content: str) -> str:
@@ -116,6 +152,9 @@ def build_chapter_plan_hint(
     summary = (
         normalized.get("display_summary", {}) if isinstance(normalized, dict) else {}
     )
+    expressive = (
+        normalized.get("expressive_brief", {}) if isinstance(normalized, dict) else {}
+    )
     card = (
         normalized.get("execution_card", {}) if isinstance(normalized, dict) else {}
     )
@@ -162,6 +201,22 @@ def build_chapter_plan_hint(
         lines.append(f"=== 本章阶段位置 ===\n{summary['stage_position'].strip()}")
     if isinstance(summary.get("pacing_justification"), str) and summary.get("pacing_justification", "").strip():
         lines.append(f"=== 节奏护栏说明 ===\n{summary['pacing_justification'].strip()}")
+    expressive_lines: list[str] = []
+    expressive_labels = {
+        "pov_strategy": "视角策略",
+        "emotional_curve": "情绪曲线",
+        "sensory_focus": "感官焦点",
+        "dialogue_strategy": "对白策略",
+        "scene_tempo": "场景节奏",
+        "reveal_strategy": "揭示策略",
+    }
+    if isinstance(expressive, dict):
+        for key, label in expressive_labels.items():
+            value = expressive.get(key)
+            if isinstance(value, str) and value.strip():
+                expressive_lines.append(f"- {label}：{value.strip()}")
+    if expressive_lines:
+        lines.append("=== 表现力简报 ===\n" + "\n".join(expressive_lines))
 
     ps = summary.get("plot_summary")
     scenes: list[dict[str, Any]] = []
@@ -184,6 +239,9 @@ def build_chapter_plan_hint(
             scene_content = scene.get("content", "")
             scene_outcome = scene.get("outcome", "")
             scene_words = scene.get("words", 600)
+            scene_emotion = scene.get("emotion_beat", "")
+            scene_camera = scene.get("camera", "")
+            scene_dialogue = scene.get("dialogue_density", "")
             if isinstance(scene_words, int) and scene_words > 0:
                 total_words += scene_words
             else:
@@ -198,6 +256,12 @@ def build_chapter_plan_hint(
                 lines.append(f"  内容：{scene_content}")
             if scene_outcome:
                 lines.append(f"  收束：{scene_outcome}")
+            if scene_emotion:
+                lines.append(f"  情绪节拍：{scene_emotion}")
+            if scene_camera:
+                lines.append(f"  镜头调度：{scene_camera}")
+            if scene_dialogue:
+                lines.append(f"  对白密度：{scene_dialogue}")
             lines.append(f"  建议字数：约{scene_words}字")
         lines.append(f"\n本章建议总字数：{total_words}字")
 
@@ -388,6 +452,8 @@ def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
     """
     是否存在未结束的章节生成批次（已入队 batch_start 或 chapter_generation_queued，
     但尚无 batch_done / batch_failed / batch_blocked）。
+
+    用户可清空「生成日志」；并发判断同时看 user_tasks，避免日志被删后误判为空闲或无法恢复。
     """
     rows = (
         db.query(NovelGenerationLog.batch_id)
@@ -412,7 +478,15 @@ def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
                         "batch_done",
                         "batch_failed",
                         "batch_blocked",
+                        "batch_cancelled",
                         "chapter_generation_enqueue_failed",
+                        # 全自动 pipeline 与章节生成共用同一 batch_id 时，内层会写 batch_start，
+                        # 失败路径常见 chapter_memory_delta_failed / auto_pipeline_failed，必须视为终态。
+                        "chapter_failed",
+                        "chapter_memory_delta_failed",
+                        "auto_pipeline_done",
+                        "auto_pipeline_failed",
+                        "auto_pipeline_cancelled",
                     ]
                 ),
             )
@@ -420,7 +494,334 @@ def has_pending_chapter_generation_batch(db: Session, novel_id: str) -> bool:
         )
         if not terminal:
             return True
-    return False
+    ut = (
+        db.query(UserTask.id)
+        .filter(
+            UserTask.novel_id == novel_id,
+            UserTask.kind == "generate_chapters",
+            UserTask.batch_id.isnot(None),
+            ~UserTask.status.in_(list(TERMINAL_STATUSES)),
+        )
+        .first()
+    )
+    return bool(ut)
+
+
+def recover_stale_chapter_generation_batches(db: Session, novel_id: str) -> dict[str, Any]:
+    """
+    将明显超时且没有终态的普通章节生成批次标记为失败。
+
+    章节生成没有独立 Redis 锁。    默认可按「章节数 × 超时」给较长宽限；若 Celery inspect
+    显示已无任何 worker 持有该 batch 任务（进程重启、任务从队列丢失），则改用约 5 分钟短宽限，
+    避免长时间占住「进行中」槽位。丢失的后台任务不会自动续跑，需用户重新发起生成。
+    用户清空生成日志后，仍根据未终态的 user_tasks 合并批次并回收。
+    在 Celery 中已无本 batch 时优先按 user_tasks.meta 自动再入队续跑；失败或达次数上限后仍落回 batch_failed。
+    """
+    rows = (
+        db.query(NovelGenerationLog)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.event.in_(
+                [
+                    "batch_start",
+                    "chapter_generation_queued",
+                    "chapter_generation_resume_enqueued",
+                    "batch_resumed",
+                    "chapter_start",
+                    "chapter_draft_done",
+                    "chapter_consistency_done",
+                    "chapter_consistency_failed",
+                    "chapter_plan_guard_failed",
+                    "chapter_plan_guard_fixed",
+                    "chapter_plan_guard_warn",
+                    "chapter_expressive_enhance_done",
+                    "chapter_expressive_enhance_failed",
+                    "chapter_style_polish_done",
+                    "chapter_style_polish_failed",
+                    "chapter_saved",
+                    "chapter_judge_done",
+                    "chapter_judge_failed",
+                    "chapter_story_assets_queued",
+                    "chapter_story_assets_enqueue_failed",
+                    "batch_done",
+                    "batch_failed",
+                    "batch_blocked",
+                    "batch_cancelled",
+                    "chapter_generation_enqueue_failed",
+                ]
+            ),
+        )
+        .order_by(NovelGenerationLog.created_at.asc())
+        .all()
+    )
+    batches: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        bid = str(row.batch_id or "")
+        if not bid or not bid.startswith("gen-"):
+            continue
+        info = batches.setdefault(
+            bid,
+            {"events": set(), "last_at": row.created_at, "meta": {}},
+        )
+        event = str(row.event or "")
+        info["events"].add(event)
+        if row.created_at and (
+            info["last_at"] is None or row.created_at > info["last_at"]
+        ):
+            info["last_at"] = row.created_at
+        if event in ("chapter_generation_queued", "batch_start"):
+            meta = _safe_log_meta(getattr(row, "meta_json", None))
+            if meta:
+                info["meta"] = {**info.get("meta", {}), **meta}
+
+    # 生成日志可被清空；未终态的 user_tasks 仍须参与回收，否则仅依赖上面 logs 的批次会漏掉
+    for ut in (
+        db.query(UserTask)
+        .filter(
+            UserTask.novel_id == novel_id,
+            UserTask.kind == "generate_chapters",
+            UserTask.batch_id.isnot(None),
+            UserTask.batch_id.like("gen-%"),
+            ~UserTask.status.in_(list(TERMINAL_STATUSES)),
+        )
+        .all()
+    ):
+        bid = str(ut.batch_id or "")
+        if not bid:
+            continue
+        m = ut.meta if isinstance(ut.meta, dict) else {}
+        t_ref = ut.updated_at or ut.started_at or ut.created_at
+        if bid not in batches:
+            batches[bid] = {
+                "events": set(),
+                "last_at": t_ref,
+                "meta": m,
+            }
+        else:
+            if t_ref and (
+                batches[bid].get("last_at") is None
+                or t_ref > batches[bid]["last_at"]
+            ):
+                batches[bid]["last_at"] = t_ref
+            if m and not batches[bid].get("meta"):
+                batches[bid]["meta"] = m
+
+    from app.tasks import novel_tasks as _novel_tasks
+
+    now = datetime.utcnow()
+    recovered_batches: list[str] = []
+    requeued_batches: list[str] = []
+    terminal_events = {
+        "batch_done",
+        "batch_failed",
+        "batch_blocked",
+        "batch_cancelled",
+        "chapter_generation_enqueue_failed",
+        "chapter_failed",
+        "chapter_memory_delta_failed",
+        "auto_pipeline_done",
+        "auto_pipeline_failed",
+        "auto_pipeline_cancelled",
+    }
+    for batch_id, info in batches.items():
+        events = info["events"]
+        if events & terminal_events:
+            continue
+        last_at = info.get("last_at")
+        if not last_at:
+            continue
+        long_grace = _chapter_generation_stale_grace(info.get("meta") or {})
+        held = _novel_tasks.celery_chapter_batch_held_in_workers(batch_id)
+        if held is True:
+            grace = long_grace
+        elif held is False:
+            grace = _CHAPTER_GENERATION_IF_WORKER_GONE_GRACE
+        else:
+            grace = long_grace
+        if now - last_at < grace:
+            continue
+        if _novel_tasks.try_requeue_stale_chapter_generation_batch(
+            db,
+            novel_id,
+            batch_id,
+            held=held,
+        ):
+            requeued_batches.append(batch_id)
+            continue
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="batch_failed",
+            level="warning",
+            message="章节生成任务疑似因进程重启或异常退出中断，系统已自动回收僵尸批次",
+            meta={
+                "reason": "stale_recovered",
+                "last_event_at": last_at.isoformat() if last_at else None,
+                "stale_grace_seconds": int(grace.total_seconds()),
+            },
+        )
+        try:
+            from app.services.user_task_service import update_user_task_by_batch_id
+
+            update_user_task_by_batch_id(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                last_message="章节生成任务疑似中断，系统已自动回收僵尸批次",
+                finished_at=now,
+            )
+        except Exception:
+            logger.exception(
+                "update stale chapter user task failed | batch_id=%s",
+                batch_id,
+            )
+        recovered_batches.append(batch_id)
+
+    if recovered_batches or requeued_batches:
+        db.commit()
+        if recovered_batches:
+            logger.warning(
+                "recovered stale chapter generation batches | novel_id=%s batches=%s",
+                novel_id,
+                recovered_batches,
+            )
+        if requeued_batches:
+            logger.warning(
+                "requeued chapter generation after stale | novel_id=%s batches=%s",
+                novel_id,
+                requeued_batches,
+            )
+    return {
+        "recovered_batches": recovered_batches,
+        "requeued_batches": requeued_batches,
+    }
+
+
+def recover_stale_volume_plan_batches(db: Session, novel_id: str) -> dict[str, Any]:
+    """
+    卷章计划生成无独立 Redis 锁；Worker 掉线后同章节生成，可能长时间被判定为进行中。
+    在 Celery 已找不到对应 batch 任务时，用较短宽限释放槽位；否则仍用较长写计划宽限。
+    """
+    from app.tasks import novel_tasks as _novel_tasks
+    from app.services.user_task_service import update_user_task_by_batch_id
+
+    rows = (
+        db.query(NovelGenerationLog)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id.like("vol-plan-%"),
+        )
+        .order_by(NovelGenerationLog.created_at.asc())
+        .all()
+    )
+    batches: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        bid = str(row.batch_id or "")
+        if not bid:
+            continue
+        info = batches.setdefault(
+            bid,
+            {"events": set(), "last_at": row.created_at},
+        )
+        info["events"].add(str(row.event or ""))
+        if row.created_at and (
+            info["last_at"] is None or row.created_at > info["last_at"]
+        ):
+            info["last_at"] = row.created_at
+
+    for ut in (
+        db.query(UserTask)
+        .filter(
+            UserTask.novel_id == novel_id,
+            UserTask.kind == "volume_plan",
+            UserTask.batch_id.isnot(None),
+            UserTask.batch_id.like("vol-plan-%"),
+            ~UserTask.status.in_(list(TERMINAL_STATUSES)),
+        )
+        .all()
+    ):
+        bid = str(ut.batch_id or "")
+        if not bid:
+            continue
+        t_ref = ut.updated_at or ut.started_at or ut.created_at
+        if bid not in batches:
+            batches[bid] = {"events": set(), "last_at": t_ref}
+        elif t_ref and (
+            batches[bid].get("last_at") is None or t_ref > batches[bid]["last_at"]
+        ):
+            batches[bid]["last_at"] = t_ref
+
+    terminal = {
+        "volume_plan_done",
+        "volume_plan_failed",
+        "volume_plan_enqueue_failed",
+    }
+    now = datetime.utcnow()
+    recovered: list[str] = []
+    requeued_vol: list[str] = []
+    for batch_id, info in batches.items():
+        if info["events"] & terminal:
+            continue
+        last_at = info.get("last_at")
+        if not last_at:
+            continue
+        held = _novel_tasks.celery_volume_plan_batch_held_in_workers(batch_id)
+        if held is True:
+            grace = _VOLUME_PLAN_BASE_STALE_GRACE
+        elif held is False:
+            grace = _VOLUME_PLAN_IF_WORKER_GONE_GRACE
+        else:
+            grace = _VOLUME_PLAN_BASE_STALE_GRACE
+        if now - last_at < grace:
+            continue
+        if _novel_tasks.try_requeue_stale_volume_plan_batch(
+            db, novel_id, batch_id, held=held
+        ):
+            requeued_vol.append(batch_id)
+            continue
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="volume_plan_failed",
+            level="warning",
+            message="卷章计划生成疑似因进程重启或异常退出中断，系统已自动回收僵尸批次",
+            meta={
+                "reason": "stale_recovered",
+                "last_event_at": last_at.isoformat() if last_at else None,
+                "stale_grace_seconds": int(grace.total_seconds()),
+            },
+        )
+        try:
+            update_user_task_by_batch_id(
+                db,
+                batch_id=batch_id,
+                status="failed",
+                last_message="卷章计划任务疑似中断，系统已自动回收僵尸批次",
+                finished_at=now,
+            )
+        except Exception:
+            logger.exception(
+                "update stale volume plan user task failed | batch_id=%s", batch_id
+            )
+        recovered.append(batch_id)
+
+    if recovered or requeued_vol:
+        db.commit()
+        if recovered:
+            logger.warning(
+                "recovered stale volume plan batches | novel_id=%s batches=%s",
+                novel_id,
+                recovered,
+            )
+        if requeued_vol:
+            logger.warning(
+                "requeued volume plan after stale | novel_id=%s batches=%s",
+                novel_id,
+                requeued_vol,
+            )
+    return {"recovered_batches": recovered, "requeued_batches": requeued_vol}
 
 
 def has_pending_auto_pipeline_batch(
@@ -438,8 +839,10 @@ def has_pending_auto_pipeline_batch(
                 [
                     "auto_pipeline_queued",
                     "auto_pipeline_start",
+                    "auto_pipeline_resumed",
                     "auto_pipeline_plan_batch",
                     "auto_pipeline_chapters",
+                    "auto_pipeline_resume_enqueued",
                 ]
             ),
         )
@@ -468,6 +871,19 @@ def has_pending_auto_pipeline_batch(
         )
         if not terminal:
             return True
+    qut = (
+        db.query(UserTask.id)
+        .filter(
+            UserTask.novel_id == novel_id,
+            UserTask.kind.in_(("auto_generate", "ai_create_and_start")),
+            UserTask.batch_id.isnot(None),
+            ~UserTask.status.in_(list(TERMINAL_STATUSES)),
+        )
+    )
+    if exclude_batch_id:
+        qut = qut.filter(UserTask.batch_id != exclude_batch_id)
+    if qut.first():
+        return True
     return False
 
 def get_active_auto_pipeline_count(db: Session) -> int:
@@ -482,8 +898,11 @@ def get_active_auto_pipeline_count(db: Session) -> int:
                 [
                     "auto_pipeline_queued",
                     "auto_pipeline_start",
+                    "auto_pipeline_resumed",
+                    "auto_pipeline_resume_enqueued",
                     "ai_create_queued",
                     "ai_create_brainstorming",
+                    "ai_create_resume_enqueued",
                 ]
             )
         )
@@ -549,7 +968,17 @@ def has_pending_volume_plan_batch(db: Session, novel_id: str) -> bool:
         )
         if not terminal:
             return True
-    return False
+    ut = (
+        db.query(UserTask.id)
+        .filter(
+            UserTask.novel_id == novel_id,
+            UserTask.kind == "volume_plan",
+            UserTask.batch_id.isnot(None),
+            ~UserTask.status.in_(list(TERMINAL_STATUSES)),
+        )
+        .first()
+    )
+    return bool(ut)
 
 
 def has_pending_memory_refresh_batch(db: Session, novel_id: str) -> bool:

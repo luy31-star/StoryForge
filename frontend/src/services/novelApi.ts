@@ -440,6 +440,7 @@ export async function createNovel(body: {
   auto_plan_guard_check?: boolean;
   auto_plan_guard_fix?: boolean;
   auto_style_polish?: boolean;
+  auto_expressive_enhance?: boolean;
 }) {
   const r = await apiFetch(BASE, {
     method: "POST",
@@ -466,6 +467,7 @@ export async function aiCreateAndStartNovel(body: {
   auto_plan_guard_check?: boolean;
   auto_plan_guard_fix?: boolean;
   auto_style_polish?: boolean;
+  auto_expressive_enhance?: boolean;
   writing_style_id?: string;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
@@ -515,6 +517,7 @@ export async function getNovel(id: string) {
     auto_plan_guard_check: boolean;
     auto_plan_guard_fix: boolean;
     auto_style_polish: boolean;
+    auto_expressive_enhance?: boolean;
     framework_confirmed: boolean;
     base_framework_confirmed: boolean;
     /** 兼容：含 arcs 的完整框架 JSON（卷表或旧库内嵌） */
@@ -651,6 +654,7 @@ export async function generateChapters(
     auto_plan_guard_check?: boolean;
     auto_plan_guard_fix?: boolean;
     auto_style_polish?: boolean;
+    auto_expressive_enhance?: boolean;
     chapter_no?: number;
     source?: string;
   }
@@ -674,6 +678,9 @@ export async function generateChapters(
   }
   if (typeof options?.auto_style_polish === "boolean") {
     payload.auto_style_polish = options.auto_style_polish;
+  }
+  if (typeof options?.auto_expressive_enhance === "boolean") {
+    payload.auto_expressive_enhance = options.auto_expressive_enhance;
   }
   const r = await apiFetch(`${BASE}/${novelId}/chapters/generate`, {
     method: "POST",
@@ -732,6 +739,18 @@ export async function autoGenerateChapters(
   }>;
 }
 
+export async function getNovelQueueStatus() {
+  const r = await apiFetch(`${BASE}/queue-status`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    active_auto_pipeline_count: number;
+    max_active_auto_pipeline: number;
+    available_auto_pipeline_slots: number;
+    is_busy: boolean;
+  }>;
+}
+
 export async function listGenerationLogs(
   novelId: string,
   params?: { batch_id?: string; level?: string; limit?: number }
@@ -755,7 +774,19 @@ export async function listGenerationLogs(
     latest_refresh_success_version: number | null;
     latest_memory_version?: number;
     refresh_outcome?: "idle" | "ok" | "warning" | "blocked" | "failed";
-    memory_refresh_preview?: Record<string, unknown> | null;
+    memory_refresh_preview?: {
+      tier: "warning" | "blocked";
+      current_version?: number | null;
+      candidate_json?: string;
+      candidate_readable_zh?: string;
+      warnings?: string[];
+      errors?: string[];
+      auto_pass_notes?: string[];
+      confirmation_token?: string | null;
+      diff_summary?: MemoryDiffSummary;
+      run_id?: string | null;
+      applied?: boolean;
+    } | null;
     latest_chapter_gen_batch_id?: string | null;
     chapter_generation_status?: "idle" | "queued" | "started" | "done" | "failed";
     latest_volume_plan_batch_id?: string | null;
@@ -1186,6 +1217,8 @@ export async function getMemory(novelId: string) {
     created_at?: string | null;
     schema_guide?: MemorySchemaGuide;
     health?: MemoryHealth;
+    normalized?: NormalizedMemoryPayload | null;
+    latest_update_run?: MemoryUpdateRun | null;
   }>;
 }
 
@@ -1245,6 +1278,52 @@ export type MemoryHealth = {
   latest_chapter_no: number;
   stale_plots: Array<Record<string, unknown>>;
   overdue_plots: Array<Record<string, unknown>>;
+};
+
+export type MemoryDiffSummary = {
+  summary?: {
+    changed_types?: string[];
+    chapter_nos?: number[];
+    latest_chapter_no?: number | null;
+    change_count?: number;
+  };
+  characters?: Record<string, unknown>;
+  inventory?: Record<string, unknown>;
+  skills?: Record<string, unknown>;
+  pets?: Record<string, unknown>;
+  relations?: Record<string, unknown>;
+  open_plots?: Record<string, unknown>;
+  chapters?: Record<string, unknown>;
+};
+
+export type MemoryUpdateRun = {
+  id: string;
+  batch_id: string;
+  trigger_source: string;
+  source: string;
+  chapter_id?: string | null;
+  chapter_no?: number | null;
+  status: string;
+  current_stage: string;
+  base_memory_version: number;
+  target_memory_version: number;
+  delta_status: string;
+  validation_status: string;
+  norm_status: string;
+  snapshot_status: string;
+  story_bible_status: string;
+  rag_status: string;
+  request?: Record<string, unknown>;
+  source_summary?: Record<string, unknown>;
+  diff_summary?: MemoryDiffSummary;
+  warnings?: string[];
+  errors?: string[];
+  result?: Record<string, unknown>;
+  error?: Record<string, unknown>;
+  started_at?: string | null;
+  finished_at?: string | null;
+  created_at?: string | null;
+  updated_at?: string | null;
 };
 
 export type NormalizedMemoryPayload = {
@@ -1548,8 +1627,68 @@ export async function getMemoryHistory(novelId: string) {
       version: number;
       summary: string;
       created_at: string | null;
+      diff_summary?: MemoryDiffSummary;
+      source_summary?: {
+        chapter_nos?: number[];
+        latest_chapter_no?: number | null;
+        changed_types?: string[];
+      };
     }[]
   >;
+}
+
+export async function listMemoryUpdateRuns(novelId: string, limit = 20) {
+  const r = await apiFetch(`${BASE}/${novelId}/memory/update-runs?limit=${limit}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: "ok"; items: MemoryUpdateRun[] }>;
+}
+
+export async function getLatestStoryBibleSnapshot(
+  novelId: string,
+  options?: { entityLimit?: number; factLimit?: number }
+) {
+  const params = new URLSearchParams();
+  if (options?.entityLimit) params.set("entity_limit", String(options.entityLimit));
+  if (options?.factLimit) params.set("fact_limit", String(options.factLimit));
+  const suffix = params.toString() ? `?${params.toString()}` : "";
+  const r = await apiFetch(`${BASE}/${novelId}/story-bible/latest${suffix}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    item: null | {
+      id: string;
+      version: number;
+      source_memory_version: number;
+      summary: Record<string, unknown>;
+      stats: Record<string, unknown>;
+      created_at?: string | null;
+      updated_at?: string | null;
+      entities: Array<Record<string, unknown>>;
+      facts: Array<Record<string, unknown>>;
+    };
+  }>;
+}
+
+export async function getRetrievalIndexSnapshot(novelId: string, documentLimit = 24) {
+  const r = await apiFetch(
+    `${BASE}/${novelId}/retrieval/index?document_limit=${documentLimit}`
+  );
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    items: Array<{
+      id: string;
+      source_type: string;
+      source_id: string;
+      title: string;
+      summary: string;
+      metadata: Record<string, unknown>;
+      checksum: string;
+      is_active: boolean;
+      chunk_count: number;
+      updated_at?: string | null;
+    }>;
+  }>;
 }
 
 export async function clearMemory(novelId: string) {
@@ -1674,6 +1813,132 @@ export async function getNovelMetrics(novelId: string) {
       memory_health?: MemoryHealth;
     };
     schema_guide?: MemorySchemaGuide;
+  }>;
+}
+
+export type ChapterJudgeLatest = {
+  id: string;
+  judge_type: string;
+  status: string;
+  model_name: string;
+  score: number;
+  blocking: boolean;
+  summary: string;
+  payload_json: Record<string, unknown>;
+  created_at: string | null;
+  updated_at: string | null;
+  issues: {
+    id: string;
+    severity: string;
+    issue_type: string;
+    title: string;
+    evidence_json: unknown[];
+    suggestion: string;
+    blocking: boolean;
+    resolved: boolean;
+  }[];
+};
+
+export async function getLatestChapterJudge(chapterId: string) {
+  const r = await apiFetch(`${BASE}/chapters/${chapterId}/judge-latest`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    item: ChapterJudgeLatest | null;
+  }>;
+}
+
+export type NovelWorkflowLatest = {
+  id: string;
+  run_type: string;
+  trigger_source: string;
+  status: string;
+  batch_id: string;
+  current_step: string;
+  cursor_json: Record<string, unknown>;
+  input_json: Record<string, unknown>;
+  output_json: Record<string, unknown>;
+  error_json: Record<string, unknown>;
+  is_resumable: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  created_at: string | null;
+  updated_at: string | null;
+  steps: {
+    id: string;
+    step_type: string;
+    sequence_no: number;
+    status: string;
+    attempt_count: number;
+    payload_json: Record<string, unknown>;
+    result_json: Record<string, unknown>;
+    error_json: Record<string, unknown>;
+    started_at: string | null;
+    finished_at: string | null;
+    created_at: string | null;
+    updated_at: string | null;
+  }[];
+  events: {
+    id: string;
+    step_id: string | null;
+    level: string;
+    event_type: string;
+    message: string;
+    meta_json: Record<string, unknown>;
+    created_at: string | null;
+  }[];
+};
+
+export async function getLatestWorkflowRun(novelId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/workflow/latest`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    item: NovelWorkflowLatest | null;
+  }>;
+}
+
+export type NovelRetrievalLogItem = {
+  id: string;
+  query_text: string;
+  query_type: string;
+  top_k: number;
+  latency_ms: number;
+  created_at: string | null;
+  result_json: {
+    chunk_id?: string;
+    score?: number;
+    source_type?: string;
+    source_id?: string;
+    title?: string;
+    content?: string;
+    text?: string;
+    metadata?: Record<string, unknown>;
+  }[];
+};
+
+export async function listRetrievalLogs(novelId: string, limit = 8) {
+  const query = new URLSearchParams();
+  query.set("limit", String(limit));
+  const r = await apiFetch(`${BASE}/${novelId}/retrieval/logs?${query.toString()}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    items: NovelRetrievalLogItem[];
+  }>;
+}
+
+export async function getNovelCoreEvaluation(novelId: string) {
+  const r = await apiFetch(`${BASE}/${novelId}/core-evaluation`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{
+    status: "ok";
+    novel_id: string;
+    rubric: {
+      phases: { id: string; name: string; metrics: string[] }[];
+      notes: string;
+    };
+    observed: Record<string, number | string | null>;
   }>;
 }
 

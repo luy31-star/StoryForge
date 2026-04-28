@@ -123,4 +123,7 @@ def apply_recharge_paid(
     order.alipay_trade_no = alipay_trade_no or order.alipay_trade_no
     order.paid_at = order.paid_at or datetime.utcnow()
     order.credited_at = datetime.utcnow()
-    order.query_raw = json.dumps(raw, ensure_ascii=False)
+    if via == "notify":
+        order.notify_raw = json.dumps(raw, ensure_ascii=False)
+    else:
+        order.query_raw = json.dumps(raw, ensure_ascii=False)

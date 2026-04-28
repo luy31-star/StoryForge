@@ -63,6 +63,13 @@ def update_user_task_by_batch_id(
     )
     if not row:
         return None
+    # 用户已从前端结束任务后不可被 Worker / 僵尸回收写回 done、failed 等
+    if (
+        str(row.status or "") == "cancelled"
+        and status is not None
+        and status != "cancelled"
+    ):
+        return row
     if status is not None:
         row.status = status
     if last_message is not None:

@@ -25,6 +25,7 @@ from app.services.chapter_plan_schema import (
 from app.services.novel_generation_common import (
     append_generation_log,
     has_pending_volume_plan_batch,
+    recover_stale_volume_plan_batches,
 )
 from app.services.novel_repo import latest_memory_json
 from app.services.novel_llm_service import NovelLLMService
@@ -318,6 +319,7 @@ def generate_volume_chapter_plan(
     v = db.get(NovelVolume, volume_id)
     if not v or v.novel_id != novel_id:
         raise HTTPException(404, "卷不存在")
+    recover_stale_volume_plan_batches(db, novel_id)
     if has_pending_volume_plan_batch(db, novel_id):
         raise HTTPException(
             409,
@@ -393,7 +395,7 @@ def generate_volume_chapter_plan(
             celery_task_id=str(task_id) if task_id else None,
             novel_id=novel_id,
             volume_id=volume_id,
-            meta=payload,
+            meta=dict(payload),
         )
     except Exception:
         logger.exception("create user task failed | batch_id=%s", batch_id)

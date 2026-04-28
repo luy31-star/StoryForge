@@ -40,12 +40,17 @@ class NovelMemoryNormSkill(Base):
     memory_version: Mapped[int] = mapped_column(Integer, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     name: Mapped[str] = mapped_column(String(512), default="")
+    aliases_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    tags_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
     last_used_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    source_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
     expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="usable")
 
 
 class NovelMemoryNormItem(Base):
@@ -62,12 +67,17 @@ class NovelMemoryNormItem(Base):
     memory_version: Mapped[int] = mapped_column(Integer, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     label: Mapped[str] = mapped_column(LONGTEXT, default="")
+    aliases_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    tags_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
     last_used_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    source_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
     expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="usable")
 
 
 class NovelMemoryNormPet(Base):
@@ -82,9 +92,16 @@ class NovelMemoryNormPet(Base):
     memory_version: Mapped[int] = mapped_column(Integer, default=0)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     name: Mapped[str] = mapped_column(String(512), default="")
+    aliases_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    tags_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    source_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="usable")
 
 
 class NovelMemoryNormCharacter(Base):
@@ -101,10 +118,19 @@ class NovelMemoryNormCharacter(Base):
     name: Mapped[str] = mapped_column(String(512), default="")
     role: Mapped[str] = mapped_column(String(512), default="")
     status: Mapped[str] = mapped_column(String(512), default="")
+    aliases_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    tags_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     traits_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     influence_score: Mapped[int] = mapped_column(Integer, default=0)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
+    source_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    expired_chapter: Mapped[int | None] = mapped_column(Integer, nullable=True, default=None)
+    identity_stage: Mapped[str] = mapped_column(String(64), default="public")
+    exposed_identity_level: Mapped[str] = mapped_column(String(32), default="0")
+    lifecycle_state: Mapped[str] = mapped_column(String(32), default="usable")
 
 
 class NovelMemoryNormRelation(Base):
@@ -121,7 +147,12 @@ class NovelMemoryNormRelation(Base):
     src: Mapped[str] = mapped_column(String(512), default="")
     dst: Mapped[str] = mapped_column(String(512), default="")
     relation: Mapped[str] = mapped_column(LONGTEXT, default="")
+    detail_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    source_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    last_seen_chapter_no: Mapped[int] = mapped_column(Integer, default=0)
+    src_entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True, default=None, index=True)
+    dst_entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True, default=None, index=True)
 
 
 class NovelMemoryNormPlot(Base):
@@ -143,6 +174,7 @@ class NovelMemoryNormPlot(Base):
     estimated_duration: Mapped[int] = mapped_column(Integer, default=0)
     current_stage: Mapped[str] = mapped_column(LONGTEXT, default="")
     resolve_when: Mapped[str] = mapped_column(LONGTEXT, default="")
+    related_entities_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     introduced_chapter: Mapped[int] = mapped_column(Integer, default=0)
     last_touched_chapter: Mapped[int] = mapped_column(Integer, default=0)
 
@@ -165,6 +197,9 @@ class NovelMemoryNormChapter(Base):
     causal_results_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     open_plots_added_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     open_plots_resolved_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    scene_facts_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
     # 情绪锚点与章末悬念（用于下一章衔接）
     emotional_state: Mapped[str] = mapped_column(LONGTEXT, default="")
     unresolved_hooks_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")
+    state_snapshot_json: Mapped[str] = mapped_column(LONGTEXT, default="{}")
+    state_transition_summary_json: Mapped[str] = mapped_column(LONGTEXT, default="[]")

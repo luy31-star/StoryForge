@@ -28,6 +28,32 @@ export async function register(email: string, username: string, invite_code: str
   return r.json() as Promise<{ access_token: string; token_type: string }>;
 }
 
+export async function refreshToken() {
+  const r = await apiFetch("/api/auth/refresh", {
+    method: "POST",
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ access_token: string; token_type: string }>;
+}
+
+export async function sendForgotPasswordOtp(email: string) {
+  const r = await apiFetch("/api/auth/forgot-password/send-otp", {
+    method: "POST",
+    body: JSON.stringify({ email }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; message: string }>;
+}
+
+export async function resetPassword(email: string, otp: string, new_password: string) {
+  const r = await apiFetch("/api/auth/reset-password", {
+    method: "POST",
+    body: JSON.stringify({ email, otp, new_password }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ status: string; message: string }>;
+}
+
 export async function getRegistrationMode() {
   const r = await apiFetch("/api/auth/registration-mode");
   if (!r.ok) throw new Error(await r.text());
@@ -35,9 +61,8 @@ export async function getRegistrationMode() {
 }
 
 export async function fetchMe(token: string) {
-  const r = await apiFetch("/api/auth/me", {
-    headers: { Authorization: `Bearer ${token}` },
-  });
+  void token;
+  const r = await apiFetch("/api/auth/me");
   if (!r.ok) throw new Error(await r.text());
   return r.json() as Promise<AuthUser>;
 }

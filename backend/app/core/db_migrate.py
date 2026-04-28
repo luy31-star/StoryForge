@@ -112,6 +112,20 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN base_framework_confirmed BOOLEAN DEFAULT 0")
                     )
                     logger.info("db migrate: added novels.base_framework_confirmed (sqlite)")
+                if _has_column_sqlite(conn, "novels", "rag_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN rag_enabled BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.rag_enabled (sqlite)")
+                if _has_column_sqlite(conn, "novels", "story_bible_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN story_bible_enabled BOOLEAN DEFAULT 0")
+                    )
+                    logger.info("db migrate: added novels.story_bible_enabled (sqlite)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, 0)"
@@ -207,6 +221,20 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.auto_style_polish (postgres)")
+                if _has_column_postgres(conn, "novels", "rag_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN rag_enabled BOOLEAN DEFAULT FALSE")
+                    )
+                    logger.info("db migrate: added novels.rag_enabled (postgres)")
+                if _has_column_postgres(conn, "novels", "story_bible_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN story_bible_enabled BOOLEAN DEFAULT FALSE")
+                    )
+                    logger.info("db migrate: added novels.story_bible_enabled (postgres)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
@@ -305,6 +333,20 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.base_framework_confirmed (mysql)")
+                if _has_column_mysql(conn, "novels", "rag_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN rag_enabled BOOLEAN DEFAULT FALSE")
+                    )
+                    logger.info("db migrate: added novels.rag_enabled (mysql)")
+                if _has_column_mysql(conn, "novels", "story_bible_enabled"):
+                    pass
+                else:
+                    conn.execute(
+                        text("ALTER TABLE novels ADD COLUMN story_bible_enabled BOOLEAN DEFAULT FALSE")
+                    )
+                    logger.info("db migrate: added novels.story_bible_enabled (mysql)")
                 conn.execute(
                     text(
                         "UPDATE novels SET auto_consistency_check = COALESCE(auto_consistency_check, FALSE)"
@@ -577,6 +619,92 @@ def ensure_novel_memory_norm_extended_columns(engine: Engine) -> None:
         logger.exception("db migrate: ensure_novel_memory_norm_extended_columns failed")
 
 
+def ensure_story_bible_columns(engine: Engine) -> None:
+    """
+    轻量迁移：为现有规范化记忆表补 Story Bible / RAG 需要的别名、标签、来源章节等字段。
+    """
+    sqlite_specs: list[tuple[str, str]] = [
+        ("novel_memory_norm_skills", "aliases_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_skills", "tags_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_skills", "source_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_skills", "last_seen_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "aliases_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_items", "tags_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_items", "source_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_items", "last_seen_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_pets", "aliases_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_pets", "tags_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_pets", "source_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_pets", "last_seen_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_characters", "aliases_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_characters", "tags_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_characters", "source_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_characters", "last_seen_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_relations", "detail_json TEXT DEFAULT '{}'"),
+        ("novel_memory_norm_relations", "source_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_relations", "last_seen_chapter_no INTEGER DEFAULT 0"),
+        ("novel_memory_norm_plots", "related_entities_json TEXT DEFAULT '[]'"),
+        ("novel_memory_norm_chapters", "scene_facts_json TEXT DEFAULT '[]'"),
+    ]
+    pg_specs = sqlite_specs
+    mysql_specs: list[tuple[str, str, str | None]] = [
+        ("novel_memory_norm_skills", "aliases_json LONGTEXT NULL", "UPDATE novel_memory_norm_skills SET aliases_json = '[]' WHERE aliases_json IS NULL"),
+        ("novel_memory_norm_skills", "tags_json LONGTEXT NULL", "UPDATE novel_memory_norm_skills SET tags_json = '[]' WHERE tags_json IS NULL"),
+        ("novel_memory_norm_skills", "source_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_skills", "last_seen_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_items", "aliases_json LONGTEXT NULL", "UPDATE novel_memory_norm_items SET aliases_json = '[]' WHERE aliases_json IS NULL"),
+        ("novel_memory_norm_items", "tags_json LONGTEXT NULL", "UPDATE novel_memory_norm_items SET tags_json = '[]' WHERE tags_json IS NULL"),
+        ("novel_memory_norm_items", "source_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_items", "last_seen_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_pets", "aliases_json LONGTEXT NULL", "UPDATE novel_memory_norm_pets SET aliases_json = '[]' WHERE aliases_json IS NULL"),
+        ("novel_memory_norm_pets", "tags_json LONGTEXT NULL", "UPDATE novel_memory_norm_pets SET tags_json = '[]' WHERE tags_json IS NULL"),
+        ("novel_memory_norm_pets", "source_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_pets", "last_seen_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_characters", "aliases_json LONGTEXT NULL", "UPDATE novel_memory_norm_characters SET aliases_json = '[]' WHERE aliases_json IS NULL"),
+        ("novel_memory_norm_characters", "tags_json LONGTEXT NULL", "UPDATE novel_memory_norm_characters SET tags_json = '[]' WHERE tags_json IS NULL"),
+        ("novel_memory_norm_characters", "source_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_characters", "last_seen_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_relations", "detail_json LONGTEXT NULL", "UPDATE novel_memory_norm_relations SET detail_json = '{}' WHERE detail_json IS NULL"),
+        ("novel_memory_norm_relations", "source_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_relations", "last_seen_chapter_no INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_plots", "related_entities_json LONGTEXT NULL", "UPDATE novel_memory_norm_plots SET related_entities_json = '[]' WHERE related_entities_json IS NULL"),
+        ("novel_memory_norm_chapters", "scene_facts_json LONGTEXT NULL", "UPDATE novel_memory_norm_chapters SET scene_facts_json = '[]' WHERE scene_facts_json IS NULL"),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "sqlite":
+                for table, ddl in sqlite_specs:
+                    col = ddl.split()[0]
+                    if _has_column_sqlite(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (sqlite)", table, col)
+            elif dialect in ("postgresql", "postgres"):
+                for table, ddl in pg_specs:
+                    col = ddl.split()[0]
+                    if _has_column_postgres(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    logger.info("db migrate: added %s.%s (postgres)", table, col)
+            elif dialect == "mysql":
+                for table, ddl, backfill_sql in mysql_specs:
+                    col = ddl.split()[0]
+                    if _has_column_mysql(conn, table, col):
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    if backfill_sql:
+                        conn.execute(text(backfill_sql))
+                    logger.info("db migrate: added %s.%s (mysql)", table, col)
+            else:
+                logger.warning(
+                    "db migrate: ensure_story_bible_columns unsupported dialect=%s",
+                    dialect,
+                )
+    except Exception:
+        logger.exception("db migrate: ensure_story_bible_columns failed")
+
+
 def ensure_user_isolation_columns(engine: Engine) -> None:
     """
     轻量迁移：为 novels / projects / workflows 补 user_id（多用户隔离）。
@@ -847,3 +975,103 @@ def ensure_volume_outline_columns(engine: Engine) -> None:
                 logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
     except Exception:
         logger.exception("db migrate: ensure_volume_outline_columns failed")
+
+
+def ensure_novel_entity_state_machine_columns(engine: Engine) -> None:
+    """核心升级：规范化记忆生命周期 + 关系端点 + novels 表现力开关。"""
+    sqlite_specs: list[tuple[str, str]] = [
+        ("novel_memory_norm_skills", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_items", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_pets", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_pets", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_pets", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_characters", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_characters", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_characters", "identity_stage VARCHAR(64) DEFAULT 'public'"),
+        ("novel_memory_norm_characters", "exposed_identity_level VARCHAR(32) DEFAULT '0'"),
+        ("novel_memory_norm_characters", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_relations", "src_entity_id VARCHAR(36) DEFAULT NULL"),
+        ("novel_memory_norm_relations", "dst_entity_id VARCHAR(36) DEFAULT NULL"),
+        ("novel_memory_norm_chapters", "state_snapshot_json TEXT DEFAULT '{}'"),
+        ("novel_memory_norm_chapters", "state_transition_summary_json TEXT DEFAULT '[]'"),
+        ("novels", "auto_expressive_enhance BOOLEAN DEFAULT 0"),
+    ]
+    pg_specs: list[tuple[str, str]] = [
+        ("novel_memory_norm_skills", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_items", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_pets", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_pets", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_pets", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_characters", "introduced_chapter INTEGER DEFAULT 0"),
+        ("novel_memory_norm_characters", "expired_chapter INTEGER DEFAULT NULL"),
+        ("novel_memory_norm_characters", "identity_stage VARCHAR(64) DEFAULT 'public'"),
+        ("novel_memory_norm_characters", "exposed_identity_level VARCHAR(32) DEFAULT '0'"),
+        ("novel_memory_norm_characters", "lifecycle_state VARCHAR(32) DEFAULT 'usable'"),
+        ("novel_memory_norm_relations", "src_entity_id VARCHAR(36) DEFAULT NULL"),
+        ("novel_memory_norm_relations", "dst_entity_id VARCHAR(36) DEFAULT NULL"),
+        ("novel_memory_norm_chapters", "state_snapshot_json TEXT DEFAULT '{}'"),
+        ("novel_memory_norm_chapters", "state_transition_summary_json TEXT DEFAULT '[]'"),
+        ("novels", "auto_expressive_enhance BOOLEAN DEFAULT FALSE"),
+    ]
+    mysql_specs: list[tuple[str, str, str | None]] = [
+        ("novel_memory_norm_skills", "lifecycle_state VARCHAR(32) DEFAULT 'usable'", None),
+        ("novel_memory_norm_items", "lifecycle_state VARCHAR(32) DEFAULT 'usable'", None),
+        ("novel_memory_norm_pets", "introduced_chapter INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_pets", "expired_chapter INTEGER DEFAULT NULL", None),
+        ("novel_memory_norm_pets", "lifecycle_state VARCHAR(32) DEFAULT 'usable'", None),
+        ("novel_memory_norm_characters", "introduced_chapter INTEGER DEFAULT 0", None),
+        ("novel_memory_norm_characters", "expired_chapter INTEGER DEFAULT NULL", None),
+        ("novel_memory_norm_characters", "identity_stage VARCHAR(64) DEFAULT 'public'", None),
+        ("novel_memory_norm_characters", "exposed_identity_level VARCHAR(32) DEFAULT '0'", None),
+        ("novel_memory_norm_characters", "lifecycle_state VARCHAR(32) DEFAULT 'usable'", None),
+        ("novel_memory_norm_relations", "src_entity_id VARCHAR(36) DEFAULT NULL", None),
+        ("novel_memory_norm_relations", "dst_entity_id VARCHAR(36) DEFAULT NULL", None),
+        (
+            "novel_memory_norm_chapters",
+            "state_snapshot_json LONGTEXT NULL",
+            "UPDATE novel_memory_norm_chapters SET state_snapshot_json = '{}' WHERE state_snapshot_json IS NULL",
+        ),
+        (
+            "novel_memory_norm_chapters",
+            "state_transition_summary_json LONGTEXT NULL",
+            "UPDATE novel_memory_norm_chapters SET state_transition_summary_json = '[]' WHERE state_transition_summary_json IS NULL",
+        ),
+        ("novels", "auto_expressive_enhance BOOLEAN DEFAULT FALSE", None),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "mysql":
+                for table, ddl, post_sql in mysql_specs:
+                    col = ddl.split()[0]
+                    if _has_column_mysql(conn, table, col):
+                        if post_sql:
+                            conn.execute(text(post_sql))
+                        continue
+                    conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                    if post_sql:
+                        conn.execute(text(post_sql))
+                    logger.info("db migrate: added %s.%s (mysql)", table, col)
+                return
+            specs = sqlite_specs if dialect == "sqlite" else pg_specs
+            for table, ddl in specs:
+                col = ddl.split()[0]
+                exists = False
+                if dialect == "sqlite":
+                    exists = _has_column_sqlite(conn, table, col)
+                elif dialect in ("postgresql", "postgres"):
+                    exists = _has_column_postgres(conn, table, col)
+                else:
+                    logger.warning(
+                        "db migrate: ensure_novel_entity_state_machine_columns unsupported dialect=%s",
+                        dialect,
+                    )
+                    return
+                if exists:
+                    continue
+                if dialect in ("postgresql", "postgres") and "BOOLEAN" in ddl and "novels" in table:
+                    ddl = ddl.replace("BOOLEAN DEFAULT 0", "BOOLEAN DEFAULT FALSE")
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {ddl}"))
+                logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_novel_entity_state_machine_columns failed")

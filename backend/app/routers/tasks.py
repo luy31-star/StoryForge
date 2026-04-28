@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -11,8 +12,9 @@ from app.core.deps import get_current_user
 from app.models.novel import NovelGenerationLog
 from app.models.task import UserTask
 from app.models.user import User
+from app.services.novel_generation_common import append_generation_log
 from app.services.task_cancel import request_cancel_batch
-from app.services.user_task_service import TERMINAL_STATUSES, request_cancel_user_task
+from app.services.user_task_service import TERMINAL_STATUSES
 from app.tasks.celery_app import celery_app
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
@@ -50,6 +52,26 @@ def list_my_tasks(
     limit: int = 50,
     offset: int = 0,
 ) -> dict[str, Any]:
+    stale_cancel_cutoff = datetime.utcnow() - timedelta(seconds=30)
+    stale_cancel_rows = (
+        db.query(UserTask)
+        .filter(
+            UserTask.user_id == user.id,
+            UserTask.status == "cancel_requested",
+            UserTask.cancel_requested_at.isnot(None),
+            UserTask.cancel_requested_at < stale_cancel_cutoff,
+        )
+        .all()
+    )
+    if stale_cancel_rows:
+        now = datetime.utcnow()
+        for row in stale_cancel_rows:
+            row.status = "cancelled"
+            row.finished_at = row.finished_at or row.cancel_requested_at or now
+            if not (row.last_message or "").strip():
+                row.last_message = "用户已结束任务"
+        db.commit()
+
     lim = max(1, min(int(limit or 50), 200))
     off = max(0, int(offset or 0))
 
@@ -116,8 +138,8 @@ def cancel_task(
     if t.status in TERMINAL_STATUSES:
         return {"status": "ok", "task_id": t.id, "task_status": t.status}
 
-    request_cancel_user_task(db, task=t)
-
+    now = datetime.utcnow()
+    t.cancel_requested_at = now
     if t.batch_id:
         request_cancel_batch(t.batch_id)
 
@@ -126,6 +148,25 @@ def cancel_task(
             celery_app.control.revoke(str(t.celery_task_id), terminate=True)
         except Exception:
             pass
+
+    t.status = "cancelled"
+    t.finished_at = now
+    t.last_message = "用户已结束任务"
+    if t.novel_id and t.batch_id:
+        try:
+            append_generation_log(
+                db,
+                novel_id=t.novel_id,
+                batch_id=t.batch_id,
+                event="user_task_cancelled",
+                level="warning",
+                message="用户已从「我的任务」结束该任务",
+            )
+        except Exception:
+            # 日志写入失败不应影响任务终态写回
+            pass
+    db.commit()
+    db.refresh(t)
 
     return {"status": "ok", "task_id": t.id, "task_status": t.status}
 

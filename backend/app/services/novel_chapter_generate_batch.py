@@ -9,10 +9,12 @@ import logging
 import time
 from typing import Any
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.models.novel import Chapter, Novel
+from app.models.novel import Chapter, Novel, NovelGenerationLog, NovelMemory
+from app.models.novel_memory_runtime import NovelMemoryUpdateRun
 from app.models.volume import NovelChapterPlan
 from app.services.chapter_approval_guard import collect_chapter_approval_issues
 from app.services.chapter_plan_schema import normalize_beats_to_v2
@@ -23,16 +25,73 @@ from app.services.novel_generation_common import (
     build_multi_chapter_plan_hint,
     ensure_chapter_heading,
 )
+from app.services.novel_judge_service import run_chapter_judge_suite
 from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_memory_diff_service import build_memory_diff
+from app.services.novel_memory_update_service import (
+    build_memory_update_run_from_result,
+    create_memory_update_run,
+    set_memory_update_run_assets_status,
+    touch_memory_update_run,
+)
 from app.services.novel_repo import (
     chapter_content_metrics,
     format_continuity_excerpts,
     format_previous_chapter_fulltext,
     latest_memory_json,
 )
+from app.services.novel_retrieval_service import (
+    is_novel_rag_enabled,
+    is_novel_story_bible_enabled,
+)
+from app.services.novel_workflow_service import get_workflow_run_by_batch_id
 from app.services.task_cancel import is_cancel_requested
 
 logger = logging.getLogger(__name__)
+
+
+def _chapter_saved_nos_for_batch(
+    db: Session, novel_id: str, batch_id: str
+) -> set[int]:
+    rows = (
+        db.query(NovelGenerationLog.chapter_no)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event == "chapter_saved",
+            NovelGenerationLog.chapter_no.isnot(None),
+        )
+        .all()
+    )
+    return {int(r[0]) for r in rows if r[0] is not None}
+
+
+def _batch_has_terminal_stops(
+    db: Session, novel_id: str, batch_id: str, events: frozenset[str]
+) -> bool:
+    return (
+        db.query(NovelGenerationLog.id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event.in_(list(events)),
+        )
+        .first()
+    ) is not None
+
+
+# 一旦在任一章上因可恢复/需人工作为的终态出现，不应在“无任务在跑”时再被误判为宕机续跑
+_STALE_REQUEUE_FORBIDDEN: frozenset[str] = frozenset(
+    {
+        "batch_done",
+        "batch_failed",
+        "batch_blocked",
+        "batch_cancelled",
+        "chapter_generation_enqueue_failed",
+        "chapter_failed",
+        "chapter_memory_delta_failed",
+    }
+)
 
 
 def run_generate_chapters_batch_sync(
@@ -48,6 +107,7 @@ def run_generate_chapters_batch_sync(
     auto_plan_guard_check: bool,
     auto_plan_guard_fix: bool,
     auto_style_polish: bool,
+    auto_expressive_enhance: bool | None,
     batch_id: str,
     source: str = "batch_auto",
 ) -> dict[str, Any]:
@@ -70,33 +130,103 @@ def run_generate_chapters_batch_sync(
     do_plan_guard_fix = bool(auto_plan_guard_fix)
     do_plan_guard_check = bool(auto_plan_guard_check or do_plan_guard_fix)
     do_style_polish = bool(auto_style_polish)
+    do_expressive_enhance = (
+        bool(getattr(n, "auto_expressive_enhance", False))
+        if auto_expressive_enhance is None
+        else bool(auto_expressive_enhance)
+    )
     started = time.perf_counter()
+    original_plan = list(chapter_nos)
+
+    if _batch_has_terminal_stops(db, novel_id, batch_id, frozenset({"batch_done"})):
+        return {
+            "status": "ok",
+            "chapter_ids": [],
+            "batch_id": batch_id,
+            "already_done": True,
+        }
+
+    err_like = _STALE_REQUEUE_FORBIDDEN - {"batch_done"}
+    if _batch_has_terminal_stops(db, novel_id, batch_id, err_like):
+        raise ValueError("该批次已因错误或已取消中断，请重新发起生成")
+
+    saved_nos = _chapter_saved_nos_for_batch(db, novel_id, batch_id)
+    pending = [no for no in original_plan if no not in saved_nos]
+    batch_start_exists = _batch_has_terminal_stops(
+        db, novel_id, batch_id, frozenset({"batch_start"})
+    )
+
+    if not pending:
+        if batch_start_exists and not _batch_has_terminal_stops(
+            db, novel_id, batch_id, frozenset({"batch_done"})
+        ):
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=batch_id,
+                event="batch_done",
+                message=(
+                    f"批量生成完成，共 {len(saved_nos)} 章（续跑时检测到已全部落库，补齐终态）"
+                ),
+                meta={"elapsed_seconds": round(time.perf_counter() - started, 2)},
+            )
+            db.commit()
+        return {
+            "status": "ok",
+            "chapter_ids": [],
+            "batch_id": batch_id,
+            "already_done": True,
+        }
+
+    chapter_nos = pending
     count = len(chapter_nos)
 
     logger.info(
-        "generate_chapters sync start | novel_id=%s chapter_nos=%s batch_id=%s",
+        "generate_chapters sync start | novel_id=%s chapter_nos=%s batch_id=%s resumed=%s",
         novel_id,
         chapter_nos,
         batch_id,
+        batch_start_exists,
     )
-    append_generation_log(
-        db,
-        novel_id=novel_id,
-        batch_id=batch_id,
-        event="batch_start",
-        message=f"开始串行生成 {count} 章（章号：{', '.join(str(x) for x in chapter_nos)}）",
-        meta={
-            "count": count,
-            "chapter_nos": chapter_nos,
-            "use_cold_recall": use_cold_recall,
-            "cold_recall_items": cold_recall_items,
-            "consistency_check": do_consistency_check,
-            "plan_guard_check": do_plan_guard_check,
-            "plan_guard_fix": do_plan_guard_fix,
-            "style_polish": do_style_polish,
-        },
-    )
-    db.commit()
+    if not batch_start_exists:
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="batch_start",
+            message=(
+                f"开始串行生成 {len(original_plan)} 章（章号：{', '.join(str(x) for x in original_plan)}）"
+            ),
+            meta={
+                "count": len(original_plan),
+                "chapter_nos": original_plan,
+                "use_cold_recall": use_cold_recall,
+                "cold_recall_items": cold_recall_items,
+                "consistency_check": do_consistency_check,
+                "plan_guard_check": do_plan_guard_check,
+                "plan_guard_fix": do_plan_guard_fix,
+                "style_polish": do_style_polish,
+                "expressive_enhance": do_expressive_enhance,
+            },
+        )
+        db.commit()
+    else:
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="batch_resumed",
+            level="info",
+            message=(
+                f"续跑：尚余 {count} 章（原计划 {len(original_plan)} 章，本批次已落库 {len(saved_nos)} 章）"
+            ),
+            meta={
+                "original_chapter_nos": original_plan,
+                "pending_chapter_nos": chapter_nos,
+                "saved_count": len(saved_nos),
+            },
+        )
+        db.commit()
 
     if is_cancel_requested(batch_id):
         append_generation_log(
@@ -357,6 +487,48 @@ def run_generate_chapters_batch_sync(
                 )
                 db.commit()
 
+        do_expressive = do_expressive_enhance and settings.novel_expressive_enhance_enabled
+        if do_expressive:
+            try:
+                content = llm.expressive_enhance_chapter_sync(
+                    n,
+                    chapter_no=no,
+                    plan_title=plan.chapter_title,
+                    beats=beats,
+                    chapter_text=content,
+                    db=db,
+                )
+                normalized_title, normalized_content = ensure_chapter_heading(
+                    no, content, title_hint=effective_title_hint
+                )
+                content = normalized_content
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="chapter_expressive_enhance_done",
+                    chapter_no=no,
+                    message=f"第 {no} 章已完成表现力增强",
+                    meta={"strength": settings.novel_expressive_enhance_strength},
+                )
+                db.commit()
+            except Exception:
+                logger.exception(
+                    "generate_chapters expressive enhance failed, keep current | novel_id=%s chapter_no=%s",
+                    novel_id,
+                    no,
+                )
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="chapter_expressive_enhance_failed",
+                    chapter_no=no,
+                    level="warning",
+                    message=f"第 {no} 章表现力增强失败，已保留当前正文",
+                )
+                db.commit()
+
         if do_style_polish:
             pre_polish_metrics = chapter_content_metrics(content)
             pre_polish_body_chars = int(pre_polish_metrics.get("body_chars", 0) or 0)
@@ -437,7 +609,38 @@ def run_generate_chapters_batch_sync(
         )
         try:
             memory_delta_result: dict[str, Any] | None = None
+            memory_update_run = None
             if auto_approve:
+                current_version = (
+                    db.query(func.max(NovelMemory.version))
+                    .filter(NovelMemory.novel_id == novel_id)
+                    .scalar()
+                    or 0
+                )
+                memory_update_run = create_memory_update_run(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    trigger_source=source,
+                    source="chapter_generate_auto_approve",
+                    chapter_no=no,
+                    base_memory_version=int(current_version),
+                    request_payload={
+                        "chapter_no": no,
+                        "chapter_title": normalized_title,
+                        "source": source,
+                    },
+                )
+                touch_memory_update_run(
+                    db,
+                    memory_update_run,
+                    status="running",
+                    current_stage="delta_extracting",
+                    delta_status="running",
+                    validation_status="pending",
+                    norm_status="pending",
+                    snapshot_status="pending",
+                )
                 memory_delta_result = llm.propose_memory_update_from_chapter_sync(
                     n,
                     chapter_no=no,
@@ -445,6 +648,12 @@ def run_generate_chapters_batch_sync(
                     chapter_text=content,
                     prev_memory=mem,
                     db=db,
+                )
+                build_memory_update_run_from_result(
+                    db,
+                    memory_update_run,
+                    previous_payload_json=mem,
+                    result=memory_delta_result,
                 )
                 if not memory_delta_result.get("ok"):
                     err_text = "；".join(memory_delta_result.get("errors") or []) or "未知错误"
@@ -486,7 +695,10 @@ def run_generate_chapters_batch_sync(
                     event="chapter_memory_delta_applied",
                     chapter_no=no,
                     message=f"第 {no} 章工作记忆已更新",
-                    meta=memory_delta_result.get("stats") or {},
+                    meta={
+                        **(memory_delta_result.get("stats") or {}),
+                        "run_id": memory_update_run.id if memory_update_run else None,
+                    },
                 )
 
             created.append(ch.id)
@@ -505,6 +717,97 @@ def run_generate_chapters_batch_sync(
                 },
             )
             db.commit()
+            if settings.novel_judge_enabled:
+                try:
+                    workflow_run = get_workflow_run_by_batch_id(db, batch_id=batch_id)
+                    judge_meta = run_chapter_judge_suite(
+                        db,
+                        novel=n,
+                        chapter=ch,
+                        chapter_text=content,
+                        plan_title=plan.chapter_title or normalized_title,
+                        beats=beats,
+                        workflow_run_id=workflow_run.id if workflow_run else None,
+                        trigger_source=source,
+                    )
+                    append_generation_log(
+                        db,
+                        novel_id=novel_id,
+                        batch_id=batch_id,
+                        event="chapter_judge_done",
+                        chapter_no=no,
+                        message=(
+                            f"第 {no} 章评估完成：分数 {judge_meta['score']}，"
+                            f"发现 {judge_meta['issue_count']} 个问题"
+                        ),
+                        meta=judge_meta,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "chapter judge failed | novel_id=%s chapter_no=%s batch_id=%s",
+                        novel_id,
+                        no,
+                        batch_id,
+                    )
+                    append_generation_log(
+                        db,
+                        novel_id=novel_id,
+                        batch_id=batch_id,
+                        event="chapter_judge_failed",
+                        chapter_no=no,
+                        level="warning",
+                        message=f"第 {no} 章评估失败，已跳过 Judge",
+                    )
+                    db.commit()
+            if auto_approve and memory_update_run is not None and (
+                is_novel_story_bible_enabled(db, novel_id) or is_novel_rag_enabled(db, novel_id)
+            ):
+                try:
+                    from app.tasks.novel_tasks import novel_sync_memory_derived_assets
+
+                    task = novel_sync_memory_derived_assets.delay(
+                        novel_id,
+                        memory_update_run.id,
+                        batch_id,
+                        no,
+                    )
+                    task_id = getattr(task, "id", None)
+                    append_generation_log(
+                        db,
+                        novel_id=novel_id,
+                        batch_id=batch_id,
+                        event="chapter_story_assets_queued",
+                        chapter_no=no,
+                        message=f"第 {no} 章已转入异步同步 Story Bible / RAG",
+                        meta={"run_id": memory_update_run.id, "task_id": task_id},
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    set_memory_update_run_assets_status(
+                        db,
+                        memory_update_run,
+                        failed=True,
+                        error_message="异步同步任务入队失败",
+                    )
+                    logger.exception(
+                        "enqueue story assets after auto approve failed | novel_id=%s chapter_no=%s",
+                        novel_id,
+                        no,
+                    )
+                    append_generation_log(
+                        db,
+                        novel_id=novel_id,
+                        batch_id=batch_id,
+                        event="chapter_story_assets_enqueue_failed",
+                        chapter_no=no,
+                        level="warning",
+                        message=f"第 {no} 章正文已保存，但 Story Bible / RAG 异步任务入队失败",
+                        meta={"run_id": memory_update_run.id},
+                    )
+                    db.commit()
             if auto_approval_issues:
                 append_generation_log(
                     db,
@@ -534,6 +837,26 @@ def run_generate_chapters_batch_sync(
                 novel_id,
                 no,
             )
+            if auto_approve:
+                latest_run = (
+                    db.query(NovelMemoryUpdateRun)
+                    .filter(
+                        NovelMemoryUpdateRun.novel_id == novel_id,
+                        NovelMemoryUpdateRun.batch_id == batch_id,
+                        NovelMemoryUpdateRun.chapter_no == no,
+                    )
+                    .order_by(NovelMemoryUpdateRun.created_at.desc())
+                    .first()
+                )
+                if latest_run is not None:
+                    touch_memory_update_run(
+                        db,
+                        latest_run,
+                        status="failed",
+                        current_stage="failed",
+                        errors=[str(e)],
+                        error_payload={"error": str(e)},
+                    )
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -546,21 +869,34 @@ def run_generate_chapters_batch_sync(
                     if auto_approve
                     else f"第 {no} 章保存失败：{e}"
                 ),
+                meta={
+                    "diff_summary": build_memory_diff(
+                        mem,
+                        str(memory_delta_result.get("candidate_json") or "{}"),
+                    )
+                    if auto_approve and memory_delta_result
+                    else {},
+                },
             )
             db.commit()
             raise
 
+    total_in_batch = len(_chapter_saved_nos_for_batch(db, novel_id, batch_id))
     append_generation_log(
         db,
         novel_id=novel_id,
         batch_id=batch_id,
         event="batch_done",
-        message=f"批量生成完成，共 {len(created)} 章",
-        meta={"elapsed_seconds": round(time.perf_counter() - started, 2)},
+        message=f"批量生成完成，共 {total_in_batch} 章（本段新写 {len(created)} 章）",
+        meta={
+            "elapsed_seconds": round(time.perf_counter() - started, 2),
+            "saved_total": total_in_batch,
+            "saved_this_run": len(created),
+        },
     )
     db.commit()
     logger.info(
-        "generate_chapters sync done | novel_id=%s count=%s created=%s batch_id=%s",
+        "generate_chapters sync done | novel_id=%s pending_loop=%s created_this_run=%s batch_id=%s",
         novel_id,
         count,
         len(created),

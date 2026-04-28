@@ -17,7 +17,7 @@ from app.models.invite_code import InviteCode
 from app.models.user import User
 from app.services.app_config_service import get_app_config
 from app.core.rate_limit import limiter
-from app.services.email_service import send_otp_email
+from app.services.email_service import send_otp_email, send_password_reset_otp_email
 from app.core.redis import OTPHelper
 import logging
 
@@ -38,6 +38,12 @@ class RegisterBody(BaseModel):
 class LoginBody(BaseModel):
     username_or_email: str
     password: str
+
+
+class ResetPasswordBody(BaseModel):
+    email: EmailStr
+    otp: str = Field(..., min_length=6, max_length=6)
+    new_password: str = Field(..., min_length=6, max_length=128)
 
 
 class TokenOut(BaseModel):
@@ -67,7 +73,7 @@ async def send_otp(
     email = email.strip().lower()
     
     # 1. 尝试获取原子锁，防止并发刷邮件
-    if not await OTPHelper.try_lock_send_limit(email):
+    if not await OTPHelper.try_lock_send_limit(email, scene="register"):
         raise HTTPException(429, "发送过于频繁，请 60 秒后再试")
 
     # 2. 生成验证码
@@ -77,12 +83,45 @@ async def send_otp(
         # 3. 发送邮件（耗时操作）
         await send_otp_email(email, otp)
         # 4. 存入 Redis
-        await OTPHelper.set_otp(email, otp)
+        await OTPHelper.set_otp(email, otp, scene="register")
         return {"status": "ok", "message": "验证码已发送"}
     except Exception as e:
         # 邮件发送彻底失败时，解除频率锁定，允许用户重试
-        await OTPHelper.unlock_send_limit(email)
+        await OTPHelper.unlock_send_limit(email, scene="register")
         logger.error(f"OTP send error for {email}: {str(e)}", exc_info=True)
+        raise HTTPException(500, f"邮件发送失败: {str(e)}")
+
+
+@router.post("/forgot-password/send-otp")
+@limiter.limit("5/minute")
+async def send_forgot_password_otp(
+    request: Request,
+    email: str = Body(..., embed=True),
+    db: Session = Depends(get_db),
+):
+    """
+    发送忘记密码验证码。
+    """
+    normalized_email = email.strip().lower()
+
+    if not await OTPHelper.try_lock_send_limit(normalized_email, scene="reset_password"):
+        raise HTTPException(429, "发送过于频繁，请 60 秒后再试")
+
+    user = db.query(User).filter(User.email == normalized_email).first()
+    if not user:
+        return {"status": "ok", "message": "如果邮箱已注册，验证码已发送"}
+
+    otp = "".join(random.choices(string.digits, k=6))
+    try:
+        await send_password_reset_otp_email(normalized_email, otp)
+        await OTPHelper.set_otp(normalized_email, otp, scene="reset_password")
+        return {"status": "ok", "message": "如果邮箱已注册，验证码已发送"}
+    except Exception as e:
+        await OTPHelper.unlock_send_limit(normalized_email, scene="reset_password")
+        logger.error(
+            f"Forgot password OTP send error for {normalized_email}: {str(e)}",
+            exc_info=True,
+        )
         raise HTTPException(500, f"邮件发送失败: {str(e)}")
 
 
@@ -101,7 +140,7 @@ async def register(
         raise HTTPException(400, "用户名只允许输入英文字母和数字")
     
     # 1. 验证 OTP
-    saved_otp = await OTPHelper.get_otp(email)
+    saved_otp = await OTPHelper.get_otp(email, scene="register")
     if not saved_otp or saved_otp != data.otp:
         raise HTTPException(400, "验证码错误或已过期")
 
@@ -156,7 +195,7 @@ async def register(
     db.refresh(user)
 
     # 5. 注册成功后删除 OTP
-    await OTPHelper.delete_otp(email)
+    await OTPHelper.delete_otp(email, scene="register")
 
     token = create_access_token({"sub": user.id})
     return TokenOut(access_token=token)
@@ -182,6 +221,39 @@ def login(
         
     token = create_access_token({"sub": user.id})
     return TokenOut(access_token=token)
+
+
+@router.post("/refresh", response_model=TokenOut)
+def refresh_token(current: User = Depends(get_current_user)) -> TokenOut:
+    """
+    基于当前有效 token 做滑动续期。
+    """
+    token = create_access_token({"sub": current.id})
+    return TokenOut(access_token=token)
+
+
+@router.post("/reset-password")
+@limiter.limit("10/minute")
+async def reset_password(
+    request: Request,
+    db: Session = Depends(get_db),
+    data: ResetPasswordBody = Body(...),
+):
+    normalized_email = data.email.strip().lower()
+    user = db.query(User).filter(User.email == normalized_email).first()
+    if not user:
+        raise HTTPException(400, "验证码错误或已过期")
+
+    saved_otp = await OTPHelper.get_otp(normalized_email, scene="reset_password")
+    if not saved_otp or saved_otp != data.otp:
+        raise HTTPException(400, "验证码错误或已过期")
+
+    user.hashed_password = hash_password(data.new_password)
+    db.add(user)
+    db.commit()
+    await OTPHelper.delete_otp(normalized_email, scene="reset_password")
+
+    return {"status": "ok", "message": "密码重置成功，请使用新密码登录"}
 
 
 @router.get("/me", response_model=UserOut)

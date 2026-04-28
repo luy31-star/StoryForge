@@ -26,6 +26,7 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
       - CORS_ORIGINS=http://localhost:3000
     env_file:
       - ../.env
@@ -37,6 +38,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
 
   celery-worker:
     image: vocalflow-studio-backend-dev
@@ -45,6 +48,7 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
     env_file:
       - ../.env
     volumes:
@@ -55,6 +59,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
       backend:
         condition: service_started
 
@@ -65,11 +71,14 @@ services:
     environment:
       - DATABASE_URL=mysql+pymysql://user:password@mysql:3306/vocalflow
       - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
     env_file:
       - ../.env
     depends_on:
       redis:
         condition: service_healthy
+      qdrant:
+        condition: service_started
       backend:
         condition: service_started
     volumes:
@@ -102,5 +111,14 @@ services:
       timeout: 3s
       retries: 5
 
+  qdrant:
+    image: ${QDRANT_IMAGE:-${DOCKER_HUB_PREFIX:-docker.m.daocloud.io}/qdrant/qdrant:latest}
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrantdata:/qdrant/storage
+
 volumes:
   mysqldata:
+  qdrantdata:

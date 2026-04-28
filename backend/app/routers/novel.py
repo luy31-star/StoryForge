@@ -26,12 +26,29 @@ from app.models.novel import (
     NovelGenerationLog,
     NovelMemory,
 )
+from app.models.novel_judge import NovelJudgeIssue, NovelJudgeRun
+from app.models.novel_memory_runtime import NovelMemoryUpdateRun
+from app.models.novel_retrieval import (
+    NovelRetrievalChunk,
+    NovelRetrievalDocument,
+    NovelRetrievalQueryLog,
+)
 from app.models.novel_memory_norm import (
     NovelMemoryNormCharacter,
     NovelMemoryNormItem,
     NovelMemoryNormOutline,
     NovelMemoryNormRelation,
     NovelMemoryNormSkill,
+)
+from app.models.novel_story_bible import (
+    NovelStoryBibleEntity,
+    NovelStoryBibleFact,
+    NovelStoryBibleSnapshot,
+)
+from app.models.novel_workflow_runtime import (
+    NovelWorkflowEvent,
+    NovelWorkflowRun,
+    NovelWorkflowStep,
 )
 from app.models.task import UserTask
 from app.models.volume import NovelVolume, NovelChapterPlan
@@ -40,6 +57,11 @@ from app.services.memory_readable import (
     memory_payload_readable_zh_auto,
     memory_payload_to_readable_zh,
 )
+from app.services.novel_memory_diff_service import (
+    build_memory_diff,
+    build_memory_source_summary,
+)
+from app.services.novel_memory_update_service import serialize_memory_update_run
 from app.services.novel_llm_service import NovelLLMService, coerce_novel_outline_base_fields
 from app.services.novel_repo import (
     _select_arc_for_chapter,
@@ -79,8 +101,12 @@ from app.services.novel_generation_common import (
     has_pending_chapter_polish_batch,
     has_pending_memory_refresh_batch,
     memory_refresh_confirmation_token,
+    recover_stale_chapter_generation_batches,
+    recover_stale_volume_plan_batches,
 )
 from app.services.novel_text_formatter import format_novel_text
+from app.services.novel_judge_service import run_chapter_judge_suite
+from app.services.novel_core_evaluation import build_core_evaluation_snapshot
 from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import (
     novel_chapter_approve_memory_delta,
@@ -196,6 +222,7 @@ class AiCreateAndStartBody(BaseModel):
     auto_plan_guard_check: bool = False
     auto_plan_guard_fix: bool = False
     auto_style_polish: bool = False
+    auto_expressive_enhance: bool = False
     writing_style_id: str | None = Field(default=None, max_length=36)
     
 class NovelCreate(BaseModel):
@@ -212,6 +239,7 @@ class NovelCreate(BaseModel):
     auto_plan_guard_check: bool = False
     auto_plan_guard_fix: bool = False
     auto_style_polish: bool = False
+    auto_expressive_enhance: bool = False
 
 class NovelPatch(BaseModel):
     title: str | None = None
@@ -227,6 +255,9 @@ class NovelPatch(BaseModel):
     auto_plan_guard_check: bool | None = None
     auto_plan_guard_fix: bool | None = None
     auto_style_polish: bool | None = None
+    auto_expressive_enhance: bool | None = None
+    rag_enabled: bool | None = None
+    story_bible_enabled: bool | None = None
     status: str | None = None
 
 
@@ -275,6 +306,7 @@ class GenerateChapterBody(BaseModel):
     auto_plan_guard_check: bool | None = None
     auto_plan_guard_fix: bool | None = None
     auto_style_polish: bool | None = None
+    auto_expressive_enhance: bool | None = None
     # 按卷驱动：允许生成指定章（用于点击章计划条目生成正文）
     chapter_no: int | None = Field(default=None, ge=1, le=20000)
     source: str | None = Field(default=None, description="章节来源，如 manual 或 batch_auto")
@@ -721,8 +753,9 @@ def ai_create_and_start(
     user: User = Depends(get_current_user),
 ) -> dict[str, Any]:
     active_count = get_active_auto_pipeline_count(db)
-    if active_count >= 5:
-        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 人），请稍后再试")
+    max_active = max(1, int(settings.novel_auto_pipeline_max_active or 5))
+    if active_count >= max_active:
+        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 个任务），请稍后再试")
 
     if len(body.subjects) > 1:
         raise HTTPException(400, "题材最多选择 1 项")
@@ -766,6 +799,9 @@ def ai_create_and_start(
         auto_plan_guard_check=body.auto_plan_guard_check or body.auto_plan_guard_fix,
         auto_plan_guard_fix=body.auto_plan_guard_fix,
         auto_style_polish=body.auto_style_polish,
+        auto_expressive_enhance=body.auto_expressive_enhance,
+        rag_enabled=settings.novel_rag_enabled,
+        story_bible_enabled=settings.novel_story_bible_enabled,
         writing_style_id=body.writing_style_id,
         user_id=user.id,
         status="draft",
@@ -838,6 +874,7 @@ def ai_create_and_start(
                 "plots": body.plots,
                 "moods": body.moods,
                 "backgrounds": body.backgrounds,
+                "notes": body.notes,
                 "target_chapters": body.target_chapters,
                 "length_type": body.length_type,
                 "target_generate_chapters": body.target_generate_chapters,
@@ -852,6 +889,25 @@ def ai_create_and_start(
         "batch_id": batch_id,
         "task_id": task_id,
         "message": "AI建书已在后台执行，稍后可在列表中查看",
+    }
+
+
+@router.get("/queue-status")
+def get_novel_queue_status(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    _ = user
+    active_auto_pipeline_count = get_active_auto_pipeline_count(db)
+    max_active_auto_pipeline = max(1, int(settings.novel_auto_pipeline_max_active or 5))
+    return {
+        "status": "ok",
+        "active_auto_pipeline_count": active_auto_pipeline_count,
+        "max_active_auto_pipeline": max_active_auto_pipeline,
+        "available_auto_pipeline_slots": max(
+            0, max_active_auto_pipeline - active_auto_pipeline_count
+        ),
+        "is_busy": active_auto_pipeline_count >= max_active_auto_pipeline,
     }
 
 
@@ -875,6 +931,9 @@ def create_novel(
         auto_plan_guard_check=body.auto_plan_guard_check or body.auto_plan_guard_fix,
         auto_plan_guard_fix=body.auto_plan_guard_fix,
         auto_style_polish=body.auto_style_polish,
+        auto_expressive_enhance=body.auto_expressive_enhance,
+        rag_enabled=settings.novel_rag_enabled,
+        story_bible_enabled=settings.novel_story_bible_enabled,
         user_id=user.id,
     )
     db.add(n)
@@ -908,6 +967,9 @@ def get_novel(
         ),
         "auto_plan_guard_fix": bool(getattr(n, "auto_plan_guard_fix", False)),
         "auto_style_polish": bool(getattr(n, "auto_style_polish", False)),
+        "auto_expressive_enhance": bool(getattr(n, "auto_expressive_enhance", False)),
+        "rag_enabled": bool(getattr(n, "rag_enabled", False)),
+        "story_bible_enabled": bool(getattr(n, "story_bible_enabled", False)),
         "length_tag": _get_length_tag(n.target_chapters),
         "daily_auto_chapters": n.daily_auto_chapters,
         "daily_auto_time": n.daily_auto_time,
@@ -1279,13 +1341,14 @@ def generate_arcs(
         create_user_task(
             db,
             user_id=str(user.id),
+            kind="arcs_generate",
+            title=f"生成第{','.join(str(v) for v in (target_volume_nos or []))}卷 Arcs",
+            status="queued",
             batch_id=batch_id,
-            task_type="arcs_generate",
-            task_name="Arcs 生成",
-            message=f"正在生成第{','.join(str(v) for v in (target_volume_nos or []))}卷 Arcs",
-            celery_task_id=str(task_id or ""),
+            celery_task_id=str(task_id) if task_id else None,
+            novel_id=novel_id,
+            meta={"target_volume_nos": target_volume_nos, "instruction": instruction[:500]},
         )
-        db.commit()
     except Exception:
         logger.exception("create_user_task for arcs generate failed | novel_id=%s", novel_id)
     return {"status": "queued", "batch_id": batch_id, "task_id": task_id}
@@ -1517,6 +1580,7 @@ async def generate_chapters(
     n = require_novel_access(db, novel_id, user)
     if not n.framework_confirmed:
         raise HTTPException(400, "请先确认小说框架后再生成章节")
+    recover_stale_chapter_generation_batches(db, novel_id)
     if has_pending_chapter_generation_batch(db, novel_id):
         raise HTTPException(
             409,
@@ -1558,6 +1622,11 @@ async def generate_chapters(
         if body.auto_style_polish is not None
         else bool(getattr(n, "auto_style_polish", False))
     )
+    resolved_auto_expressive_enhance = (
+        body.auto_expressive_enhance
+        if body.auto_expressive_enhance is not None
+        else bool(getattr(n, "auto_expressive_enhance", False))
+    )
 
     payload: dict[str, Any] = {
         "title_hint": body.title_hint,
@@ -1569,6 +1638,7 @@ async def generate_chapters(
         "auto_plan_guard_check": bool(resolved_auto_plan_guard_check),
         "auto_plan_guard_fix": bool(resolved_auto_plan_guard_fix),
         "auto_style_polish": bool(resolved_auto_style_polish),
+        "auto_expressive_enhance": bool(resolved_auto_expressive_enhance),
         "source": source,
     }
     logger.info(
@@ -1633,7 +1703,7 @@ async def generate_chapters(
             batch_id=batch_id,
             celery_task_id=str(task_id) if task_id else None,
             novel_id=novel_id,
-            meta={"chapter_nos": chapter_nos, "source": source},
+            meta=dict(payload),
         )
     except Exception:
         logger.exception("create user task failed | batch_id=%s", batch_id)
@@ -1749,7 +1819,7 @@ def polish_chapter(
 
 
 class AutoGenerateBody(BaseModel):
-    target_count: int = Field(default=10, ge=1, le=5000)
+    target_count: int = Field(default=10, ge=1, le=20000)
 
 
 @router.post("/{novel_id}/auto-generate")
@@ -1764,10 +1834,12 @@ async def start_auto_pipeline(
         raise HTTPException(400, "请先确认小说框架")
 
     active_count = get_active_auto_pipeline_count(db)
-    if active_count >= 5:
-        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 人），请稍后再试")
+    max_active = max(1, int(settings.novel_auto_pipeline_max_active or 5))
+    if active_count >= max_active:
+        raise HTTPException(429, f"当前系统排队任务较多（前方排队 {active_count} 个任务），请稍后再试")
 
     recover_stale_auto_pipeline_state(db, novel_id)
+    recover_stale_chapter_generation_batches(db, novel_id)
     if has_pending_auto_pipeline_batch(db, novel_id) or has_pending_chapter_generation_batch(
         db, novel_id
     ):
@@ -1816,7 +1888,11 @@ async def start_auto_pipeline(
             batch_id=batch_id,
             celery_task_id=str(task_id) if task_id else None,
             novel_id=novel_id,
-            meta={"target_count": body.target_count},
+            meta={
+                "target_count": body.target_count,
+                "trigger_source": "manual",
+                "scheduled_date": None,
+            },
         )
     except Exception:
         logger.exception("create user task failed | batch_id=%s", batch_id)
@@ -1839,6 +1915,12 @@ def list_generation_logs(
     limit: int = 200,
 ) -> dict[str, Any]:
     require_novel_access(db, novel_id, user)
+    try:
+        recover_stale_auto_pipeline_state(db, novel_id)
+        recover_stale_chapter_generation_batches(db, novel_id)
+        recover_stale_volume_plan_batches(db, novel_id)
+    except Exception:
+        logger.exception("recover stale novel batch state failed | novel_id=%s", novel_id)
     lim = max(1, min(limit, 500))
     q = db.query(NovelGenerationLog).filter(NovelGenerationLog.novel_id == novel_id)
     if batch_id:
@@ -1997,12 +2079,15 @@ def list_generation_logs(
                         wm = {}
                     memory_refresh_preview = {
                         "tier": "warning",
-                        "current_version": wm.get("current_version"),
+                        "current_version": wm.get("current_version") or wm.get("version"),
                         "candidate_json": wm.get("candidate_json"),
                         "candidate_readable_zh": wm.get("candidate_readable_zh"),
                         "warnings": wm.get("warnings") or [],
                         "auto_pass_notes": wm.get("auto_pass_notes") or [],
                         "confirmation_token": wm.get("confirmation_token"),
+                        "diff_summary": wm.get("diff_summary") or {},
+                        "run_id": wm.get("run_id"),
+                        "applied": wm.get("confirmation_token") in (None, ""),
                     }
                     break
         elif "memory_refresh_done" in ev_rb:
@@ -2022,6 +2107,9 @@ def list_generation_logs(
                         "errors": bm.get("errors") or [],
                         "warnings": bm.get("warnings") or [],
                         "auto_pass_notes": bm.get("auto_pass_notes") or [],
+                        "diff_summary": bm.get("diff_summary") or {},
+                        "run_id": bm.get("run_id"),
+                        "applied": False,
                     }
                     break
 
@@ -2251,6 +2339,35 @@ async def approve_chapter(
     approve_batch_id = f"chapter-approve-{int(time.time())}-{c.novel_id[:8]}"
     # 先提交审定状态，再由 Celery 后台执行单章增量记忆，避免阻塞 HTTP。
     db.commit()
+    if settings.novel_judge_enabled:
+        try:
+            judge_meta = run_chapter_judge_suite(
+                db,
+                novel=n,
+                chapter=c,
+                chapter_text=c.content or "",
+                trigger_source="approve_chapter",
+            )
+            _append_generation_log(
+                db,
+                novel_id=c.novel_id,
+                batch_id=approve_batch_id,
+                event="chapter_judge_done",
+                chapter_no=c.chapter_no,
+                message=(
+                    f"第 {c.chapter_no} 章审定评估完成：分数 {judge_meta['score']}，"
+                    f"发现 {judge_meta['issue_count']} 个问题"
+                ),
+                meta=judge_meta,
+            )
+            db.commit()
+        except Exception:
+            logger.exception(
+                "approve_chapter judge failed | novel_id=%s chapter_id=%s",
+                c.novel_id,
+                chapter_id,
+            )
+            db.rollback()
     if approval_issues and force_pass:
         try:
             _append_generation_log(
@@ -2330,6 +2447,202 @@ async def approve_chapter(
         "memory_refresh_batch_id": None,
         "consolidate_memory_task_id": None,
     }
+
+
+@router.get("/chapters/{chapter_id}/judge-latest")
+def get_latest_chapter_judge(
+    chapter_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    chapter = require_chapter_access(db, chapter_id, user)
+    run = (
+        db.query(NovelJudgeRun)
+        .filter(NovelJudgeRun.chapter_id == chapter.id)
+        .order_by(NovelJudgeRun.created_at.desc())
+        .first()
+    )
+    if not run:
+        return {"status": "ok", "item": None}
+    issues = (
+        db.query(NovelJudgeIssue)
+        .filter(NovelJudgeIssue.judge_run_id == run.id)
+        .order_by(NovelJudgeIssue.created_at.asc())
+        .all()
+    )
+    return {
+        "status": "ok",
+        "item": {
+            "id": run.id,
+            "judge_type": run.judge_type,
+            "status": run.status,
+            "model_name": run.model_name,
+            "score": run.score,
+            "blocking": run.blocking,
+            "summary": run.summary,
+            "payload_json": json.loads(run.payload_json or "{}"),
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+            "issues": [
+                {
+                    "id": issue.id,
+                    "severity": issue.severity,
+                    "issue_type": issue.issue_type,
+                    "title": issue.title,
+                    "evidence_json": json.loads(issue.evidence_json or "[]"),
+                    "suggestion": issue.suggestion,
+                    "blocking": issue.blocking,
+                    "resolved": issue.resolved,
+                }
+                for issue in issues
+            ],
+        },
+    }
+
+
+@router.get("/{novel_id}/workflow/latest")
+def get_latest_workflow_run(
+    novel_id: str,
+    event_limit: int = Query(12, ge=1, le=50),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+
+    def _json_loads(raw: str, fallback: Any) -> Any:
+        try:
+            return json.loads(raw or "")
+        except Exception:
+            return fallback
+
+    run = (
+        db.query(NovelWorkflowRun)
+        .filter(NovelWorkflowRun.novel_id == novel_id)
+        .order_by(NovelWorkflowRun.created_at.desc())
+        .first()
+    )
+    if not run:
+        return {"status": "ok", "item": None}
+
+    steps = (
+        db.query(NovelWorkflowStep)
+        .filter(NovelWorkflowStep.run_id == run.id)
+        .order_by(NovelWorkflowStep.sequence_no.asc(), NovelWorkflowStep.created_at.asc())
+        .all()
+    )
+    events_desc = (
+        db.query(NovelWorkflowEvent)
+        .filter(NovelWorkflowEvent.run_id == run.id)
+        .order_by(NovelWorkflowEvent.created_at.desc())
+        .limit(event_limit)
+        .all()
+    )
+    events = list(reversed(events_desc))
+    return {
+        "status": "ok",
+        "item": {
+            "id": run.id,
+            "run_type": run.run_type,
+            "trigger_source": run.trigger_source,
+            "status": run.status,
+            "batch_id": run.batch_id,
+            "current_step": run.current_step,
+            "cursor_json": _json_loads(run.cursor_json, {}),
+            "input_json": _json_loads(run.input_json, {}),
+            "output_json": _json_loads(run.output_json, {}),
+            "error_json": _json_loads(run.error_json, {}),
+            "is_resumable": run.is_resumable,
+            "started_at": run.started_at,
+            "finished_at": run.finished_at,
+            "created_at": run.created_at,
+            "updated_at": run.updated_at,
+            "steps": [
+                {
+                    "id": step.id,
+                    "step_type": step.step_type,
+                    "sequence_no": step.sequence_no,
+                    "status": step.status,
+                    "attempt_count": step.attempt_count,
+                    "payload_json": _json_loads(step.payload_json, {}),
+                    "result_json": _json_loads(step.result_json, {}),
+                    "error_json": _json_loads(step.error_json, {}),
+                    "started_at": step.started_at,
+                    "finished_at": step.finished_at,
+                    "created_at": step.created_at,
+                    "updated_at": step.updated_at,
+                }
+                for step in steps
+            ],
+            "events": [
+                {
+                    "id": event.id,
+                    "step_id": event.step_id,
+                    "level": event.level,
+                    "event_type": event.event_type,
+                    "message": event.message,
+                    "meta_json": _json_loads(event.meta_json, {}),
+                    "created_at": event.created_at,
+                }
+                for event in events
+            ],
+        },
+    }
+
+
+@router.get("/{novel_id}/retrieval/logs")
+def list_retrieval_logs(
+    novel_id: str,
+    limit: int = Query(8, ge=1, le=50),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+
+    def _json_loads(raw: str, fallback: Any) -> Any:
+        try:
+            return json.loads(raw or "")
+        except Exception:
+            return fallback
+
+    rows = (
+        db.query(NovelRetrievalQueryLog)
+        .filter(NovelRetrievalQueryLog.novel_id == novel_id)
+        .order_by(NovelRetrievalQueryLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "status": "ok",
+        "items": [
+            {
+                "id": row.id,
+                "query_text": row.query_text,
+                "query_type": row.query_type,
+                "top_k": row.top_k,
+                "latency_ms": row.latency_ms,
+                "created_at": row.created_at,
+                "result_json": [
+                    {
+                        **item,
+                        "content": item.get("content") or item.get("text") or "",
+                    }
+                    for item in _json_loads(row.result_json, [])
+                    if isinstance(item, dict)
+                ],
+            }
+            for row in rows
+        ],
+    }
+
+
+@router.get("/{novel_id}/core-evaluation")
+def get_core_evaluation(
+    novel_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    return build_core_evaluation_snapshot(db, novel_id)
 
 
 @router.patch("/chapters/{chapter_id}")
@@ -2498,6 +2811,12 @@ def get_memory(
             normalized = normalized_memory_to_dict(db, novel_id)
         except Exception:
             logger.exception("Failed to auto-bootstrap normalized memory in get_memory")
+    latest_run = (
+        db.query(NovelMemoryUpdateRun)
+        .filter(NovelMemoryUpdateRun.novel_id == novel_id)
+        .order_by(NovelMemoryUpdateRun.created_at.desc())
+        .first()
+    )
 
     return {
         "version": row.version,
@@ -2510,6 +2829,7 @@ def get_memory(
         "normalized": normalized,
         "schema_guide": build_memory_schema_guide(),
         "health": build_memory_health_summary(db, novel_id),
+        "latest_update_run": serialize_memory_update_run(latest_run) if latest_run else None,
     }
 
 
@@ -3130,14 +3450,185 @@ def get_memory_history(
         .order_by(NovelMemory.version.desc())
         .all()
     )
-    return [
-        {
-            "version": r.version,
-            "summary": r.summary,
-            "created_at": r.created_at.isoformat() if r.created_at else None,
+    out: list[dict[str, Any]] = []
+    prev_payload_json = "{}"
+    for idx, row in enumerate(reversed(rows)):
+        diff_summary = build_memory_diff(prev_payload_json, row.payload_json or "{}")
+        item = {
+            "version": row.version,
+            "summary": row.summary,
+            "created_at": row.created_at.isoformat() if row.created_at else None,
+            "diff_summary": diff_summary,
+            "source_summary": build_memory_source_summary(diff_summary),
         }
-        for r in rows
-    ]
+        out.append(item)
+        prev_payload_json = row.payload_json or "{}"
+    out.reverse()
+    return out
+
+
+@router.get("/{novel_id}/memory/update-runs")
+def list_memory_update_runs(
+    novel_id: str,
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+    rows = (
+        db.query(NovelMemoryUpdateRun)
+        .filter(NovelMemoryUpdateRun.novel_id == novel_id)
+        .order_by(NovelMemoryUpdateRun.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return {
+        "status": "ok",
+        "items": [serialize_memory_update_run(row) for row in rows],
+    }
+
+
+@router.get("/{novel_id}/story-bible/latest")
+def get_latest_story_bible_snapshot(
+    novel_id: str,
+    entity_limit: int = Query(24, ge=1, le=100),
+    fact_limit: int = Query(24, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+
+    def _json_loads(raw: str, fallback: Any) -> Any:
+        try:
+            return json.loads(raw or "")
+        except Exception:
+            return fallback
+
+    snapshot = (
+        db.query(NovelStoryBibleSnapshot)
+        .filter(NovelStoryBibleSnapshot.novel_id == novel_id)
+        .order_by(NovelStoryBibleSnapshot.created_at.desc())
+        .first()
+    )
+    if not snapshot:
+        return {"status": "ok", "item": None}
+    entities = (
+        db.query(NovelStoryBibleEntity)
+        .filter(NovelStoryBibleEntity.snapshot_id == snapshot.id)
+        .order_by(
+            NovelStoryBibleEntity.entity_type.asc(),
+            NovelStoryBibleEntity.sort_order.asc(),
+            NovelStoryBibleEntity.created_at.asc(),
+        )
+        .limit(entity_limit)
+        .all()
+    )
+    facts = (
+        db.query(NovelStoryBibleFact)
+        .filter(NovelStoryBibleFact.snapshot_id == snapshot.id)
+        .order_by(NovelStoryBibleFact.created_at.desc())
+        .limit(fact_limit)
+        .all()
+    )
+    return {
+        "status": "ok",
+        "item": {
+            "id": snapshot.id,
+            "version": snapshot.version,
+            "source_memory_version": snapshot.source_memory_version,
+            "summary": _json_loads(snapshot.summary_json, {}),
+            "stats": _json_loads(snapshot.stats_json, {}),
+            "created_at": snapshot.created_at.isoformat() if snapshot.created_at else None,
+            "updated_at": snapshot.updated_at.isoformat() if snapshot.updated_at else None,
+            "entities": [
+                {
+                    "id": row.id,
+                    "entity_type": row.entity_type,
+                    "canonical_name": row.canonical_name,
+                    "aliases": _json_loads(row.aliases_json, []),
+                    "status": row.status,
+                    "description": row.description,
+                    "tags": _json_loads(row.tags_json, []),
+                    "attributes": _json_loads(row.attributes_json, {}),
+                    "source_chapter_no": row.source_chapter_no,
+                    "last_seen_chapter_no": row.last_seen_chapter_no,
+                    "confidence": row.confidence,
+                    "is_active": row.is_active,
+                }
+                for row in entities
+            ],
+            "facts": [
+                {
+                    "id": row.id,
+                    "fact_type": row.fact_type,
+                    "subject_entity_id": row.subject_entity_id,
+                    "object_entity_id": row.object_entity_id,
+                    "body": row.body,
+                    "evidence": _json_loads(row.evidence_json, []),
+                    "chapter_range": _json_loads(row.chapter_range_json, {}),
+                    "status": row.status,
+                    "weight": row.weight,
+                    "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+                }
+                for row in facts
+            ],
+        },
+    }
+
+
+@router.get("/{novel_id}/retrieval/index")
+def get_retrieval_index_snapshot(
+    novel_id: str,
+    document_limit: int = Query(24, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    require_novel_access(db, novel_id, user)
+
+    def _json_loads(raw: str, fallback: Any) -> Any:
+        try:
+            return json.loads(raw or "")
+        except Exception:
+            return fallback
+
+    documents = (
+        db.query(NovelRetrievalDocument)
+        .filter(NovelRetrievalDocument.novel_id == novel_id)
+        .order_by(NovelRetrievalDocument.updated_at.desc())
+        .limit(document_limit)
+        .all()
+    )
+    doc_ids = [row.id for row in documents]
+    chunk_counts: dict[str, int] = {}
+    if doc_ids:
+        for doc_id, count in (
+            db.query(
+                NovelRetrievalChunk.document_id,
+                func.count(NovelRetrievalChunk.id),
+            )
+            .filter(NovelRetrievalChunk.document_id.in_(doc_ids))
+            .group_by(NovelRetrievalChunk.document_id)
+            .all()
+        ):
+            chunk_counts[str(doc_id)] = int(count or 0)
+    return {
+        "status": "ok",
+        "items": [
+            {
+                "id": row.id,
+                "source_type": row.source_type,
+                "source_id": row.source_id,
+                "title": row.title,
+                "summary": row.summary,
+                "metadata": _json_loads(row.metadata_json, {}),
+                "checksum": row.checksum,
+                "is_active": row.is_active,
+                "chunk_count": chunk_counts.get(row.id, 0),
+                "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+            }
+            for row in documents
+        ],
+    }
 
 
 @router.post("/{novel_id}/memory/clear")

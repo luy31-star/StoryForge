@@ -7,6 +7,8 @@ class Settings(BaseSettings):
     app_name: str = "StoryForge API"
     database_url: str = "sqlite:///./vocalflow.db"
     redis_url: str = "redis://localhost:6379/0"
+    qdrant_url: str = "http://localhost:6333"
+    qdrant_api_key: str = ""
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
 
     seedance_api_key: str = ""
@@ -70,8 +72,38 @@ class Settings(BaseSettings):
     # 小说模块
     reference_txt_max_bytes: int = 15 * 1024 * 1024  # 15MB
     novel_local_upload_dir: str = "./uploads/novels"
+    novel_rag_enabled: bool = True
+    novel_story_bible_enabled: bool = True
+    novel_workflow_v2_enabled: bool = True
+    novel_judge_enabled: bool = True
+    novel_qdrant_collection: str = "novel-memory"
+    novel_embedding_dimension: int = 1536
+    # hash | http（OpenAI 兼容 /embeddings，默认走 ai302_base_url + api_key）
+    novel_embedding_provider: str = "http"
+    novel_embedding_http_model: str = "text-embedding-3-small"
+    novel_embedding_http_fallback: bool = False
+    novel_embedding_http_batch_size: int = 32
+    novel_embedding_http_timeout: float = 60.0
+    novel_retrieval_top_k: int = 8
+    novel_retrieval_timeout: float = 10.0
+    # 多路子查询每路召回数、是否增量建索引、rerank
+    novel_retrieval_incremental: bool = True
+    novel_retrieval_per_branch_k: int = 4
+    novel_retrieval_query_rewrite: bool = True
+    novel_retrieval_rerank_enabled: bool = True
+    novel_retrieval_mmr_lambda: float = 0.55
+    novel_retrieval_chunk_max_chars: int = 880
+    novel_retrieval_chunk_overlap: int = 100
+    # 准图子图（Story Bible 最新快照 1~2 跳）注入写章上下文
+    novel_quasi_graph_enabled: bool = True
+    novel_quasi_graph_max_edges: int = 24
+    # 表现力增强 pass（在一致性/执行卡之后、去 AI 味 style_polish 之前或并列由 novel 开关控制）
+    novel_expressive_enhance_enabled: bool = False
+    novel_expressive_enhance_strength: str = "safe"  # safe | strong | cinematic
     # 每日定时任务默认生成章节数（每本书可单独覆盖）
     novel_daily_default_chapters: int = 1
+    # 全自动小说流水线的全局并发/排队软上限；超过后前端提示排队，接口拒绝继续入队
+    novel_auto_pipeline_max_active: int = 5
     # Celery Beat：每日触发的小时（0-23，服务器本地时区）
     novel_beat_hour: int = 9
     novel_beat_minute: int = 0
@@ -110,6 +142,8 @@ class Settings(BaseSettings):
     novel_volume_plan_batch_size: int = 10
     # 单批 LLM 超时（秒）
     novel_volume_plan_batch_timeout: float = 480.0
+    # AI 一键建书：头脑风暴（书名/简介/背景 JSON）单次请求超时（秒），长输出易超过 3 分钟
+    novel_ai_create_brainstorm_timeout: float = 720.0
     # 记忆刷新分批：每批摘要最大字符数（0表示不分批）
     novel_memory_refresh_batch_chars: int = 15000
     # 记忆刷新单批超时（秒）

@@ -12,6 +12,23 @@ from app.models.novel_memory_norm import (  # noqa: F401 — metadata for create
     NovelMemoryNormRelation,
     NovelMemoryNormSkill,
 )
+from app.models.novel_story_bible import (
+    NovelStoryBibleEntity,
+    NovelStoryBibleFact,
+    NovelStoryBibleSnapshot,
+)
+from app.models.novel_retrieval import (
+    NovelRetrievalChunk,
+    NovelRetrievalDocument,
+    NovelRetrievalQueryLog,
+)
+from app.models.novel_workflow_runtime import (
+    NovelWorkflowEvent,
+    NovelWorkflowRun,
+    NovelWorkflowStep,
+)
+from app.models.novel_memory_runtime import NovelMemoryUpdateRun
+from app.models.novel_judge import NovelJudgeIssue, NovelJudgeRun
 from app.models.volume import NovelChapterPlan, NovelVolume
 from app.models.writing_style import WritingStyle
 from app.models.project import Project
@@ -39,6 +56,18 @@ __all__ = [
     "NovelMemoryNormPlot",
     "NovelMemoryNormRelation",
     "NovelMemoryNormSkill",
+    "NovelStoryBibleSnapshot",
+    "NovelStoryBibleEntity",
+    "NovelStoryBibleFact",
+    "NovelRetrievalDocument",
+    "NovelRetrievalChunk",
+    "NovelRetrievalQueryLog",
+    "NovelWorkflowRun",
+    "NovelWorkflowStep",
+    "NovelWorkflowEvent",
+    "NovelMemoryUpdateRun",
+    "NovelJudgeRun",
+    "NovelJudgeIssue",
     "NovelVolume",
     "NovelChapterPlan",
     "WritingStyle",

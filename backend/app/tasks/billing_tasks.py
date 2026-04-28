@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 @celery_app.task(name="billing.reconcile_alipay_orders")
 def reconcile_alipay_orders() -> dict[str, int]:
     if not settings.alipay_reconcile_enabled:
+        logger.info("alipay reconcile skipped | reason=disabled")
         return {"skipped": 1, "processed": 0, "paid": 0, "closed": 0, "failed": 0}
 
     now = datetime.utcnow()
@@ -47,18 +48,40 @@ def reconcile_alipay_orders() -> dict[str, int]:
             processed += 1
             try:
                 q = client.trade_query_sync(order.out_trade_no)
+                if q.code and q.code != "10000":
+                    logger.warning(
+                        "alipay reconcile query non-success | out_trade_no=%s code=%s msg=%s sub_code=%s sub_msg=%s",
+                        order.out_trade_no,
+                        q.code,
+                        q.msg,
+                        q.sub_code,
+                        q.sub_msg,
+                    )
                 order.query_raw = json.dumps(q.raw, ensure_ascii=False)
                 order.reconciled_at = datetime.utcnow()
                 order.trade_status = q.trade_status or order.trade_status
                 order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
 
                 if q.total_amount and q.total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+                    logger.warning(
+                        "alipay reconcile amount mismatch | out_trade_no=%s expected=%s actual=%s",
+                        order.out_trade_no,
+                        fmt_amount_cny(int(order.amount_cny or 0)),
+                        q.total_amount,
+                    )
                     db.commit()
                     continue
 
                 if q.trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
                     apply_recharge_paid(db, order, q.trade_status, q.alipay_trade_no, q.raw, via="query")
                     paid += 1
+                    logger.info(
+                        "alipay recharge credited by reconcile | out_trade_no=%s trade_no=%s status=%s points=%s",
+                        order.out_trade_no,
+                        q.alipay_trade_no,
+                        q.trade_status,
+                        order.points,
+                    )
                 elif q.trade_status in ("TRADE_CLOSED",):
                     order.status = "closed"
                     closed += 1

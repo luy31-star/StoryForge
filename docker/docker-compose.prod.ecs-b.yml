@@ -11,6 +11,9 @@ services:
     command: celery -A app.tasks.celery_app worker -l info -Q vocalflow,celery
     env_file:
       - ../.env
+    environment:
+      # Qdrant 统一部署在 ecs-a；ecs-b 必须通过 .env 指向 ecs-a 内网地址。
+      QDRANT_URL: ${QDRANT_URL:?Set QDRANT_URL to ecs-a private address, e.g. http://<ecs-a-private-ip>:6333}
     volumes:
       - ./secrets:/app/backend/secrets:ro
       - novel_uploads:/app/backend/uploads/novels
@@ -27,6 +30,8 @@ services:
     command: celery -A app.tasks.celery_app beat -l info
     env_file:
       - ../.env
+    environment:
+      QDRANT_URL: ${QDRANT_URL:?Set QDRANT_URL to ecs-a private address, e.g. http://<ecs-a-private-ip>:6333}
     volumes:
       - ./secrets:/app/backend/secrets:ro
       - novel_uploads:/app/backend/uploads/novels

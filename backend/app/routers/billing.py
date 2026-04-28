@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import uuid
 from datetime import datetime
@@ -32,6 +33,11 @@ from app.services.recharge_service import (
 router = APIRouter(prefix="/api/billing", tags=["billing"])
 # 以下 admin_router 路由均通过 Depends(get_current_admin) 校验管理员身份
 admin_router = APIRouter(prefix="/api/admin", tags=["admin"])
+logger = logging.getLogger(__name__)
+
+
+def _setting_token(value: str) -> str:
+    return (value or "").strip().split()[0] if (value or "").strip() else ""
 
 
 class RechargeBody(BaseModel):
@@ -148,6 +154,13 @@ def create_alipay_recharge_form(
     )
     db.add(order)
     db.commit()
+    logger.info(
+        "alipay recharge order created | out_trade_no=%s user_id=%s amount_cny=%s points=%s",
+        out_trade_no,
+        user.id,
+        amount_cny,
+        points,
+    )
 
     subject = f"StoryForge 积分充值 {points} 积分"
     form_html = AlipayClient().page_pay_form(
@@ -213,17 +226,39 @@ def refresh_recharge_order(
         return _serialize_recharge_order(order)
 
     q = AlipayClient().trade_query_sync(order.out_trade_no)
+    if q.code and q.code != "10000":
+        logger.warning(
+            "alipay trade query non-success | out_trade_no=%s code=%s msg=%s sub_code=%s sub_msg=%s",
+            order.out_trade_no,
+            q.code,
+            q.msg,
+            q.sub_code,
+            q.sub_msg,
+        )
     order.query_raw = json.dumps(q.raw, ensure_ascii=False)
     order.reconciled_at = datetime.utcnow()
     order.trade_status = q.trade_status or order.trade_status
     order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
 
     if q.total_amount and q.total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+        logger.warning(
+            "alipay refresh amount mismatch | out_trade_no=%s expected=%s actual=%s",
+            order.out_trade_no,
+            fmt_amount_cny(int(order.amount_cny or 0)),
+            q.total_amount,
+        )
         db.commit()
         raise HTTPException(400, "订单金额校验失败")
 
     if q.trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
         apply_recharge_paid(db, order, q.trade_status, q.alipay_trade_no, q.raw, via="query")
+        logger.info(
+            "alipay recharge credited by refresh | out_trade_no=%s trade_no=%s status=%s points=%s",
+            order.out_trade_no,
+            q.alipay_trade_no,
+            q.trade_status,
+            order.points,
+        )
     elif q.trade_status in ("TRADE_CLOSED",):
         order.status = "closed"
     elif order.status == "created":
@@ -239,17 +274,37 @@ async def alipay_notify(request: Request, db: Session = Depends(get_db)):
     form = await request.form()
     params = {k: str(v) for k, v in form.items()}
     if not params:
+        logger.warning("alipay notify rejected | reason=empty_form")
         return PlainTextResponse("failure")
 
     client = AlipayClient()
     if not client.verify(params):
+        logger.warning(
+            "alipay notify rejected | reason=verify_failed out_trade_no=%s trade_no=%s",
+            params.get("out_trade_no") or "",
+            params.get("trade_no") or "",
+        )
         return PlainTextResponse("failure")
     app_id = params.get("app_id") or ""
-    if app_id and app_id != settings.alipay_app_id:
+    expected_app_id = _setting_token(settings.alipay_app_id)
+    if app_id and app_id != expected_app_id:
+        logger.warning(
+            "alipay notify rejected | reason=app_id_mismatch out_trade_no=%s got=%s expected=%s",
+            params.get("out_trade_no") or "",
+            app_id,
+            expected_app_id,
+        )
         return PlainTextResponse("failure")
-    if settings.alipay_seller_id:
+    expected_seller_id = _setting_token(settings.alipay_seller_id)
+    if expected_seller_id:
         seller_id = params.get("seller_id") or ""
-        if seller_id != settings.alipay_seller_id:
+        if seller_id != expected_seller_id:
+            logger.warning(
+                "alipay notify rejected | reason=seller_id_mismatch out_trade_no=%s got=%s expected=%s",
+                params.get("out_trade_no") or "",
+                seller_id,
+                expected_seller_id,
+            )
             return PlainTextResponse("failure")
 
     out_trade_no = params.get("out_trade_no") or ""
@@ -259,9 +314,16 @@ async def alipay_notify(request: Request, db: Session = Depends(get_db)):
 
     order = db.query(RechargeOrder).filter(RechargeOrder.out_trade_no == out_trade_no).first()
     if not order:
+        logger.warning("alipay notify rejected | reason=order_not_found out_trade_no=%s", out_trade_no)
         return PlainTextResponse("failure")
 
     if total_amount and total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+        logger.warning(
+            "alipay notify rejected | reason=amount_mismatch out_trade_no=%s expected=%s actual=%s",
+            out_trade_no,
+            fmt_amount_cny(int(order.amount_cny or 0)),
+            total_amount,
+        )
         return PlainTextResponse("failure")
 
     order.notify_raw = json.dumps(params, ensure_ascii=False)
@@ -272,6 +334,13 @@ async def alipay_notify(request: Request, db: Session = Depends(get_db)):
     if trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
         apply_recharge_paid(db, order, trade_status, alipay_trade_no, params, via="notify")
         db.commit()
+        logger.info(
+            "alipay recharge credited by notify | out_trade_no=%s trade_no=%s status=%s points=%s",
+            out_trade_no,
+            alipay_trade_no,
+            trade_status,
+            order.points,
+        )
         return PlainTextResponse("success")
 
     if trade_status in ("TRADE_CLOSED",):
@@ -280,6 +349,12 @@ async def alipay_notify(request: Request, db: Session = Depends(get_db)):
         return PlainTextResponse("success")
 
     db.commit()
+    logger.info(
+        "alipay notify accepted without credit | out_trade_no=%s trade_no=%s status=%s",
+        out_trade_no,
+        alipay_trade_no,
+        trade_status,
+    )
     return PlainTextResponse("success")
 
 
@@ -299,17 +374,39 @@ def admin_reconcile_one(
         raise HTTPException(404, "订单不存在")
 
     q = client.trade_query_sync(order.out_trade_no)
+    if q.code and q.code != "10000":
+        logger.warning(
+            "admin alipay reconcile non-success | out_trade_no=%s code=%s msg=%s sub_code=%s sub_msg=%s",
+            order.out_trade_no,
+            q.code,
+            q.msg,
+            q.sub_code,
+            q.sub_msg,
+        )
     order.query_raw = json.dumps(q.raw, ensure_ascii=False)
     order.reconciled_at = datetime.utcnow()
     order.trade_status = q.trade_status or order.trade_status
     order.alipay_trade_no = q.alipay_trade_no or order.alipay_trade_no
 
     if q.total_amount and q.total_amount != fmt_amount_cny(int(order.amount_cny or 0)):
+        logger.warning(
+            "admin alipay reconcile amount mismatch | out_trade_no=%s expected=%s actual=%s",
+            order.out_trade_no,
+            fmt_amount_cny(int(order.amount_cny or 0)),
+            q.total_amount,
+        )
         db.commit()
         raise HTTPException(400, "金额不匹配，已记录查询结果")
 
     if q.trade_status in ("TRADE_SUCCESS", "TRADE_FINISHED"):
         apply_recharge_paid(db, order, q.trade_status, q.alipay_trade_no, q.raw, via="query")
+        logger.info(
+            "alipay recharge credited by admin reconcile | out_trade_no=%s trade_no=%s status=%s points=%s",
+            order.out_trade_no,
+            q.alipay_trade_no,
+            q.trade_status,
+            order.points,
+        )
     elif q.trade_status in ("TRADE_CLOSED",):
         order.status = "closed"
 

@@ -1,7 +1,17 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { BookOpen, Brain, ChevronDown, ChevronRight, GitBranch, Sparkles, X } from "lucide-react";
+import {
+  BookOpen,
+  Brain,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  GitBranch,
+  Sparkles,
+  X,
+} from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
+import { NovelIntelPanel } from "@/components/NovelIntelPanel";
 import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
 import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import { Button } from "@/components/ui/button";
@@ -15,6 +25,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   addChapterFeedback,
@@ -39,25 +50,37 @@ import {
   discardChapterRevision,
   exportChapters,
   generateFramework,
+  regenerateFramework,
   formatChapter,
   generateChapters,
   autoGenerateChapters,
   generateArcs,
   generateVolumeChapterPlan,
-  generateVolumes,
   getMemory,
   getMemoryNormalized,
   getMemoryHistory,
   clearMemory,
+  getNovelQueueStatus,
   rollbackMemory,
   rebuildMemoryNormalized,
   formatMemoryPlotLine,
+  getLatestChapterJudge,
+  getLatestStoryBibleSnapshot,
+  getLatestWorkflowRun,
+  getNovelCoreEvaluation,
   type MemoryHealth,
+  type MemoryDiffSummary,
   type MemorySchemaGuide,
+  type MemoryUpdateRun,
+  listRetrievalLogs,
+  listMemoryUpdateRuns,
   listGenerationLogs,
   type NormalizedMemoryPayload,
+  type NovelRetrievalLogItem,
+  type NovelWorkflowLatest,
   listVolumeChapterPlan,
   listVolumes,
+  type NovelVolumeListItem,
   manualFixMemory,
   getNovel,
   listChapters,
@@ -70,9 +93,11 @@ import {
   patchNovel,
   polishChapter,
   refreshMemory,
+  getRetrievalIndexSnapshot,
   regenerateChapterPlan,
   retryChapterMemory,
   reviseChapter,
+  type ChapterJudgeLatest,
   type ChapterPlanReservedItem,
   type ChapterPlanV2Beats,
   waitForChapterConsistencyBatch,
@@ -81,6 +106,7 @@ import {
   waitForChapterReviseBatch,
   waitForArcsGenerateBatch,
   waitForFrameworkGenerateBatch,
+  waitForFrameworkRegenerateBatch,
   waitForMemoryRefreshBatch,
   waitForVolumePlanBatch,
 } from "@/services/novelApi";
@@ -120,6 +146,288 @@ function safeJsonStringify(data: unknown): string {
   }
 }
 
+/** 后端 naive UTC 的 isoformat() 无时区；浏览器会当成本地时间。无尾部 Z/偏移时按 UTC 解析。 */
+function parseBackendUtcIso(iso: string): Date {
+  const s = iso.trim();
+  if (!s) return new Date(NaN);
+  if (/[zZ]$/.test(s)) return new Date(s);
+  if (/[+-]\d{2}:\d{2}$/.test(s) || /[+-]\d{4}$/.test(s)) return new Date(s);
+  const normalized = s.includes("T") ? s : s.replace(" ", "T");
+  return new Date(`${normalized}Z`);
+}
+
+function formatDateTimeLabel(value?: string | null): string {
+  if (!value) return "暂无";
+  const date = parseBackendUtcIso(value);
+  if (Number.isNaN(date.getTime())) return "暂无";
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "Asia/Shanghai",
+  }).format(date);
+}
+
+function diffChangedTypes(diff?: MemoryDiffSummary | null): string[] {
+  const list = diff?.summary?.changed_types;
+  return Array.isArray(list) ? list.map((item) => String(item)) : [];
+}
+
+function diffChangeCount(diff?: MemoryDiffSummary | null): number {
+  return Number(diff?.summary?.change_count ?? 0) || 0;
+}
+
+function diffChapterNos(diff?: MemoryDiffSummary | null): number[] {
+  const list = diff?.summary?.chapter_nos;
+  return Array.isArray(list)
+    ? list.map((item) => Number(item)).filter((item) => Number.isFinite(item) && item > 0)
+    : [];
+}
+
+function memoryRunStatusTone(status?: string): string {
+  switch (status) {
+    case "ok":
+      return "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300";
+    case "warning":
+      return "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300";
+    case "blocked":
+    case "failed":
+      return "border-rose-500/25 bg-rose-500/10 text-rose-700 dark:text-rose-300";
+    case "running":
+    case "queued":
+      return "border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-300";
+    default:
+      return "border-border/70 bg-background/60 text-foreground/60";
+  }
+}
+
+type VolumeArcRow = {
+  title?: string;
+  name?: string;
+  from_chapter?: number;
+  to_chapter?: number;
+  summary?: string;
+  description?: string;
+  hook?: string;
+  must_not?: string[] | string;
+  progress_allowed?: string[] | string;
+};
+
+function parseVolumeOutlineJson(
+  raw?: string
+): { volume_no?: number; arcs: VolumeArcRow[] } | null {
+  if (!raw || raw.trim() === "" || raw === "{}") return null;
+  try {
+    const o = JSON.parse(raw) as { volume_no?: number; arcs?: unknown };
+    if (!o || !Array.isArray(o.arcs) || o.arcs.length === 0) return null;
+    return {
+      volume_no: o.volume_no,
+      arcs: o.arcs.filter(
+        (a): a is VolumeArcRow => a != null && typeof a === "object"
+      ),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function stringListField(v: string | string[] | undefined): string[] {
+  if (v == null) return [];
+  if (Array.isArray(v))
+    return v.map((x) => String(x).trim()).filter(Boolean);
+  return String(v).trim() ? [String(v).trim()] : [];
+}
+
+function VolumeArcStack({
+  volume,
+  compact,
+  roomy,
+}: {
+  volume: NovelVolumeListItem;
+  compact?: boolean;
+  /** 大纲抽屉主预览：更大字号与留白，适合阅读 */
+  roomy?: boolean;
+}) {
+  const parsed = parseVolumeOutlineJson(volume.outline_json);
+  const md = (volume.outline_markdown || "").trim();
+  if (parsed && parsed.arcs.length > 0) {
+    return (
+      <div
+        className={
+          compact
+            ? "space-y-1.5"
+            : roomy
+              ? "space-y-3.5"
+              : "space-y-2"
+        }
+      >
+        {parsed.arcs.map((arc, idx) => {
+          const title = (arc.title || arc.name || `第${idx + 1}段`).trim();
+          const lo = arc.from_chapter;
+          const hi = arc.to_chapter;
+          const range =
+            typeof lo === "number" && typeof hi === "number"
+              ? `约第${lo}—${hi}章`
+              : "";
+          const summary = (arc.summary || arc.description || "").trim();
+          const hook = (arc.hook || "").trim();
+          const must = stringListField(arc.must_not);
+          const allow = stringListField(arc.progress_allowed);
+          return (
+            <details
+              key={`${volume.id}-arc-${idx}`}
+              className={
+                roomy
+                  ? "group rounded-2xl border-2 border-border/80 bg-card/80 open:border-primary/30 open:shadow-sm"
+                  : "group rounded-xl border border-border/70 bg-background/50 open:border-primary/20 open:bg-muted/25"
+              }
+            >
+              <summary
+                className={`flex cursor-pointer list-none items-start gap-2 text-left [&::-webkit-details-marker]:hidden ${
+                  roomy
+                    ? "p-4 pr-5 text-base"
+                    : "p-2.5"
+                }`}
+              >
+                <ChevronRight
+                  className={
+                    roomy
+                      ? "mt-0.5 size-[1.1rem] shrink-0 text-foreground/50 transition group-open:rotate-90"
+                      : "mt-0.5 size-3.5 shrink-0 text-foreground/45 transition group-open:rotate-90"
+                  }
+                />
+                <div className="min-w-0 flex-1">
+                  <p
+                    className={`font-bold text-foreground ${
+                      compact
+                        ? "text-[11px] leading-snug"
+                        : roomy
+                          ? "text-base leading-snug"
+                          : "text-sm"
+                    }`}
+                  >
+                    {title}
+                    {range ? (
+                      <span
+                        className={
+                          roomy
+                            ? "ml-2 text-sm font-normal text-foreground/50"
+                            : "ml-1.5 font-normal text-foreground/45"
+                        }
+                      >
+                        {range}
+                      </span>
+                    ) : null}
+                  </p>
+                </div>
+              </summary>
+              <div
+                className={`space-y-2 border-t border-border/40 text-foreground/85 ${
+                  compact
+                    ? "px-2.5 pb-2.5 pt-2 text-[10px] leading-relaxed"
+                    : roomy
+                      ? "space-y-3 px-4 pb-4 pt-3 text-sm leading-[1.65] sm:px-5"
+                      : "px-2.5 pb-2.5 pt-2 text-xs leading-relaxed"
+                }`}
+              >
+                {summary ? (
+                  <p
+                    className={
+                      roomy ? "whitespace-pre-wrap text-[15px] text-foreground/90" : "whitespace-pre-wrap text-foreground/90"
+                    }
+                  >
+                    {summary}
+                  </p>
+                ) : (
+                  <p className="text-foreground/50">
+                    （本段无剧情摘要。重新生成分卷剧情后将显示摘要与约束。）
+                  </p>
+                )}
+                {hook ? (
+                  <div
+                    className={
+                      roomy
+                        ? "rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5"
+                        : "rounded-lg border border-amber-500/25 bg-amber-500/10 px-2 py-1.5"
+                    }
+                  >
+                    <p className="font-bold text-amber-800 dark:text-amber-200">
+                      钩子
+                    </p>
+                    <p className="mt-0.5 text-foreground/90">{hook}</p>
+                  </div>
+                ) : null}
+                {must.length > 0 ? (
+                  <div
+                    className={
+                      roomy
+                        ? "rounded-xl border border-rose-500/25 bg-rose-500/10 px-3.5 py-2.5"
+                        : "rounded-lg border border-rose-500/20 bg-rose-500/5 px-2 py-1.5"
+                    }
+                  >
+                    <p className="font-bold text-rose-800 dark:text-rose-200">
+                      禁止推进
+                    </p>
+                    <ul className="mt-1 list-disc pl-4">
+                      {must.map((x) => (
+                        <li key={x}>{x}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+                {allow.length > 0 ? (
+                  <div
+                    className={
+                      roomy
+                        ? "rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3.5 py-2.5"
+                        : "rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-2 py-1.5"
+                    }
+                  >
+                    <p className="font-bold text-emerald-800 dark:text-emerald-200">
+                      允许推进
+                    </p>
+                    <ul className="mt-1 list-disc pl-4">
+                      {allow.map((x) => (
+                        <li key={x}>{x}</li>
+                      ))}
+                    </ul>
+                  </div>
+                ) : null}
+              </div>
+            </details>
+          );
+        })}
+      </div>
+    );
+  }
+  if (md) {
+    return (
+      <details className="rounded-xl border border-border/70 bg-muted/20 open:rounded-2xl">
+        <summary
+          className={
+            roomy
+              ? "cursor-pointer list-none p-4 text-left text-sm font-bold text-foreground [&::-webkit-details-marker]:hidden"
+              : "cursor-pointer list-none p-2.5 text-left text-xs font-bold text-foreground [&::-webkit-details-marker]:hidden"
+          }
+        >
+          查看分卷剧情（仅文本，建议重新生成以带结构化约束）
+        </summary>
+        <pre
+          className={
+            roomy
+              ? "max-h-[min(68dvh,800px)] overflow-auto whitespace-pre-wrap break-words p-4 font-sans text-sm leading-[1.65] text-foreground sm:p-5"
+              : "max-h-[min(50vh,480px)] overflow-auto whitespace-pre-wrap break-words p-3 font-sans text-xs text-foreground sm:text-sm"
+          }
+        >
+          {md}
+        </pre>
+      </details>
+    );
+  }
+  return <p className="text-xs text-foreground/50">暂无分卷剧情。</p>;
+}
+
 function clamp01(value: number) {
   if (Number.isNaN(value)) return 0;
   return Math.max(0, Math.min(1, value));
@@ -129,6 +437,53 @@ function shortenText(value: string, max = 88) {
   const trimmed = value.trim();
   if (trimmed.length <= max) return trimmed;
   return `${trimmed.slice(0, max - 1)}…`;
+}
+
+function plotBodyFromItem(item: unknown): string {
+  if (typeof item === "string") return item.trim();
+  if (item && typeof item === "object" && "body" in item) {
+    const body = (item as { body?: unknown }).body;
+    return typeof body === "string" ? body.trim() : "";
+  }
+  return "";
+}
+
+function summarizeDetail(detail: Record<string, unknown> | null | undefined, max = 48): string {
+  if (!detail || typeof detail !== "object") return "";
+  const preferredKeys = [
+    "summary",
+    "description",
+    "effect",
+    "usage",
+    "status",
+    "remark",
+    "note",
+    "current_stage",
+  ];
+  for (const key of preferredKeys) {
+    const value = detail[key];
+    if (typeof value === "string" && value.trim()) {
+      return shortenText(value, max);
+    }
+  }
+  for (const value of Object.values(detail)) {
+    if (typeof value === "string" && value.trim()) {
+      return shortenText(value, max);
+    }
+  }
+  return "";
+}
+
+function detailText(detail: Record<string, unknown> | null | undefined): string {
+  if (!detail || typeof detail !== "object") return "";
+  return Object.values(detail)
+    .map((value) => (typeof value === "string" ? value.trim() : ""))
+    .filter(Boolean)
+    .join(" ");
+}
+
+function includesAnyKeyword(text: string, keywords: string[]): boolean {
+  return keywords.some((keyword) => text.includes(keyword));
 }
 
 type NormalizedPlanBeats = {
@@ -205,19 +560,6 @@ function inventoryDisplaySummary(
   if (description) return description;
   if (owner) return `持有人：${owner}`;
   return "";
-}
-
-function readPromptNumber(
-  message: string,
-  defaultValue: number,
-  min = 0,
-  max = 100
-): number | null {
-  const raw = window.prompt(message, String(defaultValue));
-  if (raw == null) return null;
-  const parsed = Number(String(raw).trim() || String(defaultValue));
-  if (!Number.isFinite(parsed)) return null;
-  return Math.max(min, Math.min(max, Math.round(parsed)));
 }
 
 function formatVolumePlanBeatsText(beats: unknown): string {
@@ -525,6 +867,27 @@ type LlmConfirmState = {
   details: string[];
 };
 
+type MemoryEditorState = {
+  kind: "character" | "relation" | "skill" | "item";
+  mode: "create" | "edit" | "delete";
+  id?: string;
+  title: string;
+  subtitle: string;
+  confirmLabel: string;
+  name: string;
+  role: string;
+  status: string;
+  traits: string;
+  from: string;
+  to: string;
+  relation: string;
+  label: string;
+  owner: string;
+  description: string;
+  influence: string;
+  isActive: boolean;
+};
+
 export function NovelWorkspace() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
@@ -543,14 +906,20 @@ export function NovelWorkspace() {
   /** 左侧树点到「本书」根：不强制选中某一卷，主区显示全书入口 */
   const [workspaceRootBook, setWorkspaceRootBook] = useState(false);
   const [outlineDrawerOpen, setOutlineDrawerOpen] = useState(false);
+  /** 左侧结构树整条侧栏收起，给主区更多空间 */
+  const [studioTreeSidebarCollapsed, setStudioTreeSidebarCollapsed] = useState(false);
   /** 卷下章节树是否展开 */
   const [expandedVolumeIds, setExpandedVolumeIds] = useState<Record<string, boolean>>({});
+  /** 结构树内：展开查看某卷剧情（与章节列表独立） */
+  const [treeVolumePlotOpenId, setTreeVolumePlotOpenId] = useState<string | null>(
+    null
+  );
   const [fbDraft, setFbDraft] = useState<Record<string, string>>({});
   const [revisePrompt, setRevisePrompt] = useState<Record<string, string>>({});
   const [err, setErr] = useState<string | null>(null);
   const [notice, setNotice] = useState<React.ReactNode | null>(null);
 
-  function setTaskNotice(msg: string) {
+  const setTaskNotice = useCallback((msg: string) => {
     setNotice(
       <div className="flex items-center justify-between w-full">
         <span>{msg}</span>
@@ -564,10 +933,18 @@ export function NovelWorkspace() {
         </Button>
       </div>
     );
-  }
+  }, [navigate]);
   const [busy, setBusy] = useState(false);
   const [generateTrace, setGenerateTrace] = useState<string>("");
+  const [queueStatus, setQueueStatus] = useState<{
+    active_auto_pipeline_count: number;
+    max_active_auto_pipeline: number;
+    available_auto_pipeline_slots: number;
+    is_busy: boolean;
+  } | null>(null);
+  const [queueStatusLoading, setQueueStatusLoading] = useState(false);
   const [generateCount, setGenerateCount] = useState(1);
+  const [generateCountTouched, setGenerateCountTouched] = useState(false);
   const [useColdRecall, setUseColdRecall] = useState(false);
   const [coldRecallItems, setColdRecallItems] = useState(5);
   const [selectedChapterId, setSelectedChapterId] = useState<string>("");
@@ -582,14 +959,16 @@ export function NovelWorkspace() {
   const [memoryFixHints, setMemoryFixHints] = useState<string[]>([]);
   const [memoryRefreshPreview, setMemoryRefreshPreview] = useState<{
     tier: "blocked" | "warning";
-    version: number;
     currentVersion: number;
     errors: string[];
     warnings: string[];
     autoPassNotes: string[];
     candidateJson: string;
     candidateReadableZh: string;
-    confirmationToken?: string;
+    confirmationToken?: string | null;
+    diffSummary?: MemoryDiffSummary;
+    runId?: string | null;
+    applied?: boolean;
   } | null>(null);
   const [structuredPages, setStructuredPages] = useState<Record<string, number>>({});
   const [memoryFixListPages, setMemoryFixListPages] = useState<Record<string, number>>({});
@@ -614,6 +993,22 @@ export function NovelWorkspace() {
   const [genLogs, setGenLogs] = useState<
     Awaited<ReturnType<typeof listGenerationLogs>>["items"]
   >([]);
+  const [latestWorkflow, setLatestWorkflow] = useState<NovelWorkflowLatest | null>(null);
+  const [memoryUpdateRuns, setMemoryUpdateRuns] = useState<MemoryUpdateRun[]>([]);
+  const [storyBibleSnapshot, setStoryBibleSnapshot] = useState<Awaited<
+    ReturnType<typeof getLatestStoryBibleSnapshot>
+  >["item"] | null>(null);
+  const [retrievalIndexDocs, setRetrievalIndexDocs] = useState<
+    Awaited<ReturnType<typeof getRetrievalIndexSnapshot>>["items"]
+  >([]);
+  const [retrievalLogs, setRetrievalLogs] = useState<NovelRetrievalLogItem[]>([]);
+  const [coreEvaluation, setCoreEvaluation] = useState<
+    Awaited<ReturnType<typeof getNovelCoreEvaluation>> | null
+  >(null);
+  const [chapterJudge, setChapterJudge] = useState<ChapterJudgeLatest | null>(null);
+  const [intelWorkflowLoading, setIntelWorkflowLoading] = useState(false);
+  const [intelRetrievalLoading, setIntelRetrievalLoading] = useState(false);
+  const [intelJudgeLoading, setIntelJudgeLoading] = useState(false);
   const [chapterChatOpen, setChapterChatOpen] = useState(false);
   const [chapterChatTurns, setChapterChatTurns] = useState<
     { role: "user" | "assistant"; content: string }[]
@@ -625,7 +1020,8 @@ export function NovelWorkspace() {
   const [chapterThinkExpanded, setChapterThinkExpanded] = useState(false);
   const [chapterChatAbort, setChapterChatAbort] = useState<AbortController | null>(null);
   const [volumes, setVolumes] = useState<Awaited<ReturnType<typeof listVolumes>>>([]);
-  const [arcsTargetVolumes, setArcsTargetVolumes] = useState<number[]>([]);
+  /** 分卷剧情区：当前选中的卷号（1-based），与下方卷按钮单选一致 */
+  const [arcsPanelVolumeNo, setArcsPanelVolumeNo] = useState(1);
   const [arcsInstruction, setArcsInstruction] = useState("");
   const [arcsBusy, setArcsBusy] = useState(false);
   const [selectedVolumeId, setSelectedVolumeId] = useState<string>("");
@@ -672,6 +1068,12 @@ export function NovelWorkspace() {
       version: number;
       summary: string;
       created_at: string | null;
+      diff_summary?: MemoryDiffSummary;
+      source_summary?: {
+        chapter_nos?: number[];
+        latest_chapter_no?: number | null;
+        changed_types?: string[];
+      };
     }[]
   >([]);
   const [historyDialogOpen, setHistoryDialogOpen] = useState(false);
@@ -680,6 +1082,8 @@ export function NovelWorkspace() {
   const [llmConfirm, setLlmConfirm] = useState<LlmConfirmState | null>(null);
   const [llmConfirmBusy, setLlmConfirmBusy] = useState(false);
   const llmConfirmActionRef = useRef<null | (() => Promise<void>)>(null);
+  const [memoryEditor, setMemoryEditor] = useState<MemoryEditorState | null>(null);
+  const [memoryEditorBusy, setMemoryEditorBusy] = useState(false);
 
   const [novelSettingsOpen, setNovelSettingsOpen] = useState(false);
   const [novelSettingsDraft, setNovelSettingsDraft] = useState({
@@ -713,12 +1117,32 @@ export function NovelWorkspace() {
     try {
       const res = await exportChapters(id, exportStartNo, exportEndNo);
       setExportContent(res.full_text);
-    } catch (e: any) {
-      setErr(e.message || "导出失败");
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "导出失败");
     } finally {
       setExportBusy(false);
     }
   }
+
+  const reloadQueueStatus = useCallback(async () => {
+    setQueueStatusLoading(true);
+    try {
+      const status = await getNovelQueueStatus();
+      setQueueStatus(status);
+    } catch {
+      setQueueStatus(null);
+    } finally {
+      setQueueStatusLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void reloadQueueStatus();
+    const timer = window.setInterval(() => {
+      void reloadQueueStatus();
+    }, 15000);
+    return () => window.clearInterval(timer);
+  }, [reloadQueueStatus]);
 
 
   function openNovelSettings() {
@@ -751,8 +1175,8 @@ export function NovelWorkspace() {
       await reload();
       await reloadVolumes();
       setTimeout(() => setNotice(null), 3000);
-    } catch (e: any) {
-      setErr(e.message);
+    } catch (e: unknown) {
+      setErr(e instanceof Error ? e.message : "保存小说设置失败");
     } finally {
       setNovelSettingsBusy(false);
     }
@@ -784,29 +1208,62 @@ export function NovelWorkspace() {
   ] as const;
 
   const reload = useCallback(async () => {
-    const [n, c, m, mn] = await Promise.all([
-      getNovel(id),
-      listChapters(id),
-      getMemory(id),
-      getMemoryNormalized(id).catch(() => ({ status: "empty" as const, data: null })),
-    ]);
-    setNovel(n);
-    setChapters(c);
-    setMemory(m);
-    const normalizedSchemaGuide =
-      "schema_guide" in mn ? (mn.schema_guide ?? null) : null;
-    const normalizedHealth = "health" in mn ? (mn.health ?? null) : null;
-    setMemorySchemaGuide(normalizedSchemaGuide ?? m.schema_guide ?? null);
-    setMemoryHealth(normalizedHealth ?? m.health ?? null);
-    if (mn.status === "ok" && mn.data) {
-      setMemoryNorm(mn.data);
-    } else {
-      setMemoryNorm(null);
+    setIntelWorkflowLoading(true);
+    setIntelRetrievalLoading(true);
+    try {
+      const [
+        n,
+        c,
+        m,
+        mn,
+        workflowRes,
+        retrievalRes,
+        evalRes,
+        updateRunsRes,
+        storyBibleRes,
+        retrievalIndexRes,
+      ] = await Promise.all([
+        getNovel(id),
+        listChapters(id),
+        getMemory(id),
+        getMemoryNormalized(id).catch(() => ({ status: "empty" as const, data: null })),
+        getLatestWorkflowRun(id).catch(() => ({ status: "ok" as const, item: null })),
+        listRetrievalLogs(id, 6).catch(() => ({ status: "ok" as const, items: [] })),
+        getNovelCoreEvaluation(id).catch(() => null),
+        listMemoryUpdateRuns(id, 12).catch(() => ({ status: "ok" as const, items: [] })),
+        getLatestStoryBibleSnapshot(id, { entityLimit: 16, factLimit: 16 }).catch(() => ({
+          status: "ok" as const,
+          item: null,
+        })),
+        getRetrievalIndexSnapshot(id, 16).catch(() => ({ status: "ok" as const, items: [] })),
+      ]);
+      setNovel(n);
+      setChapters(c);
+      setMemory(m);
+      const normalizedSchemaGuide =
+        "schema_guide" in mn ? (mn.schema_guide ?? null) : null;
+      const normalizedHealth = "health" in mn ? (mn.health ?? null) : null;
+      setMemorySchemaGuide(normalizedSchemaGuide ?? m.schema_guide ?? null);
+      setMemoryHealth(normalizedHealth ?? m.health ?? null);
+      if (mn.status === "ok" && mn.data) {
+        setMemoryNorm(mn.data);
+      } else {
+        setMemoryNorm(null);
+      }
+      setFwMd(String(n.framework_markdown ?? ""));
+      // 优先编辑「基础大纲」JSON；无该字段时回退到 framework_json（旧客户端/旧数据）
+      const baseJson = (n as { framework_json_base?: string }).framework_json_base;
+      setFwJson(String(baseJson ?? n.framework_json ?? "{}"));
+      setLatestWorkflow(workflowRes.item ?? null);
+      setMemoryUpdateRuns(updateRunsRes.items ?? []);
+      setStoryBibleSnapshot(storyBibleRes.item ?? null);
+      setRetrievalIndexDocs(retrievalIndexRes.items ?? []);
+      setRetrievalLogs(retrievalRes.items ?? []);
+      setCoreEvaluation(evalRes);
+    } finally {
+      setIntelWorkflowLoading(false);
+      setIntelRetrievalLoading(false);
     }
-    setFwMd(String(n.framework_markdown ?? ""));
-    // 优先编辑「基础大纲」JSON；无该字段时回退到 framework_json（旧客户端/旧数据）
-    const baseJson = (n as { framework_json_base?: string }).framework_json_base;
-    setFwJson(String(baseJson ?? n.framework_json ?? "{}"));
   }, [id]);
 
   const openNormDetail = useCallback((title: string, data: unknown) => {
@@ -844,14 +1301,14 @@ export function NovelWorkspace() {
     return Math.max(1, Math.ceil(tc / 50));
   }, [novel?.target_chapters]);
 
+  useEffect(() => {
+    setArcsPanelVolumeNo((n) => Math.min(Math.max(1, n), totalStudioVolumes));
+  }, [totalStudioVolumes]);
+
   const runInlineGenerateArcs = useCallback(async () => {
     if (!id) return;
     if (!novel?.base_framework_confirmed) {
-      setErr("请先确认基础大纲，再生成分卷 Arcs。");
-      return;
-    }
-    if (arcsTargetVolumes.length === 0) {
-      setErr("请在大纲抽屉里至少选择一卷。");
+      setErr("请先确认基础大纲，再为各卷生成分卷剧情。");
       return;
     }
     setArcsBusy(true);
@@ -859,29 +1316,30 @@ export function NovelWorkspace() {
     try {
       await ensureLlmReady();
       const r = await generateArcs(id, {
-        target_volume_nos: arcsTargetVolumes,
+        target_volume_nos: [arcsPanelVolumeNo],
         instruction: arcsInstruction.trim(),
       });
       if (r.status === "queued" && r.batch_id) {
-        setTaskNotice("正在生成分卷 Arcs…");
+        setTaskNotice("正在生成分卷剧情…");
         const o = await waitForArcsGenerateBatch(id, r.batch_id);
-        if (o === "failed") throw new Error("分卷 Arcs 生成失败，请查看生成日志");
+        if (o === "failed") throw new Error("分卷剧情生成失败，请查看生成记录。");
       }
-      setNotice("分卷 Arcs 已更新。");
+      setNotice("分卷剧情已更新。");
       await reloadVolumes();
       await reload();
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "分卷 Arcs 生成失败");
+      setErr(e instanceof Error ? e.message : "分卷剧情生成失败");
     } finally {
       setArcsBusy(false);
     }
   }, [
     id,
     novel?.base_framework_confirmed,
-    arcsTargetVolumes,
+    arcsPanelVolumeNo,
     arcsInstruction,
     reload,
     reloadVolumes,
+    setTaskNotice,
   ]);
 
   useEffect(() => {
@@ -921,12 +1379,6 @@ export function NovelWorkspace() {
       .catch(() => setVolumePlan([]))
       .finally(() => setVolumeBusy(false));
   }, [id, selectedVolumeId]);
-
-
-  useEffect(() => {
-    if (!id) return;
-    void reloadGenerationLogs();
-  }, [id]);
 
   const activeChapterVolume = useMemo(() => {
     if (!chapterVolumeId) return null;
@@ -983,6 +1435,20 @@ export function NovelWorkspace() {
     : !frameworkConfirmed
       ? "请先在向导或流程中确认框架"
       : "";
+  const queueActiveCount = queueStatus?.active_auto_pipeline_count ?? 0;
+  const queueMaxActive = queueStatus?.max_active_auto_pipeline ?? 0;
+  const queueSlots = queueStatus?.available_auto_pipeline_slots ?? 0;
+  const queueBusy = Boolean(queueStatus?.is_busy);
+  const queueLabel = queueStatusLoading && !queueStatus
+    ? "读取队列中…"
+    : queueActiveCount > 0
+      ? `前方排队 ${queueActiveCount} 个任务`
+      : "生成队列空闲";
+  const queueHint = queueStatus
+    ? queueBusy
+      ? `已达并发上限 ${queueMaxActive}，建议稍后再发起。`
+      : `可用生成槽 ${queueSlots}/${queueMaxActive || "?"}`
+    : "队列状态暂不可用";
 
   useEffect(() => {
     if (!selectedChapter) {
@@ -993,6 +1459,19 @@ export function NovelWorkspace() {
     setEditTitle(selectedChapter.title || "");
     setEditContent(selectedChapter.content || "");
   }, [selectedChapter]);
+
+  useEffect(() => {
+    if (!selectedChapter?.id) {
+      setChapterJudge(null);
+      setIntelJudgeLoading(false);
+      return;
+    }
+    setIntelJudgeLoading(true);
+    getLatestChapterJudge(selectedChapter.id)
+      .then((res) => setChapterJudge(res.item ?? null))
+      .catch(() => setChapterJudge(null))
+      .finally(() => setIntelJudgeLoading(false));
+  }, [selectedChapter?.id, selectedChapter?.status, selectedChapter?.pending_content]);
 
   useEffect(() => {
     const clearContinuity = () => {
@@ -1100,45 +1579,25 @@ export function NovelWorkspace() {
     [volumes, selectedVolumeId]
   );
 
-  const selectedVolumeTotalChapters = selectedVolume
-    ? selectedVolume.to_chapter - selectedVolume.from_chapter + 1
+  const approvedChapterCount = chapters.filter(
+    (chapter) => chapter.status === "approved"
+  ).length;
+  const draftChapterCount = Math.max(0, chapters.length - approvedChapterCount);
+  const latestChapterNo = chapters.length
+    ? Math.max(...chapters.map((chapter) => chapter.chapter_no))
     : 0;
+  const maxGenerateCount = Math.max(1, Number(novel?.target_chapters || 5000));
+  const remainingGenerateCount = Math.max(1, maxGenerateCount - latestChapterNo);
+  const activeMemoryLines = memoryNorm?.open_plots.length ?? openPlotsLines.length;
 
-  const selectedVolumeCoverage = selectedVolumeTotalChapters
-    ? clamp01(volumePlan.length / selectedVolumeTotalChapters)
-    : 0;
+  useEffect(() => {
+    setGenerateCountTouched(false);
+  }, [novel?.id]);
 
-  const selectedVolumeSlots = useMemo(() => {
-    if (!selectedVolume || selectedVolumeTotalChapters <= 0) return [];
-    const planSet = new Set(volumePlan.map((plan) => plan.chapter_no));
-    const bodySet = new Set(
-      chapters
-        .filter(
-          (chapter) =>
-            chapter.chapter_no >= selectedVolume.from_chapter &&
-            chapter.chapter_no <= selectedVolume.to_chapter &&
-            (chapter.content || chapter.pending_content || "").trim().length > 0
-        )
-        .map((chapter) => chapter.chapter_no)
-    );
-
-    return Array.from({ length: selectedVolumeTotalChapters }, (_, index) => {
-      const chapterNo = selectedVolume.from_chapter + index;
-      return {
-        chapterNo,
-        hasPlan: planSet.has(chapterNo),
-        hasBody: bodySet.has(chapterNo),
-      };
-    });
-  }, [chapters, selectedVolume, selectedVolumeTotalChapters, volumePlan]);
-
-  const volumePlanMetrics = useMemo(() => {
-    const normalizedPlans = volumePlan.map((plan) => normalizePlanBeats(plan.beats));
-    return {
-      editedCount: normalizedPlans.filter((plan) => plan.meta.edited_by_user).length,
-      pendingWriteCount: volumePlanView.visible.length,
-    };
-  }, [volumePlan, volumePlanView.visible.length]);
+  useEffect(() => {
+    if (generateCountTouched) return;
+    setGenerateCount(remainingGenerateCount);
+  }, [generateCountTouched, remainingGenerateCount]);
 
   const memoryVisuals = useMemo(() => {
     if (!memoryNorm) return null;
@@ -1146,6 +1605,7 @@ export function NovelWorkspace() {
     const topCharacters = [...memoryNorm.characters]
       .sort((a, b) => b.influence_score - a.influence_score)
       .slice(0, MEMORY_ATLAS_POINTS.length);
+    const topCharacterNames = new Set(topCharacters.map((character) => character.name));
     const maxInfluence = Math.max(
       1,
       ...topCharacters.map((character) => character.influence_score || 0)
@@ -1157,18 +1617,264 @@ export function NovelWorkspace() {
         return (b.last_touched_chapter || 0) - (a.last_touched_chapter || 0);
       })
       .slice(0, 6);
+    const topSkills = [...memoryNorm.skills]
+      .sort((a, b) => {
+        const active = Number(Boolean(b.is_active)) - Number(Boolean(a.is_active));
+        if (active !== 0) return active;
+        return (b.influence_score || 0) - (a.influence_score || 0);
+      })
+      .slice(0, 6);
+    const topInventory = [...memoryNorm.inventory]
+      .sort((a, b) => {
+        const active = Number(Boolean(b.is_active)) - Number(Boolean(a.is_active));
+        if (active !== 0) return active;
+        return (b.influence_score || 0) - (a.influence_score || 0);
+      })
+      .slice(0, 6);
+
+    const activeRelations = memoryNorm.relations.filter(
+      (relation) => relation.is_active !== false
+    );
+    const topRelations = [...activeRelations]
+      .sort((a, b) => {
+        const aHot =
+          topCharacterNames.has(a.from) && topCharacterNames.has(a.to) ? 1 : 0;
+        const bHot =
+          topCharacterNames.has(b.from) && topCharacterNames.has(b.to) ? 1 : 0;
+        return bHot - aHot;
+      })
+      .slice(0, 6);
+    const networkRelations = activeRelations
+      .filter(
+        (relation) =>
+          topCharacterNames.has(relation.from) && topCharacterNames.has(relation.to)
+      )
+      .slice(0, 10);
 
     return {
       topCharacters,
       maxInfluence,
       topOpenPlots,
-      topRelations: memoryNorm.relations.filter((relation) => relation.is_active !== false).slice(0, 6),
+      topSkills,
+      topInventory,
+      topRelations,
+      networkRelations,
       activeCharacters: memoryNorm.characters.filter((character) => character.is_active).length,
+      activeSkills: memoryNorm.skills.filter((skill) => skill.is_active).length,
       activeInventory: memoryNorm.inventory.filter((item) => item.is_active).length,
       staleCount: memoryHealth?.stale_plots.length ?? 0,
       overdueCount: memoryHealth?.overdue_plots.length ?? 0,
     };
   }, [memoryNorm, memoryHealth]);
+
+  const latestMemoryUpdateRun = useMemo(
+    () => memoryUpdateRuns[0] ?? memory?.latest_update_run ?? null,
+    [memoryUpdateRuns, memory?.latest_update_run]
+  );
+
+  const highlightedDiffSummary = useMemo(
+    () => memoryRefreshPreview?.diffSummary ?? latestMemoryUpdateRun?.diff_summary ?? null,
+    [memoryRefreshPreview?.diffSummary, latestMemoryUpdateRun?.diff_summary]
+  );
+
+  const memoryStoryView = useMemo(() => {
+    if (!memoryNorm || !memoryVisuals) return null;
+
+    const latestNormChapter = memoryNorm.chapters.length
+      ? Math.max(...memoryNorm.chapters.map((chapter) => chapter.chapter_no))
+      : 0;
+    const memoryLag = Math.max(0, latestChapterNo - latestNormChapter);
+    const overdueBodies = new Set(
+      (memoryHealth?.overdue_plots ?? [])
+        .map((plot) => plotBodyFromItem(plot))
+        .filter(Boolean)
+    );
+    const staleBodies = new Set(
+      (memoryHealth?.stale_plots ?? [])
+        .map((plot) => plotBodyFromItem(plot))
+        .filter(Boolean)
+    );
+    const latestTouchedChapter = Math.max(
+      latestNormChapter,
+      ...memoryNorm.open_plots.map((plot) => plot.last_touched_chapter || 0)
+    );
+    const freshChapterFloor = Math.max(1, latestTouchedChapter - 3);
+    const sortedPlots = [...memoryNorm.open_plots].sort((a, b) => {
+      const priority = (b.priority || 0) - (a.priority || 0);
+      if (priority !== 0) return priority;
+      return (b.last_touched_chapter || 0) - (a.last_touched_chapter || 0);
+    });
+    const urgentPlots = sortedPlots.filter((plot) => overdueBodies.has(plot.body)).slice(0, 4);
+    const hotPlots = sortedPlots
+      .filter(
+        (plot) =>
+          !overdueBodies.has(plot.body) &&
+          (staleBodies.has(plot.body) || (plot.priority || 0) >= 70)
+      )
+      .slice(0, 4);
+    const freshPlots = sortedPlots
+      .filter(
+        (plot) =>
+          !overdueBodies.has(plot.body) &&
+          !staleBodies.has(plot.body) &&
+          (plot.introduced_chapter || 0) >= freshChapterFloor
+      )
+      .slice(0, 4);
+    const steadyPlots = sortedPlots
+      .filter(
+        (plot) =>
+          !urgentPlots.some((item) => item.body === plot.body) &&
+          !hotPlots.some((item) => item.body === plot.body) &&
+          !freshPlots.some((item) => item.body === plot.body)
+      )
+      .slice(0, 4);
+    const chapterMoments = [...memoryNorm.chapters]
+      .sort((a, b) => a.chapter_no - b.chapter_no)
+      .slice(-8)
+      .map((chapter) => ({
+        ...chapter,
+        signal:
+          chapter.key_facts.length +
+          chapter.causal_results.length +
+          chapter.open_plots_added.length +
+          chapter.open_plots_resolved.length,
+      }));
+    const maxChapterSignal = Math.max(
+      1,
+      ...chapterMoments.map((chapter) => chapter.signal || 0)
+    );
+    const latestFacts =
+      [...memoryNorm.chapters]
+        .sort((a, b) => b.chapter_no - a.chapter_no)
+        .find(
+          (chapter) => chapter.key_facts.length || chapter.causal_results.length
+        ) ?? null;
+
+    const nextActions: string[] = [];
+    if (memoryLag > 0) {
+      nextActions.push(`记忆还落后 ${memoryLag} 章，建议先刷新已审定章节。`);
+    }
+    if (urgentPlots.length > 0) {
+      nextActions.push(`有 ${urgentPlots.length} 条线索已经逼近回收时点，续写时优先处理。`);
+    }
+    if (memoryVisuals.activeCharacters < 3 && memoryNorm.characters.length > 0) {
+      nextActions.push("当前活跃人物偏少，可以考虑回收旧角色或补新冲突点。");
+    }
+    if (diffChangeCount(highlightedDiffSummary) > 0) {
+      nextActions.push(
+        `最近一次刷新识别到 ${diffChangeCount(highlightedDiffSummary)} 处结构变化，可回看关键章节。`
+      );
+    }
+    if (nextActions.length === 0) {
+      nextActions.push("故事记忆状态平稳，可以继续推进正文，不必频繁手动干预。");
+    }
+
+    const classifySkillGroup = (skill: (typeof memoryNorm.skills)[number]) => {
+      const text = `${skill.name} ${detailText(skill.detail)} ${skill.aliases.join(" ")}`;
+      if (
+        !skill.is_active ||
+        includesAnyKeyword(text, ["受限", "禁用", "封印", "失控", "失效", "冷却", "枯竭"])
+      ) {
+        return "restricted";
+      }
+      if (
+        (skill.influence_score || 0) >= 65 ||
+        includesAnyKeyword(text, ["核心", "本命", "觉醒", "主力", "杀招", "底牌"])
+      ) {
+        return "core";
+      }
+      return "support";
+    };
+
+    const classifyItemGroup = (item: (typeof memoryNorm.inventory)[number]) => {
+      const text = `${item.label} ${detailText(item.detail)} ${item.aliases.join(" ")}`;
+      if (
+        !item.is_active ||
+        includesAnyKeyword(text, ["失去", "丢失", "损毁", "碎裂", "交出", "封存", "已毁", "耗尽"])
+      ) {
+        return "lost";
+      }
+      if (
+        (item.influence_score || 0) >= 65 ||
+        includesAnyKeyword(text, ["钥匙", "证据", "地图", "令牌", "碎片", "卷轴", "信物", "机关", "线索"])
+      ) {
+        return "quest";
+      }
+      return "carried";
+    };
+
+    const skillGroups = {
+      core: memoryNorm.skills.filter((skill) => classifySkillGroup(skill) === "core").slice(0, 4),
+      support: memoryNorm.skills
+        .filter((skill) => classifySkillGroup(skill) === "support")
+        .slice(0, 4),
+      restricted: memoryNorm.skills
+        .filter((skill) => classifySkillGroup(skill) === "restricted")
+        .slice(0, 4),
+    };
+
+    const itemGroups = {
+      carried: memoryNorm.inventory
+        .filter((item) => classifyItemGroup(item) === "carried")
+        .slice(0, 4),
+      quest: memoryNorm.inventory.filter((item) => classifyItemGroup(item) === "quest").slice(0, 4),
+      lost: memoryNorm.inventory.filter((item) => classifyItemGroup(item) === "lost").slice(0, 4),
+    };
+
+    return {
+      latestNormChapter,
+      memoryLag,
+      freshnessRatio:
+        approvedChapterCount > 0
+          ? clamp01(latestNormChapter / approvedChapterCount)
+          : 0,
+      draftPressureRatio:
+        latestChapterNo > 0 ? clamp01(approvedChapterCount / latestChapterNo) : 0,
+      mainNarrative:
+        memoryNorm.outline.main_plot.trim() ||
+        latestFacts?.key_facts?.[0] ||
+        "记忆已建立，但主线摘要还比较克制。",
+      latestFacts,
+      chapterMoments,
+      maxChapterSignal,
+      plotBuckets: [
+        {
+          key: "urgent",
+          title: "优先回收",
+          hint: "越拖越容易失控",
+          items: urgentPlots,
+        },
+        {
+          key: "hot",
+          title: "持续推进",
+          hint: "仍在拉动主线",
+          items: hotPlots,
+        },
+        {
+          key: "fresh",
+          title: "新近埋下",
+          hint: "最近几章新出现",
+          items: freshPlots,
+        },
+        {
+          key: "steady",
+          title: "平稳挂起",
+          hint: "先记着，不必急改",
+          items: steadyPlots,
+        },
+      ],
+      skillGroups,
+      itemGroups,
+      nextActions: nextActions.slice(0, 3),
+    };
+  }, [
+    approvedChapterCount,
+    highlightedDiffSummary,
+    latestChapterNo,
+    memoryHealth,
+    memoryNorm,
+    memoryVisuals,
+  ]);
 
   function normalizeLines(lines: string[]): string[] {
     return lines.map((x) => x.trim()).filter(Boolean);
@@ -1485,7 +2191,7 @@ export function NovelWorkspace() {
     }
   }
 
-  async function reloadGenerationLogs(batchId?: string) {
+  const reloadGenerationLogs = useCallback(async (batchId?: string) => {
     if (!id) return;
     setLogBusy(true);
     try {
@@ -1512,7 +2218,12 @@ export function NovelWorkspace() {
     } finally {
       setLogBusy(false);
     }
-  }
+  }, [id, logViewMode, logBatchId, logOnlyError]);
+
+  useEffect(() => {
+    if (!id) return;
+    void reloadGenerationLogs();
+  }, [id, reloadGenerationLogs]);
 
   async function executeRefreshMemory(options: { from_chapter_no?: number; to_chapter_no?: number; is_full?: boolean } = {}) {
     if (!id) return;
@@ -1545,7 +2256,6 @@ export function NovelWorkspace() {
         const cv = typeof p.current_version === "number" ? p.current_version : 0;
         setMemoryRefreshPreview({
           tier: "blocked",
-          version: cv,
           currentVersion: cv,
           errors: Array.isArray(p.errors) ? (p.errors as string[]) : [],
           warnings: Array.isArray(p.warnings) ? (p.warnings as string[]) : [],
@@ -1554,6 +2264,9 @@ export function NovelWorkspace() {
             : [],
           candidateJson: String(p.candidate_json ?? "{}"),
           candidateReadableZh: String(p.candidate_readable_zh ?? ""),
+          diffSummary: (p.diff_summary ?? {}) as MemoryDiffSummary,
+          runId: p.run_id == null ? null : String(p.run_id),
+          applied: false,
         });
         setNotice(
           "候选记忆已生成，但这版风险过高，系统已自动保留当前生效记忆。"
@@ -1563,7 +2276,6 @@ export function NovelWorkspace() {
         const cv = typeof p.current_version === "number" ? p.current_version : 0;
         setMemoryRefreshPreview({
           tier: "warning",
-          version: cv,
           currentVersion: cv,
           errors: [],
           warnings: Array.isArray(p.warnings) ? (p.warnings as string[]) : [],
@@ -1572,10 +2284,16 @@ export function NovelWorkspace() {
             : [],
           candidateJson: String(p.candidate_json ?? "{}"),
           candidateReadableZh: String(p.candidate_readable_zh ?? ""),
-          confirmationToken: String(p.confirmation_token ?? ""),
+          confirmationToken:
+            p.confirmation_token == null ? null : String(p.confirmation_token),
+          diffSummary: (p.diff_summary ?? {}) as MemoryDiffSummary,
+          runId: p.run_id == null ? null : String(p.run_id),
+          applied: p.applied === true,
         });
         setNotice(
-          "候选记忆已生成，这次变更建议你先看一眼再决定是否替换当前版本。"
+          p.applied === true
+            ? "记忆已刷新，但这次变更带有 warning，建议先看结构化差异。"
+            : "候选记忆已生成，这次变更建议你先看一眼再决定是否替换当前版本。"
         );
       } else if (outcome === "ok") {
         setMemoryRefreshPreview(null);
@@ -1599,7 +2317,13 @@ export function NovelWorkspace() {
   }
 
   async function runApplyMemoryRefreshPreview() {
-    if (!id || !memoryRefreshPreview || memoryRefreshPreview.tier !== "warning") return;
+    if (
+      !id ||
+      !memoryRefreshPreview ||
+      memoryRefreshPreview.tier !== "warning" ||
+      !memoryRefreshPreview.confirmationToken
+    )
+      return;
     setErr(null);
     setNotice(null);
     setBusy(true);
@@ -1636,390 +2360,445 @@ export function NovelWorkspace() {
     }
   }
 
-  async function runCreateCharacter() {
-    if (!id) return;
-    const name = (window.prompt("请输入人物主名") || "").trim();
-    if (!name) return;
-    const role = (window.prompt("人物角色（可选）", "") || "").trim();
-    const status = (window.prompt("人物状态（可选）", "") || "").trim();
-    const traitsRaw = (window.prompt("人物特征（可选，逗号分隔）", "") || "").trim();
-    const influence = readPromptNumber("人物影响力（0-100）", 0, 0, 100);
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm("是否标记为活跃人物？（确定=活跃，取消=已退场）");
+  function closeMemoryEditor() {
+    if (memoryEditorBusy) return;
+    setMemoryEditor(null);
+  }
+
+  async function submitMemoryEditor() {
+    if (!id || !memoryEditor) return;
     setErr(null);
-    setBusy(true);
+    setNotice(null);
+    setMemoryEditorBusy(true);
     try {
-      await createMemoryCharacter(id, {
-        name,
-        role,
-        status,
-        traits: traitsRaw
-          ? traitsRaw
-              .split(/[，,]/)
-              .map((x) => x.trim())
-              .filter(Boolean)
-          : [],
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("人物已新增");
+      if (memoryEditor.kind === "character") {
+        const traits = memoryEditor.traits
+          .split(/[，,\n]/)
+          .map((item) => item.trim())
+          .filter(Boolean);
+        if (memoryEditor.mode === "create") {
+          await createMemoryCharacter(id, {
+            name: memoryEditor.name.trim(),
+            role: memoryEditor.role.trim(),
+            status: memoryEditor.status.trim(),
+            traits,
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("人物已新增");
+        } else if (memoryEditor.mode === "edit" && memoryEditor.id) {
+          const current = memoryNorm?.characters.find((item) => item.id === memoryEditor.id);
+          await patchMemoryCharacter(id, memoryEditor.id, {
+            name: memoryEditor.name.trim(),
+            role: memoryEditor.role.trim(),
+            status: memoryEditor.status.trim(),
+            traits,
+            detail: current?.detail ?? {},
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("人物已更新");
+        } else if (memoryEditor.mode === "delete" && memoryEditor.id) {
+          await deleteMemoryCharacter(id, memoryEditor.id);
+          setNotice("人物已标记为退场");
+        }
+      } else if (memoryEditor.kind === "relation") {
+        if (memoryEditor.mode === "create") {
+          await createMemoryRelation(id, {
+            from_name: memoryEditor.from.trim(),
+            to_name: memoryEditor.to.trim(),
+            relation: memoryEditor.relation.trim(),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("关系已新增");
+        } else if (memoryEditor.mode === "edit" && memoryEditor.id) {
+          await patchMemoryRelation(id, memoryEditor.id, {
+            from_name: memoryEditor.from.trim(),
+            to_name: memoryEditor.to.trim(),
+            relation: memoryEditor.relation.trim(),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("关系已更新");
+        } else if (memoryEditor.mode === "delete" && memoryEditor.id) {
+          await deleteMemoryRelation(id, memoryEditor.id);
+          setNotice("关系已标记为失效");
+        }
+      } else if (memoryEditor.kind === "skill") {
+        const detail = memoryEditor.description.trim()
+          ? { description: memoryEditor.description.trim() }
+          : {};
+        if (memoryEditor.mode === "create") {
+          await createMemorySkill(id, {
+            name: memoryEditor.name.trim(),
+            detail,
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("技能已新增");
+        } else if (memoryEditor.mode === "edit" && memoryEditor.id) {
+          const current = memoryNorm?.skills.find((item) => item.id === memoryEditor.id);
+          await patchMemorySkill(id, memoryEditor.id, {
+            name: memoryEditor.name.trim(),
+            detail: { ...(current?.detail ?? {}), ...detail },
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("技能已更新");
+        } else if (memoryEditor.mode === "delete" && memoryEditor.id) {
+          await deleteMemorySkill(id, memoryEditor.id);
+          setNotice("技能已删除");
+        }
+      } else if (memoryEditor.kind === "item") {
+        const detail = {
+          ...(memoryEditor.owner.trim() ? { owner: memoryEditor.owner.trim() } : {}),
+          ...(memoryEditor.description.trim()
+            ? { description: memoryEditor.description.trim() }
+            : {}),
+        };
+        if (memoryEditor.mode === "create") {
+          await createMemoryItem(id, {
+            label: memoryEditor.label.trim(),
+            detail,
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("物品已新增");
+        } else if (memoryEditor.mode === "edit" && memoryEditor.id) {
+          const current = memoryNorm?.inventory.find((item) => item.id === memoryEditor.id);
+          await patchMemoryItem(id, memoryEditor.id, {
+            label: memoryEditor.label.trim(),
+            detail: { ...(current?.detail ?? {}), ...detail },
+            influence_score: Number(memoryEditor.influence || 0),
+            is_active: memoryEditor.isActive,
+          });
+          setNotice("物品已更新");
+        } else if (memoryEditor.mode === "delete" && memoryEditor.id) {
+          await deleteMemoryItem(id, memoryEditor.id);
+          setNotice("物品已删除");
+        }
+      }
+      setMemoryEditor(null);
       await reload();
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "新增人物失败");
+      setErr(e instanceof Error ? e.message : "记忆编辑失败");
     } finally {
-      setBusy(false);
+      setMemoryEditorBusy(false);
     }
+  }
+
+  async function runCreateCharacter() {
+    setMemoryEditor({
+      kind: "character",
+      mode: "create",
+      title: "新增人物",
+      subtitle: "用结构化表单录入人物名称、身份与影响力。",
+      confirmLabel: "创建人物",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: true,
+    });
   }
 
   async function runEditCharacter(character: NormalizedMemoryPayload["characters"][number]) {
-    if (!id) return;
     if (!character.id) {
       setErr("当前人物缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    const name = (window.prompt("人物主名", character.name) || "").trim();
-    if (!name) return;
-    const role = (window.prompt("人物角色（可选）", character.role || "") || "").trim();
-    const status = (window.prompt("人物状态（可选）", character.status || "") || "").trim();
     const currentTraits = Array.isArray(character.traits)
       ? character.traits.map((x) => String(x || "").trim()).filter(Boolean).join("，")
       : "";
-    const traitsRaw = (window.prompt("人物特征（可选，逗号分隔）", currentTraits) || "").trim();
-    const influence = readPromptNumber(
-      "人物影响力（0-100）",
-      character.influence_score ?? 0,
-      0,
-      100
-    );
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm(
-      `当前状态：${character.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
-    );
-    setErr(null);
-    setBusy(true);
-    try {
-      await patchMemoryCharacter(id, character.id, {
-        name,
-        role,
-        status,
-        traits: traitsRaw
-          ? traitsRaw
-              .split(/[，,]/)
-              .map((x) => x.trim())
-              .filter(Boolean)
-          : [],
-        detail: character.detail,
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("人物已更新");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "更新人物失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "character",
+      mode: "edit",
+      id: character.id,
+      title: `编辑人物 · ${character.name}`,
+      subtitle: "直接修改真源结构化表，再由系统派生快照。",
+      confirmLabel: "保存人物",
+      name: character.name,
+      role: character.role || "",
+      status: character.status || "",
+      traits: currentTraits,
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: String(character.influence_score ?? 0),
+      isActive: Boolean(character.is_active),
+    });
   }
 
   async function runDeleteCharacter(character: NormalizedMemoryPayload["characters"][number]) {
-    if (!id) return;
     if (!character.id) {
       setErr("当前人物缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    if (!window.confirm(`确认将人物「${character.name}」标记为已退场吗？`)) return;
-    setErr(null);
-    setBusy(true);
-    try {
-      await deleteMemoryCharacter(id, character.id);
-      setNotice("人物已标记为退场");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "人物下线失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "character",
+      mode: "delete",
+      id: character.id,
+      title: `下线人物 · ${character.name}`,
+      subtitle: "人物不会物理删除，只会标记为退场/不活跃。",
+      confirmLabel: "确认下线",
+      name: character.name,
+      role: character.role || "",
+      status: character.status || "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: String(character.influence_score ?? 0),
+      isActive: false,
+    });
   }
 
   async function runCreateRelation() {
-    if (!id) return;
-    const fromName = (window.prompt("关系起点人物") || "").trim();
-    if (!fromName) return;
-    const toName = (window.prompt("关系终点人物") || "").trim();
-    if (!toName) return;
-    const relation = (window.prompt("关系描述") || "").trim();
-    if (!relation) return;
-    const isActive = window.confirm("是否标记为当前生效关系？（确定=生效，取消=失效）");
-    setErr(null);
-    setBusy(true);
-    try {
-      await createMemoryRelation(id, {
-        from_name: fromName,
-        to_name: toName,
-        relation,
-        is_active: isActive,
-      });
-      setNotice("关系已新增");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "新增关系失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "relation",
+      mode: "create",
+      title: "新增人物关系",
+      subtitle: "补录结构化关系，供快照 / Story Bible / RAG 共用。",
+      confirmLabel: "创建关系",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: true,
+    });
   }
 
   async function runEditRelation(relation: NormalizedMemoryPayload["relations"][number]) {
-    if (!id) return;
     if (!relation.id) {
       setErr("当前关系缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    const fromName = (window.prompt("关系起点人物", relation.from) || "").trim();
-    if (!fromName) return;
-    const toName = (window.prompt("关系终点人物", relation.to) || "").trim();
-    if (!toName) return;
-    const relText = (window.prompt("关系描述", relation.relation) || "").trim();
-    if (!relText) return;
-    const isActive = window.confirm(
-      `当前状态：${relation.is_active === false ? "失效" : "生效"}。点击“确定”设置为生效，点击“取消”设置为失效。`
-    );
-    setErr(null);
-    setBusy(true);
-    try {
-      await patchMemoryRelation(id, relation.id, {
-        from_name: fromName,
-        to_name: toName,
-        relation: relText,
-        is_active: isActive,
-      });
-      setNotice("关系已更新");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "更新关系失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "relation",
+      mode: "edit",
+      id: relation.id,
+      title: `编辑关系 · ${relation.from} → ${relation.to}`,
+      subtitle: "修改关系的主体、客体和当前状态。",
+      confirmLabel: "保存关系",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: relation.from,
+      to: relation.to,
+      relation: relation.relation,
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: relation.is_active !== false,
+    });
   }
 
   async function runDeleteRelation(relation: NormalizedMemoryPayload["relations"][number]) {
-    if (!id) return;
     if (!relation.id) {
       setErr("当前关系缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    if (!window.confirm(`确认将关系「${relation.from} → ${relation.to}」标记为失效吗？`)) return;
-    setErr(null);
-    setBusy(true);
-    try {
-      await deleteMemoryRelation(id, relation.id);
-      setNotice("关系已标记为失效");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "关系失效失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "relation",
+      mode: "delete",
+      id: relation.id,
+      title: `失效关系 · ${relation.from} → ${relation.to}`,
+      subtitle: "关系不会物理删除，只会切换为失效态。",
+      confirmLabel: "确认失效",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: relation.from,
+      to: relation.to,
+      relation: relation.relation,
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: false,
+    });
   }
 
   async function runCreateSkill() {
-    if (!id) return;
-    const name = (window.prompt("请输入技能名称") || "").trim();
-    if (!name) return;
-    const desc = (window.prompt("技能描述（可选）", "") || "").trim();
-    const influence = readPromptNumber("技能影响力（0-100）", 0, 0, 100);
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm("是否标记为活跃技能？（确定=活跃，取消=已退场）");
-    setErr(null);
-    setBusy(true);
-    try {
-      await createMemorySkill(id, {
-        name,
-        detail: desc ? { description: desc } : {},
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("技能已新增");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "新增技能失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "skill",
+      mode: "create",
+      title: "新增技能",
+      subtitle: "录入技能描述与影响力，让检索和设定引用更稳定。",
+      confirmLabel: "创建技能",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: true,
+    });
   }
 
   async function runEditSkill(skill: NormalizedMemoryPayload["skills"][number]) {
-    if (!id) return;
     if (!skill.id) {
       setErr("当前技能缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    const name = (window.prompt("技能名称", skill.name) || "").trim();
-    if (!name) return;
     const currentDesc =
       typeof skill.detail.description === "string" ? skill.detail.description : "";
-    const desc = (window.prompt("技能描述（可选）", currentDesc) || "").trim();
-    const influence = readPromptNumber(
-      "技能影响力（0-100）",
-      skill.influence_score ?? 0,
-      0,
-      100
-    );
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm(
-      `当前状态：${skill.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
-    );
-    setErr(null);
-    setBusy(true);
-    try {
-      await patchMemorySkill(id, skill.id, {
-        name,
-        detail: { ...skill.detail, description: desc },
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("技能已更新");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "更新技能失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "skill",
+      mode: "edit",
+      id: skill.id,
+      title: `编辑技能 · ${skill.name}`,
+      subtitle: "直接修改技能明细与影响力。",
+      confirmLabel: "保存技能",
+      name: skill.name,
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: currentDesc,
+      influence: String(skill.influence_score ?? 0),
+      isActive: Boolean(skill.is_active),
+    });
   }
 
   async function runDeleteSkill(skill: NormalizedMemoryPayload["skills"][number]) {
-    if (!id) return;
     if (!skill.id) {
       setErr("当前技能缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
-    if (!window.confirm(`确认删除技能「${skill.name}」吗？`)) return;
-    setErr(null);
-    setBusy(true);
-    try {
-      await deleteMemorySkill(id, skill.id);
-      setNotice("技能已删除");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "删除技能失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "skill",
+      mode: "delete",
+      id: skill.id,
+      title: `删除技能 · ${skill.name}`,
+      subtitle: "删除后会从结构化真源中移除，并影响后续快照与检索。",
+      confirmLabel: "确认删除",
+      name: skill.name,
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: String(skill.influence_score ?? 0),
+      isActive: false,
+    });
   }
 
   async function runCreateItem() {
-    if (!id) return;
-    const label = (window.prompt("请输入物品名称") || "").trim();
-    if (!label) return;
-    const owner = (window.prompt("持有人（可选）", "") || "").trim();
-    const description = (window.prompt("物品描述（可选）", "") || "").trim();
-    const influence = readPromptNumber("物品影响力（0-100）", 0, 0, 100);
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm("是否标记为活跃物品？（确定=活跃，取消=已退场）");
-    setErr(null);
-    setBusy(true);
-    try {
-      await createMemoryItem(id, {
-        label,
-        detail: {
-          ...(owner ? { owner } : {}),
-          ...(description ? { description } : {}),
-        },
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("物品已新增");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "新增物品失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "item",
+      mode: "create",
+      title: "新增物品",
+      subtitle: "录入物品名称、持有人与描述，补齐后续引用语境。",
+      confirmLabel: "创建物品",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: "",
+      owner: "",
+      description: "",
+      influence: "0",
+      isActive: true,
+    });
   }
 
   async function runEditItem(item: NormalizedMemoryPayload["inventory"][number]) {
-    if (!id) return;
     if (!item.id) {
       setErr("当前物品缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
     const currentLabel = inventoryDisplayLabel(item);
-    const label = (window.prompt("物品名称", currentLabel) || "").trim();
-    if (!label) return;
     const currentOwner =
       typeof item.detail.owner === "string" ? item.detail.owner : "";
     const currentDescription =
       typeof item.detail.description === "string" ? item.detail.description : "";
-    const owner = (window.prompt("持有人（可选）", currentOwner) || "").trim();
-    const description = (window.prompt("物品描述（可选）", currentDescription) || "").trim();
-    const influence = readPromptNumber(
-      "物品影响力（0-100）",
-      item.influence_score ?? 0,
-      0,
-      100
-    );
-    if (influence == null) {
-      setErr("影响力需为 0-100 的数字");
-      return;
-    }
-    const isActive = window.confirm(
-      `当前状态：${item.is_active ? "活跃" : "已退场"}。点击“确定”设置为活跃，点击“取消”设置为已退场。`
-    );
-    setErr(null);
-    setBusy(true);
-    try {
-      await patchMemoryItem(id, item.id, {
-        label,
-        detail: {
-          ...item.detail,
-          ...(owner ? { owner } : { owner: "" }),
-          ...(description ? { description } : { description: "" }),
-        },
-        influence_score: influence,
-        is_active: isActive,
-      });
-      setNotice("物品已更新");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "更新物品失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "item",
+      mode: "edit",
+      id: item.id,
+      title: `编辑物品 · ${currentLabel}`,
+      subtitle: "修改持有人、描述和活跃状态。",
+      confirmLabel: "保存物品",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label: currentLabel,
+      owner: currentOwner,
+      description: currentDescription,
+      influence: String(item.influence_score ?? 0),
+      isActive: Boolean(item.is_active),
+    });
   }
 
   async function runDeleteItem(item: NormalizedMemoryPayload["inventory"][number]) {
-    if (!id) return;
     if (!item.id) {
       setErr("当前物品缺少唯一标识，请先点击“从快照同步分表”后重试");
       return;
     }
     const label = inventoryDisplayLabel(item);
-    if (!window.confirm(`确认删除物品「${label}」吗？`)) return;
-    setErr(null);
-    setBusy(true);
-    try {
-      await deleteMemoryItem(id, item.id);
-      setNotice("物品已删除");
-      await reload();
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "删除物品失败");
-    } finally {
-      setBusy(false);
-    }
+    setMemoryEditor({
+      kind: "item",
+      mode: "delete",
+      id: item.id,
+      title: `删除物品 · ${label}`,
+      subtitle: "删除后会同步影响快照、Story Bible 与 RAG。",
+      confirmLabel: "确认删除",
+      name: "",
+      role: "",
+      status: "",
+      traits: "",
+      from: "",
+      to: "",
+      relation: "",
+      label,
+      owner: "",
+      description: "",
+      influence: String(item.influence_score ?? 0),
+      isActive: false,
+    });
   }
 
   async function runGetMemoryHistory() {
@@ -2084,7 +2863,7 @@ export function NovelWorkspace() {
   useEffect(() => {
     if (!logDialogOpen) return;
     void reloadGenerationLogs(logViewMode === "batch" ? logBatchId || undefined : undefined);
-  }, [logOnlyError, logDialogOpen, logViewMode, logBatchId]);
+  }, [logOnlyError, logDialogOpen, logViewMode, logBatchId, reloadGenerationLogs]);
 
   useEffect(() => {
     if (!logDialogOpen) return;
@@ -2092,7 +2871,7 @@ export function NovelWorkspace() {
       void reloadGenerationLogs(logViewMode === "batch" ? logBatchId || undefined : undefined);
     }, 3000);
     return () => window.clearInterval(t);
-  }, [logDialogOpen, logBatchId, logOnlyError, logViewMode]);
+  }, [logDialogOpen, logBatchId, logOnlyError, logViewMode, reloadGenerationLogs]);
 
   useEffect(() => {
     if (
@@ -2102,7 +2881,7 @@ export function NovelWorkspace() {
     ) {
       void reload();
     }
-  }, [latestMemoryVersion, memory?.version]);
+  }, [latestMemoryVersion, memory?.version, reload]);
 
   // 后台轻量轮询记忆版本，确保不打开日志弹窗也能更新记忆状态
   useEffect(() => {
@@ -2118,7 +2897,7 @@ export function NovelWorkspace() {
         if (!frameworkConfirmed && !fwMd) {
           await reload();
         }
-      } catch (e) {
+      } catch {
         // ignore
       }
     }, 5000);
@@ -2136,15 +2915,18 @@ export function NovelWorkspace() {
       `正在发起 AI 一键续写请求...（目标：${targetCount}章）`
     );
     try {
+      await reloadQueueStatus();
       const resp = await autoGenerateChapters(id, targetCount);
       if (resp.status !== "queued" || !resp.batch_id) {
-        setGenerateTrace("生成请求未成功启动");
+        const message = resp.message || "生成请求未成功启动，请查看生成日志或稍后重试";
+        setErr(message);
+        setGenerateTrace(`生成请求未成功启动：${message}`);
         await reloadGenerationLogs();
         await reload();
         return;
       }
       setGenerateTrace(
-        `已入队，后台将先消费已有章计划，再按批次补齐章计划并串行生成正文...`
+        `已入队：将按需补全分卷剧情 → 章计划 → 正文；已有计划与剧情会优先复用。`
       );
       setRefreshBatchId(resp.batch_id);
       await reload(); // 清除失败横幅
@@ -2155,12 +2937,14 @@ export function NovelWorkspace() {
         await reloadGenerationLogs();
       }
       setTaskNotice(`已开启 AI 一键续写（${targetCount}章）。`);
+      await reloadQueueStatus();
       await reload(); // 获取最新小说状态，消除失败横幅
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "全自动生成失败");
       setGenerateTrace(
         `生成请求失败：${e instanceof Error ? e.message : "未知错误"}`
       );
+      await reloadQueueStatus();
     } finally {
       setBusy(false);
     }
@@ -2174,51 +2958,46 @@ export function NovelWorkspace() {
     setNotice(null);
     setBusy(true);
     try {
-      const resp = await generateFramework(id);
-      if (resp.status === "queued" && resp.batch_id) {
-        const outcome = await waitForFrameworkGenerateBatch(id, resp.batch_id);
-        if (outcome === "failed") {
-          throw new Error("大纲 JSON 不完整或生成失败，请点击“重新生成大纲”再次尝试，并查看生成日志。");
+      const frameworkMarkdown =
+        typeof novel?.framework_markdown === "string" ? novel.framework_markdown : "";
+      const frameworkJson =
+        typeof novel?.framework_json === "string" ? novel.framework_json : "";
+      const hasExistingFramework =
+        Boolean(frameworkMarkdown.trim()) ||
+        Boolean(frameworkJson.trim() && frameworkJson !== "{}");
+      const defaultRegenInstruction =
+        "请在保留当前书名、题材方向、文风与核心主题的前提下，完整重写基础大纲。" +
+        "输出必须继续保持《一、世界观与核心设定》《二、核心人物》《三、主线剧情与长期矛盾》三部分结构，" +
+        "并把设定、人物动机、长期矛盾写得更完整、更具体、更可用于后续续写。";
+
+      if (hasExistingFramework) {
+        const resp = await regenerateFramework(id, defaultRegenInstruction);
+        if (resp.status === "queued" && resp.batch_id) {
+          const outcome = await waitForFrameworkRegenerateBatch(id, resp.batch_id);
+          if (outcome === "failed") {
+            throw new Error("大纲重写不完整或失败，请点击「基于当前版本重写大纲」再试，并在生成记录里查看详情。");
+          }
+        }
+      } else {
+        const resp = await generateFramework(id);
+        if (resp.status === "queued" && resp.batch_id) {
+          const outcome = await waitForFrameworkGenerateBatch(id, resp.batch_id);
+          if (outcome === "failed") {
+            throw new Error("首版大纲生成不完整或失败，请点击「重新生成首版大纲」再试，并在生成记录里查看详情。");
+          }
         }
       }
       await reload();
-      setNotice("大纲已重新入队生成，请稍候自动刷新。");
+      setNotice(
+        hasExistingFramework
+          ? "大纲已按当前版本重新入队重写，请稍候自动刷新。"
+          : "大纲已重新入队生成，请稍候自动刷新。"
+      );
     } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "重新生成大纲失败");
+      setErr(e instanceof Error ? e.message : "重试大纲生成失败");
       await reload();
     } finally {
       setBusy(false);
-    }
-  }
-
-  async function runGenerateVolumes() {
-    if (!id) return;
-    setErr(null);
-    setNotice(null);
-    setVolumeBusy(true);
-    try {
-      const resp = await generateVolumes(id, {
-        approx_size: 50,
-        total_chapters: Number(novel?.target_chapters || 0) || undefined,
-      });
-      await reloadVolumes();
-      if (resp.status === "extended") {
-        setNotice(
-          `已补生成后续卷 ${resp.added ?? 0} 个，现已覆盖到第${resp.covered_to ?? resp.total_chapters ?? "?"}章。`
-        );
-      } else if (resp.status === "skipped") {
-        setNotice(
-          resp.reason
-            ? `未新增卷：${resp.reason}。`
-            : "未新增卷：当前卷列表已经覆盖目标章节范围。"
-        );
-      } else {
-        setNotice("卷列表已生成。请选择一卷后生成本卷章计划。");
-      }
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : "生成卷列表失败");
-    } finally {
-      setVolumeBusy(false);
     }
   }
 
@@ -2273,14 +3052,14 @@ export function NovelWorkspace() {
     }
   }
 
-  async function runGenerateVolumePlan(force = false) {
+  async function runGenerateVolumePlan() {
     if (!id || !selectedVolumeId) return;
     setErr(null);
     setNotice(null);
     setVolumeBusy(true);
     try {
       const resp = await generateVolumeChapterPlan(id, selectedVolumeId, {
-        force_regen: force,
+        force_regen: false,
         batch_size: volumePlanBatchSize,
       });
       if (resp.status !== "queued" || !("batch_id" in resp) || !resp.batch_id) {
@@ -2486,9 +3265,12 @@ export function NovelWorkspace() {
       ? fcRaw
           .map((x) => {
             if (typeof x === "object" && x !== null) {
-              const obj = x as any;
+              const obj = x as Record<string, unknown>;
               const iid = obj.id;
-              const body = obj.body || JSON.stringify(obj);
+              const body =
+                typeof obj.body === "string" && obj.body.trim()
+                  ? obj.body
+                  : JSON.stringify(obj);
               return iid ? `[${iid}] ${body}` : body;
             }
             return String(x).trim();
@@ -2508,7 +3290,7 @@ export function NovelWorkspace() {
       }
     } else {
       details.push(
-        "当前未从规范大纲加载到硬约束列表；若你仍有多条全局禁止设定，请先在「结构化记忆」中核对 outline。"
+        "当前未从大纲里加载到全局禁止设定；若你仍有多条这类设定，请先在「记忆」里打开结构化记忆核对。"
       );
     }
     void openLlmConfirm(
@@ -2778,41 +3560,20 @@ export function NovelWorkspace() {
     await runChapterChatPrompt(prompt);
   }
 
-  function confirmGenerateVolumes() {
+  function confirmGenerateVolumePlan() {
     void openLlmConfirm(
       {
-        title: "确认生成卷列表？",
-        description: "这会调用大模型，根据已确认框架拆出整本书的卷结构。",
-        confirmLabel: "确认生成卷列表",
-        details: [
-          "建议在框架稳定后再执行，避免卷级节奏被反复推倒重来。",
-          "生成后你仍可继续补充章计划，不会直接写正文。",
-        ],
-      },
-      async () => {
-        await runGenerateVolumes();
-      }
-    );
-  }
-
-  function confirmGenerateVolumePlan(force = false) {
-    void openLlmConfirm(
-      {
-        title: force ? "确认强制重生成本卷计划？" : "确认生成本卷下一批章计划？",
-        description: force
-          ? "这会调用大模型，从当前卷开头重新推演下一批章计划。"
-          : "这会调用大模型，为当前卷继续补出下一批章计划。",
-        confirmLabel: force ? "确认重生成计划" : "确认生成章计划",
+        title: "确认生成本卷下一批章计划？",
+        description: "这会调用大模型，为当前卷继续补出下一批章计划。",
+        confirmLabel: "确认生成章计划",
         details: [
           "提交后任务在后台执行，关闭或离开本页不会中断。",
           `本次会按 ${volumePlanBatchSize} 章为一批生成计划。`,
-          force
-            ? "适合在卷节奏明显跑偏时重算；已有思路请先确认是否需要保留。"
-            : "更适合逐批推进，先看一批再决定下一批是否继续。",
+          "更适合逐批推进，先看一批再决定下一批是否继续。",
         ],
       },
       async () => {
-        await runGenerateVolumePlan(force);
+        await runGenerateVolumePlan();
       }
     );
   }
@@ -2843,11 +3604,12 @@ export function NovelWorkspace() {
       {
         title: `确认生成第${chapterNo}章正文？`,
         description:
-          "将基于该章在卷章计划中的条目，在后台生成正文（单章串行，与其它续写任务一致）；保存后为已审定，并已在流程中更新工作记忆。",
+          "将基于该章在卷章计划中的条目，在后台串行生成正文；本次走手动单章生成链路，生成结果默认为待审定，不会直接自动审定，也不会立即自动更新工作记忆。",
         confirmLabel: "确认生成正文",
         details: [
           "须已存在该章的章计划；若计划缺失会提示你先补计划。",
-          "若你希望先出稿再人工把关，可依赖修订/一致性流程；批量自动续写与此规则一致。",
+          "生成完成后建议先人工审定；只有审定通过后，才会走后续记忆写入或其它衍生流程。",
+          "这条链路与 AI 一键续写不同：AI 一键续写默认每章生成后直接审定，并尝试更新工作记忆。",
           useColdRecall
             ? `当前已开启冷层召回，最多附带 ${coldRecallItems} 条历史记忆。`
             : "当前未开启冷层召回，会以热层记忆为主生成正文。",
@@ -2860,14 +3622,18 @@ export function NovelWorkspace() {
   }
 
   function confirmGenerateChapters() {
+    const safeGenerateCount = Math.max(
+      1,
+      Math.min(maxGenerateCount, Math.round(Number(generateCount) || remainingGenerateCount))
+    );
     void openLlmConfirm(
       {
-        title: `确认 AI 一键续写 ${generateCount} 章？`,
+        title: `确认 AI 一键续写 ${safeGenerateCount} 章？`,
         description:
-          "将从已审定章节之后开始推进，后台会先消费已有章计划；如章计划不足，会自动补齐章计划并串行生成正文。默认会在每章生成后直接审定并更新工作记忆；若你开启了执行卡校验/纠偏，则该流程可能被校验拦截。",
+          "从已审定章节之后开始：若当前卷尚无分卷剧情，会先生成该卷剧情弧线；若缺少章计划，会自动分批补齐章计划；再按章串行生成正文。默认每章生成后直接审定并更新工作记忆；若开启执行卡校验/纠偏，可能被门禁拦截。",
         confirmLabel: "确认开始续写",
         details: [
-          "会优先使用已有章计划；不足部分将自动补齐章计划。",
+          "顺序：缺卷剧情则补卷剧情 → 缺章计划则补章计划 → 生成正文；已有内容会尽量复用。",
           "提交后任务在后台执行，关闭或离开本页不会中断生成。",
           "批量生成更省操作，但建议在关键转折前控制批次数，便于及时校正走向。",
           useColdRecall
@@ -2876,9 +3642,19 @@ export function NovelWorkspace() {
         ],
       },
       async () => {
-        await runAutoGenerate(generateCount);
+        await runAutoGenerate(safeGenerateCount);
       }
     );
+  }
+
+  function updateGenerateCountInput(rawValue: string) {
+    setGenerateCountTouched(true);
+    const parsed = Number.parseInt(rawValue, 10);
+    if (!Number.isFinite(parsed)) {
+      setGenerateCount(1);
+      return;
+    }
+    setGenerateCount(Math.max(1, Math.min(maxGenerateCount, Math.round(parsed))));
   }
 
   function confirmSendChapterChat() {
@@ -2986,7 +3762,7 @@ export function NovelWorkspace() {
 
   function formatUtc8(iso: string | null | undefined): string {
     if (!iso) return "-";
-    const d = new Date(iso);
+    const d = parseBackendUtcIso(iso);
     if (Number.isNaN(d.getTime())) return iso;
     const shifted = new Date(d.getTime() + 8 * 60 * 60 * 1000);
     const yyyy = shifted.getUTCFullYear();
@@ -3008,12 +3784,6 @@ export function NovelWorkspace() {
     return `${s}s`;
   }
 
-  const approvedChapterCount = chapters.filter((chapter) => chapter.status === "approved").length;
-  const draftChapterCount = Math.max(0, chapters.length - approvedChapterCount);
-  const latestChapterNo = chapters.length
-    ? Math.max(...chapters.map((chapter) => chapter.chapter_no))
-    : 0;
-  const activeMemoryLines = memoryNorm?.open_plots.length ?? openPlotsLines.length;
   const workspaceStageLabel = frameworkConfirmed
     ? approvedChapterCount > 0
       ? "持续创作中"
@@ -3151,22 +3921,15 @@ export function NovelWorkspace() {
           frameworkMarkdown={fwMd}
           frameworkJson={fwJson}
           status={String(novel?.status || "")}
-          targetChapters={Number(novel?.target_chapters || 0)}
-          volumes={volumes.map((v) => ({
-            volume_no: v.volume_no,
-            title: v.title,
-            outline_json: v.outline_json,
-            outline_markdown: v.outline_markdown,
-          }))}
           onReload={reload}
           onConfirmFramework={async () => {
             await confirmFramework(id, fwMd, fwJson);
-            setNotice("框架已确认，可继续生成卷计划与正文。");
+            setNotice("全书框架已确认，可继续生成章计划与正文。");
             await reload();
           }}
           onConfirmBaseFramework={async () => {
             await confirmBaseFramework(id, fwMd, fwJson);
-            setNotice("基础大纲已确认，现在可以为各卷生成 Arcs。");
+            setNotice("基础大纲已确认。请打开「大纲抽屉」为各卷生成分卷剧情。");
             await reload();
           }}
         />
@@ -3219,7 +3982,7 @@ export function NovelWorkspace() {
                   disabled={busy}
                   onClick={() => void runRetryFrameworkGeneration()}
                 >
-                  {busy ? "重新生成中…" : "重新生成大纲"}
+                  {busy ? "重试中…" : "重新生成首版大纲 / 重写当前大纲"}
                 </Button>
               ) : null}
               <Button
@@ -3231,7 +3994,7 @@ export function NovelWorkspace() {
               </Button>
               <p className="text-[11px] text-foreground/50 dark:text-muted-foreground italic font-medium ml-2">
                 {!novel.framework_confirmed
-                  ? "如果报错里提到 JSON 不完整或截断，直接点击“重新生成大纲”即可。"
+                  ? "若当前还没有可用大纲，会重试首版生成；若已存在草案，则会基于当前版本重写。"
                   : "建议先查看错误日志，再决定是否继续重试。"}
               </p>
             </div>
@@ -3269,6 +4032,16 @@ export function NovelWorkspace() {
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-1.5 sm:ml-auto">
+                  <div
+                    className={`rounded-full border px-3 py-1 text-[11px] font-bold ${
+                      queueBusy
+                        ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                        : "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                    }`}
+                    title={queueHint}
+                  >
+                    {queueLabel}
+                  </div>
                   <Button
                     type="button"
                     size="sm"
@@ -3277,6 +4050,34 @@ export function NovelWorkspace() {
                     onClick={() => setOutlineDrawerOpen(true)}
                   >
                     大纲抽屉
+                  </Button>
+                  <div className="inline-flex h-8 items-center overflow-hidden rounded-full border border-border/70 bg-background/70">
+                    <span className="pl-3 pr-1 text-[11px] font-bold text-foreground/58">
+                      续写
+                    </span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={maxGenerateCount}
+                      value={generateCount}
+                      onChange={(e) => updateGenerateCountInput(e.target.value)}
+                      className="h-full w-16 bg-transparent px-1 text-center text-xs font-black text-foreground outline-none"
+                      aria-label="一键续写章节数量"
+                    />
+                    <span className="pl-1 pr-3 text-[11px] font-bold text-foreground/58">
+                      章
+                    </span>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    className="h-8 gap-1 rounded-full px-3 text-xs font-bold"
+                    disabled={busy || !frameworkConfirmed}
+                    onClick={() => confirmGenerateChapters()}
+                    title={!frameworkConfirmed ? "请先确认框架，再开始 AI 续写" : `续写 ${generateCount} 章`}
+                  >
+                    <Sparkles className="size-3.5 shrink-0 opacity-90" />
+                    AI 一键续写
                   </Button>
                   <Button
                     type="button"
@@ -3294,11 +4095,43 @@ export function NovelWorkspace() {
             <div className="novel-container py-4 md:py-5">
               <div className="flex max-h-[min(85dvh,920px)] min-h-[min(52dvh,420px)] flex-col overflow-hidden rounded-2xl border border-border/60 bg-background/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
                 <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-                  <aside className="flex max-h-[34vh] w-full shrink-0 flex-col border-b border-border/60 bg-muted/15 lg:max-h-none lg:w-[min(18rem,92vw)] lg:border-b-0 lg:border-r border-border/60">
+                  <aside
+                    className={`shrink-0 border-border/60 bg-muted/15 transition-[width,max-height] duration-200 ease-out ${
+                      studioTreeSidebarCollapsed
+                        ? "flex w-full max-h-11 flex-row items-stretch border-b lg:max-h-none lg:min-h-0 lg:w-11 lg:flex-col lg:self-stretch lg:border-b-0 lg:border-r"
+                        : "flex max-h-[34vh] w-full min-h-0 flex-col border-b lg:max-h-none lg:min-h-0 lg:w-[min(18rem,92vw)] lg:self-stretch lg:border-b-0 lg:border-r"
+                    }`}
+                  >
+                    {studioTreeSidebarCollapsed ? (
+                      <button
+                        type="button"
+                        className="flex w-full items-center justify-center gap-2 text-foreground/70 transition-colors hover:bg-muted/45 lg:flex-1 lg:flex-col lg:gap-1.5 lg:py-4"
+                        aria-label="展开结构树"
+                        title="展开结构树"
+                        onClick={() => setStudioTreeSidebarCollapsed(false)}
+                      >
+                        <ChevronRight className="size-5 shrink-0 lg:size-4" />
+                        <span className="text-[11px] font-bold lg:hidden">结构树</span>
+                      </button>
+                    ) : (
+                      <>
+                        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border/45 px-3 py-2 sm:px-4">
+                          <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
+                            结构树
+                          </p>
+                          <Button
+                            type="button"
+                            size="icon"
+                            variant="ghost"
+                            className="h-8 w-8 shrink-0 text-foreground/60 hover:text-foreground"
+                            aria-label="收起结构树"
+                            title="收起结构树"
+                            onClick={() => setStudioTreeSidebarCollapsed(true)}
+                          >
+                            <ChevronLeft className="size-4" />
+                          </Button>
+                        </div>
                     <div className="soft-scroll min-h-0 flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
-                      <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
-                        结构树
-                      </p>
                       <div
                         className={`flex items-center gap-2 rounded-xl border px-2.5 py-2 ${
                           workspaceRootBook || !selectedVolumeId
@@ -3346,7 +4179,7 @@ export function NovelWorkspace() {
                       <div className="space-y-2 pt-1">
                         {volumes.length === 0 ? (
                           <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
-                            暂无分卷。在右侧主区生成卷列表。
+                            暂无分卷。请在大纲抽屉里生成分卷剧情，系统会同步卷占位。
                           </p>
                         ) : (
                           volumes
@@ -3361,6 +4194,11 @@ export function NovelWorkspace() {
                                 )
                                 .sort((a, b) => a.chapter_no - b.chapter_no);
                               const expanded = Boolean(expandedVolumeIds[v.id]);
+                              const volHasPlot =
+                                Boolean(
+                                  parseVolumeOutlineJson(v.outline_json)?.arcs
+                                    ?.length
+                                ) || (v.outline_markdown || "").trim().length > 0;
                               return (
                                 <div key={v.id} className="space-y-1">
                                   <div className="flex items-stretch gap-0.5">
@@ -3406,6 +4244,41 @@ export function NovelWorkspace() {
                                       </p>
                                     </button>
                                   </div>
+                                  {volHasPlot ? (
+                                    <div className="ml-8 flex flex-wrap items-center gap-2">
+                                      <button
+                                        type="button"
+                                        className={`text-[10px] font-bold ${
+                                          treeVolumePlotOpenId === v.id
+                                            ? "text-primary underline"
+                                            : "text-foreground/50 hover:text-foreground"
+                                        }`}
+                                        onClick={() =>
+                                          setTreeVolumePlotOpenId((p) =>
+                                            p === v.id ? null : v.id
+                                          )
+                                        }
+                                      >
+                                        {treeVolumePlotOpenId === v.id
+                                          ? "收起卷剧情"
+                                          : "卷剧情"}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        className="text-[10px] text-foreground/40 hover:text-foreground/70"
+                                        onClick={() => {
+                                          setOutlineDrawerOpen(true);
+                                        }}
+                                      >
+                                        在大纲抽屉编辑
+                                      </button>
+                                    </div>
+                                  ) : null}
+                                  {treeVolumePlotOpenId === v.id && volHasPlot ? (
+                                    <div className="ml-8 max-h-56 overflow-y-auto rounded-xl border border-border/60 bg-muted/15 p-2">
+                                      <VolumeArcStack volume={v} compact />
+                                    </div>
+                                  ) : null}
                                   {expanded ? (
                                     <div className="ml-9 max-h-[min(42dvh,360px)] space-y-1 overflow-y-auto border-l border-border/35 pl-2 pr-0.5">
                                       {volChapters.length === 0 ? (
@@ -3448,56 +4321,56 @@ export function NovelWorkspace() {
                         )}
                       </div>
                     </div>
+                      </>
+                    )}
                   </aside>
                   <div className="min-h-0 flex-1 overflow-y-auto soft-scroll p-4 md:p-5">
             <Dialog open={outlineDrawerOpen} onOpenChange={setOutlineDrawerOpen}>
-              <DialogContent className="!fixed !inset-y-3 !right-3 !left-auto !top-3 !flex !h-[min(92dvh,900px)] !max-h-[92dvh] !w-[min(28rem,calc(100vw-1.5rem))] !max-w-none !translate-x-0 !translate-y-0 flex-col gap-0 overflow-hidden rounded-2xl border border-border/60 bg-background/98 p-0 shadow-2xl data-[state=open]:zoom-in-100 sm:!max-w-none">
-                <DialogHeader className="shrink-0 space-y-1 border-b border-border/60 px-5 py-4 text-left">
-                  <DialogTitle>大纲抽屉</DialogTitle>
-                  <DialogDescription className="text-left text-xs">
-                    全书基线 Markdown 与分卷 Arcs；关闭后用左侧树切换卷/章。
-                  </DialogDescription>
+              <DialogContent className="!fixed !inset-y-2 !right-2 !left-auto !top-2 !flex !h-[min(94dvh,940px)] !max-h-[94dvh] !w-[calc(100vw-1rem)] !max-w-[min(46rem,calc(100vw-1rem))] !translate-x-0 !translate-y-0 flex-col gap-0 overflow-hidden !rounded-2xl !border-2 !border-border !bg-card !p-0 !text-card-foreground !backdrop-blur-none shadow-[0_24px_64px_-12px_rgba(15,23,42,0.22)] dark:shadow-[0_24px_64px_-8px_rgba(0,0,0,0.5)] data-[state=open]:zoom-in-100 sm:!inset-y-3 sm:!right-3 sm:!max-w-[min(46rem,calc(100vw-1.5rem))] sm:!w-[min(46rem,calc(100vw-1.5rem))]">
+                <DialogHeader className="shrink-0 space-y-2 border-b-2 border-border bg-muted px-5 py-4 text-left sm:flex-row sm:items-center sm:justify-between sm:space-y-0 sm:px-6">
+                  <div className="min-w-0 space-y-1 pr-8 sm:pr-0">
+                    <DialogTitle className="text-left text-lg">大纲抽屉</DialogTitle>
+                    <DialogDescription className="text-left text-xs text-muted-foreground sm:max-w-xl">
+                      查看全书大纲与各卷剧情线；关闭抽屉后，用左侧目录切换卷和章节。
+                    </DialogDescription>
+                  </div>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="secondary"
+                    className="mt-2 w-full shrink-0 font-bold sm:mt-0 sm:w-auto"
+                    disabled={busy}
+                    onClick={() => setFrameworkWizardOpen(true)}
+                  >
+                    修改向导
+                  </Button>
                 </DialogHeader>
-                <div className="min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-4 soft-scroll">
+                <div className="min-h-0 flex-1 space-y-8 overflow-y-auto bg-background px-5 py-5 soft-scroll sm:px-6 sm:py-6">
             <div
               id="studio-outline-drawer"
-              className="space-y-4"
+              className="space-y-6"
             >
-            <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-              <div className="space-y-1">
+            <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">小说概览与创作基线</p>
-                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  与左侧结构树配合：此处管全书与分卷 Arcs，主区管当前卷/章。
+                <p className="text-sm text-foreground/80 dark:text-muted-foreground font-medium">
+                  与左侧目录配合：这里管全书大纲和各卷剧情，中间主区写当前卷、当前章。
                 </p>
               </div>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="font-bold"
-                  disabled={busy}
-                  onClick={() => setFrameworkWizardOpen(true)}
-                >
-                  修改向导
-                </Button>
-              </div>
-            </div>
-            <div className="grid gap-3 md:grid-cols-3">
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">框架状态</p>
+            <div className="grid gap-3 sm:grid-cols-3">
+              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
+                <p className="text-xs font-bold text-muted-foreground">框架状态</p>
                 <p className="mt-2 text-base font-bold text-foreground">
                   {frameworkConfirmed ? "已确认" : "待确认"}
                 </p>
               </div>
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前章节</p>
+              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
+                <p className="text-xs font-bold text-muted-foreground">当前章节</p>
                 <p className="mt-2 text-base font-bold text-foreground">
                   {latestChapterNo ? `第 ${latestChapterNo} 章` : "未开始"}
                 </p>
               </div>
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议下一步</p>
+              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
+                <p className="text-xs font-bold text-muted-foreground">建议下一步</p>
                 <p className="mt-2 text-sm font-bold text-foreground">
                   {frameworkConfirmed
                     ? "在左侧树选卷或章节，主区即切换"
@@ -3515,7 +4388,7 @@ export function NovelWorkspace() {
                 一、基础大纲（世界观 / 人物 / 主线）
               </Label>
               <p className="mt-1 text-xs text-foreground/55 dark:text-muted-foreground">
-                不包含分卷 Arcs；分卷剧情见本抽屉下方「分卷 Arcs」。
+                这里是全书层面的设定与主线；按卷写的剧情弧线在下方「分卷剧情」。
               </p>
               {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
                 <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
@@ -3525,7 +4398,7 @@ export function NovelWorkspace() {
                         <div className="h-4 w-4 rounded-full bg-destructive" />
                       </div>
                       <p className="font-bold text-base text-destructive">AI 构思似乎失败了</p>
-                      <p className="text-xs opacity-60 max-w-xs mb-2">如果是大纲 JSON 不完整或输出截断，直接点击下方重新生成即可。</p>
+                      <p className="text-xs opacity-60 max-w-xs mb-2">若当前还没有草案，会重试首版生成；若已有草案，则会按当前版本重写。</p>
                       <Button 
                         size="sm" 
                         variant="default" 
@@ -3533,7 +4406,7 @@ export function NovelWorkspace() {
                         onClick={() => void runRetryFrameworkGeneration()}
                         disabled={busy}
                       >
-                        {busy ? "重新生成中..." : "重新生成大纲"}
+                        {busy ? "重试中..." : "重新生成首版大纲 / 重写当前大纲"}
                       </Button>
                       <Button 
                         size="sm" 
@@ -3558,81 +4431,111 @@ export function NovelWorkspace() {
                 <textarea
                   value={fwMd}
                   onChange={(e) => setFwMd(e.target.value)}
-                  className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                  className="mt-2 min-h-[280px] w-full rounded-2xl border-2 border-border bg-card p-4 font-mono text-sm text-foreground shadow-sm dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
                   placeholder="暂无大纲。进入“修改向导”或等待 AI 生成。"
                 />
               )}
             </div>
             </>
-            <div className="space-y-3 border-t border-border/60 pt-6">
+            <div className="space-y-3 border-t-2 border-border pt-8">
               <div className="space-y-1">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                  分卷 Arcs（概览与生成）
+                  分卷剧情（概览与生成）
                 </Label>
-                <p className="text-xs text-foreground/55 dark:text-muted-foreground">
-                  每卷单独保存；下方可勾选卷并生成/覆盖 Arcs，也可用顶部「完整向导」。续写与章计划会优先读卷上的 outline。
+                <p className="text-xs text-foreground/70 dark:text-muted-foreground">
+                  下方点选卷号后，这里只显示该卷。各段默认折叠，展开后可读「剧情 / 钩子 / 禁止推进 / 允许推进」。续写与章计划会参考此处。
                 </p>
               </div>
               {volumes.length === 0 ? (
-                <div className="rounded-2xl border border-dashed border-border/70 bg-background/40 p-6 text-sm text-foreground/60">
-                  尚未生成卷列表。请关闭抽屉后在主区生成卷列表。
+                <div className="rounded-2xl border-2 border-dashed border-border bg-muted p-6 text-sm text-muted-foreground">
+                  还没有分卷占位。请先在下方选择卷号并生成分卷剧情，系统会同步卷信息。
                 </div>
               ) : (
-                <div className="grid gap-3 md:grid-cols-2">
-                  {volumes
-                    .slice()
-                    .sort((a, b) => a.volume_no - b.volume_no)
-                    .map((v) => {
-                      const om = (v.outline_markdown || "").trim();
-                      const hasArc = om.length > 0;
-                      return (
-                        <div
-                          key={v.id}
-                          className="rounded-2xl border border-border/70 bg-background/60 p-4 shadow-[inset_0_1px_0_rgba(255,255,255,0.2)]"
-                        >
-                          <div className="flex items-start justify-between gap-2">
-                            <div>
-                              <p className="text-xs font-bold uppercase tracking-wide text-foreground/50">
-                                第 {v.volume_no} 卷
-                              </p>
-                              <p className="mt-1 text-base font-bold text-foreground">
-                                {v.title || "（未命名）"}
-                              </p>
-                            </div>
-                            <span
-                              className={`shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold ${
-                                hasArc
-                                  ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
-                                  : "bg-muted text-muted-foreground"
-                              }`}
-                            >
-                              {hasArc ? "已有 Arcs" : "未生成"}
-                            </span>
-                          </div>
-                          {v.summary ? (
-                            <p className="mt-2 text-xs text-foreground/65 line-clamp-3">{v.summary}</p>
-                          ) : null}
-                          {hasArc ? (
-                            <pre className="mt-3 max-h-[200px] overflow-auto whitespace-pre-wrap rounded-xl border border-border/50 bg-background/80 p-3 font-mono text-[11px] leading-relaxed text-foreground/90">
-                              {om}
-                            </pre>
-                          ) : (
-                            <p className="mt-3 text-xs text-foreground/50">暂无卷级 Arcs，可在下方选卷生成或使用「完整向导」。</p>
-                          )}
+                (() => {
+                  const v = volumes.find(
+                    (x) => x.volume_no === arcsPanelVolumeNo
+                  );
+                  const om = (v?.outline_markdown || "").trim();
+                  const po = v ? parseVolumeOutlineJson(v.outline_json) : null;
+                  const hasArc =
+                    Boolean(po && po.arcs.length > 0) || om.length > 0;
+                  const segN =
+                    po && po.arcs.length > 0
+                      ? po.arcs.length
+                      : (om.match(/^### /gm) || []).length;
+                  if (!v) {
+                    return (
+                      <div className="rounded-2xl border-2 border-dashed border-border bg-muted/30 p-6 sm:p-8">
+                        <p className="text-sm font-bold text-foreground">
+                          第 {arcsPanelVolumeNo} 卷
+                        </p>
+                        <p className="mt-2 text-sm leading-relaxed text-foreground/70">
+                          该卷尚未在书中落库。请在下方保持选中该卷号，点击「生成第{" "}
+                          {arcsPanelVolumeNo} 卷剧情」后会自动创建本卷并写入剧情。
+                        </p>
+                      </div>
+                    );
+                  }
+                  return (
+                    <div className="w-full max-w-full rounded-2xl border-2 border-border bg-card p-4 shadow-sm sm:p-6">
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <p className="text-xs font-bold uppercase tracking-wide text-foreground/50">
+                            第 {v.volume_no} 卷
+                          </p>
+                          <p className="mt-1 text-lg font-bold text-foreground sm:text-xl">
+                            {v.title || "（未命名）"}
+                          </p>
                         </div>
-                      );
-                    })}
-                </div>
+                        <span
+                          className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-bold ${
+                            hasArc
+                              ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
+                              : "bg-muted text-muted-foreground"
+                          }`}
+                        >
+                          {hasArc ? "已有剧情" : "未生成"}
+                        </span>
+                      </div>
+                      {v.summary ? (
+                        <p className="mt-3 text-sm text-foreground/70 line-clamp-4">
+                          {v.summary}
+                        </p>
+                      ) : null}
+                      {hasArc ? (
+                        <details className="group mt-4 rounded-2xl border-2 border-border/80 bg-muted/10 open:border-primary/25 open:bg-muted/20">
+                          <summary className="flex cursor-pointer list-none items-center gap-2 p-3.5 text-left text-sm font-bold text-foreground sm:p-4 [&::-webkit-details-marker]:hidden">
+                            <ChevronRight className="size-4 shrink-0 text-foreground/45 transition group-open:rotate-90" />
+                            <span>展开本卷剧情</span>
+                            {segN > 0 ? (
+                              <span className="text-sm font-normal text-foreground/45">
+                                （{segN} 段）
+                              </span>
+                            ) : null}
+                          </summary>
+                          <div className="min-h-0 max-h-[min(72dvh,820px)] overflow-y-auto border-t border-border/50 p-3 sm:p-4">
+                            <VolumeArcStack volume={v} roomy />
+                          </div>
+                        </details>
+                      ) : (
+                        <p className="mt-4 text-sm leading-relaxed text-foreground/55">
+                          本卷还没有分卷剧情。保持下方当前卷号选中，点击「生成第{" "}
+                          {arcsPanelVolumeNo} 卷剧情」即可；同一卷再次生成会覆盖旧内容。
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()
               )}
 
-              <div className="space-y-3 border-t border-border/50 pt-6">
+              <div className="space-y-3 border-t-2 border-border pt-8">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                  生成或覆盖 Arcs
+                  生成或覆盖分卷剧情
                 </Label>
                 <p className="text-xs text-foreground/55 dark:text-muted-foreground">
-                  需已确认基础大纲。异步生成，选中卷上已有 Arcs 会被覆盖。
+                  需先确认基础大纲。生成需要一点时间；同一卷再次生成会覆盖该卷已有内容。
                 </p>
-                {!Boolean(novel?.base_framework_confirmed) ? (
+                {!novel?.base_framework_confirmed ? (
                   <p className="text-xs font-bold text-amber-600 dark:text-amber-400">
                     请先在向导中确认基础大纲，或使用确认按钮。
                   </p>
@@ -3641,21 +4544,19 @@ export function NovelWorkspace() {
                   {Array.from({ length: totalStudioVolumes }, (_, i) => i + 1).map((volNo) => {
                     const hasOutline = volumes.some(
                       (vv) =>
-                        vv.volume_no === volNo && (vv.outline_markdown || "").trim().length > 0
+                        vv.volume_no === volNo &&
+                        ((vv.outline_markdown || "").trim().length > 0 ||
+                          Boolean(
+                            parseVolumeOutlineJson(vv.outline_json)?.arcs?.length
+                          ))
                     );
-                    const selected = arcsTargetVolumes.includes(volNo);
+                    const selected = arcsPanelVolumeNo === volNo;
                     return (
                       <button
                         key={`arc-vol-${volNo}`}
                         type="button"
                         disabled={arcsBusy || busy}
-                        onClick={() =>
-                          setArcsTargetVolumes((prev) =>
-                            prev.includes(volNo)
-                              ? prev.filter((x) => x !== volNo)
-                              : [...prev, volNo].sort((a, b) => a - b)
-                          )
-                        }
+                        onClick={() => setArcsPanelVolumeNo(volNo)}
                         className={`rounded-xl border px-3 py-1.5 text-xs font-bold transition-colors ${
                           selected
                             ? "border-primary bg-primary text-primary-foreground"
@@ -3681,15 +4582,12 @@ export function NovelWorkspace() {
                     type="button"
                     size="sm"
                     className="font-bold"
-                    disabled={
-                      arcsBusy ||
-                      busy ||
-                      !Boolean(novel?.base_framework_confirmed) ||
-                      arcsTargetVolumes.length === 0
-                    }
+                    disabled={arcsBusy || busy || !novel?.base_framework_confirmed}
                     onClick={() => void runInlineGenerateArcs()}
                   >
-                    {arcsBusy ? "生成中…" : `生成第 ${arcsTargetVolumes.join("、")} 卷 Arcs`}
+                    {arcsBusy
+                      ? "生成中…"
+                      : `生成第 ${arcsPanelVolumeNo} 卷剧情`}
                   </Button>
                 </div>
               </div>
@@ -3707,21 +4605,12 @@ export function NovelWorkspace() {
               <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">卷与章计划</p>
                 <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  生成卷列表 → 为本卷分批生成章计划 → 在左侧树选章后在主区续写与编辑正文。
+                  卷在「大纲抽屉」里随分卷剧情落库后，可在此生成本卷章计划 → 在左侧树选章后在主区续写与编辑正文。需清空本卷计划时可用「一键清除」后重跑下一批。
                 </p>
               </div>
               <div className="glass-chip font-bold text-foreground/80">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
             </div>
             <div className="glass-panel-subtle flex flex-wrap gap-2 p-3">
-              <Button
-                type="button"
-                size="sm"
-                className="font-bold"
-                disabled={busy || volumeBusy}
-                onClick={() => confirmGenerateVolumes()}
-              >
-                生成卷列表（每卷约50章）
-              </Button>
               <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-background/60 px-3 py-1.5 text-xs">
                 <span className="text-foreground/60 dark:text-muted-foreground font-bold">每次生成</span>
                 <select
@@ -3743,19 +4632,9 @@ export function NovelWorkspace() {
                 variant="secondary"
                 className="font-bold"
                 disabled={busy || volumeBusy || !selectedVolumeId}
-                onClick={() => confirmGenerateVolumePlan(false)}
+                onClick={() => confirmGenerateVolumePlan()}
               >
                 生成本卷章计划（下一批）
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                className="font-semibold"
-                disabled={busy || volumeBusy || !selectedVolumeId}
-                onClick={() => confirmGenerateVolumePlan(true)}
-              >
-                强制重生成本卷计划（从头下一批）
               </Button>
               <Button
                 type="button"
@@ -3768,113 +4647,6 @@ export function NovelWorkspace() {
                 一键清除本卷计划
               </Button>
             </div>
-
-            {selectedVolume ? (
-              <div className="grid gap-4 xl:grid-cols-[1.08fr_0.92fr]">
-                <div className="signal-surface story-mesh p-5">
-                  <div className="flex flex-wrap items-start justify-between gap-3">
-                    <div className="space-y-2">
-                      <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
-                        <Sparkles className="size-3.5" />
-                        Volume Atlas
-                      </span>
-                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
-                        第{selectedVolume.volume_no}卷 · {selectedVolume.title}
-                      </h3>
-                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
-                        {selectedVolume.summary ||
-                          "为当前卷生成章节轨道后，这里会显示本卷的节奏分布、缺口与正文覆盖情况。"}
-                      </p>
-                    </div>
-                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
-                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
-                        轨道覆盖
-                      </p>
-                      <p className="mt-2 text-2xl font-semibold text-foreground">
-                        {Math.round(selectedVolumeCoverage * 100)}%
-                      </p>
-                      <p className="mt-1 text-sm text-foreground/60">
-                        第{selectedVolume.from_chapter}—{selectedVolume.to_chapter}章
-                      </p>
-                    </div>
-                  </div>
-
-                  <div className="mt-5 grid gap-3 sm:grid-cols-3">
-                    {[
-                      ["计划章节", `${volumePlan.length}`, "已生成执行卡"],
-                      ["待写正文", `${volumePlanMetrics.pendingWriteCount}`, "默认隐藏已有正文章节"],
-                      ["已人工调整", `${volumePlanMetrics.editedCount}`, "说明本卷已经进入精修阶段"],
-                    ].map(([label, value, hint]) => (
-                      <div key={label} className="rounded-[1.2rem] border border-border/60 bg-background/65 px-4 py-3">
-                        <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
-                          {label}
-                        </p>
-                        <p className="mt-2 text-xl font-semibold text-foreground">{value}</p>
-                        <p className="mt-1 text-sm text-foreground/60">{hint}</p>
-                      </div>
-                    ))}
-                  </div>
-
-                  <div className="mt-5 rounded-[1.6rem] border border-border/60 bg-background/58 p-4">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <GitBranch className="size-4 text-primary" />
-                        <p className="text-sm font-semibold text-foreground">章节轨道</p>
-                      </div>
-                      <span className="status-badge">覆盖 {Math.round(selectedVolumeCoverage * 100)}%</span>
-                    </div>
-
-                    <div className="mt-4 grid grid-cols-5 gap-2 sm:grid-cols-8 lg:grid-cols-10">
-                      {selectedVolumeSlots.map((slot) => (
-                        <div
-                          key={`slot-${slot.chapterNo}`}
-                          className={`rounded-[1rem] border px-2 py-2 text-center ${
-                            slot.hasBody
-                              ? "border-accent/30 bg-accent/12"
-                              : slot.hasPlan
-                                ? "border-primary/25 bg-primary/10"
-                                : "border-border/50 bg-background/44"
-                          }`}
-                        >
-                          <div
-                            className={`mx-auto h-1.5 w-full rounded-full ${
-                              slot.hasBody
-                                ? "bg-gradient-to-r from-accent via-primary to-cyan-200"
-                                : slot.hasPlan
-                                  ? "bg-gradient-to-r from-primary via-accent to-cyan-300"
-                                  : "bg-border/60"
-                            }`}
-                          />
-                          <p className="mt-2 text-[11px] font-semibold text-foreground/62">
-                            {slot.chapterNo}
-                          </p>
-                        </div>
-                      ))}
-                    </div>
-                    <div className="mt-4 flex flex-wrap gap-2 text-xs text-foreground/60">
-                      <span className="status-badge">亮色已写正文</span>
-                      <span className="status-badge">主色仅有计划</span>
-                      <span className="status-badge">暗色尚未生成</span>
-                    </div>
-                  </div>
-
-                  <div className="glass-panel-subtle mt-4 flex flex-wrap items-center justify-between gap-3 px-4 py-3 text-sm text-foreground/68">
-                    <span>
-                      {volumePlan.length === 0
-                        ? "先生成本卷章计划，让每章目标、冲突和转折先被看见。"
-                        : volumePlanView.visible.length === 0
-                          ? "当前视图下没有待写章节，可以切换显示已有正文的章节继续复盘。"
-                          : `下一步优先处理第 ${volumePlanView.visible[0]?.chapter_no ?? "?"} 章。`}
-                    </span>
-                    <span className="text-xs text-foreground/56">
-                      {selectedVolumeCoverage >= 1
-                        ? "本卷计划已铺满"
-                        : `还差 ${Math.max(0, selectedVolumeTotalChapters - volumePlan.length)} 章执行卡`}
-                    </span>
-                  </div>
-                </div>
-              </div>
-            ) : null}
 
             <div>
               <section className="glass-panel-subtle p-5">
@@ -4287,26 +5059,14 @@ export function NovelWorkspace() {
             <div className="glass-panel-subtle space-y-3 p-4">
               <div className="flex flex-wrap items-center gap-2">
                 <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">一次生成</Label>
-                {(() => {
-                  const maxGenerateCount = Math.max(1, Number(novel?.target_chapters || 5000));
-                  return (
                 <input
                   type="number"
                   min={1}
                   max={maxGenerateCount}
                   value={generateCount}
-                  onChange={(e) => {
-                    const parsed = Number.parseInt(e.target.value, 10);
-                    if (!Number.isFinite(parsed)) {
-                      setGenerateCount(1);
-                      return;
-                    }
-                    setGenerateCount(Math.max(1, Math.min(maxGenerateCount, Math.round(parsed))));
-                  }}
+                  onChange={(e) => updateGenerateCountInput(e.target.value)}
                   className="h-8 w-24 rounded-xl border border-border/70 bg-background px-2.5 text-sm text-foreground font-bold"
                 />
-                  );
-                })()}
                 <Button
                   type="button"
                   size="sm"
@@ -4327,6 +5087,17 @@ export function NovelWorkspace() {
                 </Button>
               </div>
               <div className="flex flex-wrap items-center gap-3 text-xs text-foreground/70 dark:text-muted-foreground font-bold">
+                <span
+                  className={`rounded-full border px-3 py-1 ${
+                    queueBusy
+                      ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
+                      : "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                  }`}
+                  title={queueHint}
+                >
+                  {queueLabel}
+                  {queueStatus ? ` · ${queueHint}` : ""}
+                </span>
                 {generateDisabledReason ? (
                   <span className="font-bold text-amber-600">{generateDisabledReason}</span>
                 ) : null}
@@ -4408,6 +5179,20 @@ export function NovelWorkspace() {
                         </p>
                       </div>
                     </div>
+                    <NovelIntelPanel
+                      selectedChapter={{
+                        chapter_no: selectedChapter.chapter_no,
+                        title: selectedChapter.title,
+                      }}
+                      workflow={latestWorkflow}
+                      judge={chapterJudge}
+                      retrievalLogs={retrievalLogs}
+                      memoryRuns={memoryUpdateRuns}
+                      evaluation={coreEvaluation}
+                      workflowLoading={intelWorkflowLoading}
+                      judgeLoading={intelJudgeLoading}
+                      retrievalLoading={intelRetrievalLoading}
+                    />
                     <div className="glass-panel-subtle space-y-4 p-4">
                       <div className="space-y-2">
                         <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">章节标题</Label>
@@ -4632,9 +5417,52 @@ export function NovelWorkspace() {
               <div className="space-y-1">
                 <p className="section-heading text-foreground font-bold">全书入口</p>
                 <p className="text-sm text-foreground/65 dark:text-muted-foreground font-medium">
-                  在左侧树选择某一卷可查看章计划与轨道；展开卷后点章节进入正文编辑。需要改世界观/人物/主线或分卷 Arcs 时，用大纲抽屉。
+                  在左侧树选择某一卷可查看章计划与轨道；展开卷后点章节进入正文编辑。需要改世界观、人物、主线或各卷剧情线时，用大纲抽屉。
                 </p>
               </div>
+              {!frameworkConfirmed ? (
+                <div className="relative overflow-hidden rounded-[1.75rem] border border-amber-500/35 bg-amber-500/10 p-4 shadow-[0_18px_50px_rgba(245,158,11,0.10)] md:p-5">
+                  <div className="pointer-events-none absolute -right-16 -top-20 h-44 w-44 rounded-full bg-amber-300/25 blur-3xl" />
+                  <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                    <div className="space-y-2">
+                      <div className="inline-flex rounded-full border border-amber-500/35 bg-background/65 px-3 py-1 text-[11px] font-bold text-amber-700 dark:text-amber-300">
+                        下一步：确认框架
+                      </div>
+                      <div>
+                        <p className="text-lg font-black text-foreground">
+                          大纲已生成，但还没有确认，暂时不能开始 AI 续写
+                        </p>
+                        <p className="mt-1 max-w-2xl text-sm leading-6 text-foreground/68 dark:text-muted-foreground">
+                          确认框架后，系统才会把世界观、人物和主线当成正式约束，并继续生成分卷剧情、章计划和正文。
+                          {fwMd.trim()
+                            ? "建议先快速扫一遍大纲，再进入向导确认。"
+                            : "如果大纲内容还没出现，请稍等后台生成完成或在向导中重试。"}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-2 lg:justify-end">
+                      <Button
+                        type="button"
+                        size="sm"
+                        className="gap-1 font-black shadow-lg shadow-amber-500/15"
+                        onClick={() => setFrameworkWizardOpen(true)}
+                      >
+                        <Sparkles className="size-3.5 shrink-0 opacity-90" />
+                        确认框架（进入向导）
+                      </Button>
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="secondary"
+                        className="font-bold"
+                        onClick={() => setOutlineDrawerOpen(true)}
+                      >
+                        先检查大纲
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              ) : null}
               <div className="grid gap-3 md:grid-cols-3">
                 <div className="glass-panel-subtle p-4">
                   <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">框架状态</p>
@@ -4654,26 +5482,11 @@ export function NovelWorkspace() {
                   <p className="mt-1 text-xs text-foreground/50">在树中展开可浏览章节</p>
                 </div>
               </div>
-              <div className="flex flex-wrap gap-2">
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="font-bold"
-                  onClick={() => setOutlineDrawerOpen(true)}
-                >
-                  大纲抽屉
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  className="font-bold"
-                  onClick={() => setFrameworkWizardOpen(true)}
-                >
-                  完整向导
-                </Button>
-              </div>
+              {frameworkConfirmed ? (
+                <p className="rounded-2xl border border-border/55 bg-muted/25 p-3 text-xs font-semibold text-foreground/58 dark:text-muted-foreground">
+                  可使用顶部工具条的「AI 一键续写」继续生成；默认目标为剩余 {remainingGenerateCount} 章，不超过全书目标 {maxGenerateCount} 章。
+                </p>
+              ) : null}
             </section>
             )}
                   </div>
@@ -4685,9 +5498,9 @@ export function NovelWorkspace() {
           <TabsContent value="memory" className="glass-panel space-y-4 p-5 md:p-6">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div className="space-y-1">
-                <p className="section-heading">记忆区</p>
+                <p className="section-heading">小说态势面板</p>
                 <p className="text-sm text-muted-foreground">
-                  这里聚合结构化记忆、健康检查和人工微调入口。适合在审定章节后刷新，再回看待收束线是否过期或偏移。
+                  默认只看故事当前讲到哪、谁在推动剧情、哪些线索最该处理；更细的日志和结构化数据都收进下方高级视图。
                 </p>
               </div>
               <div className="flex flex-wrap gap-2">
@@ -4732,31 +5545,777 @@ export function NovelWorkspace() {
                 </Button>
               </div>
             </div>
-            <div className="grid gap-3 md:grid-cols-3">
+            <div className="grid gap-3 md:grid-cols-4">
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">记忆版本</p>
+                <p className="text-xs text-muted-foreground">故事推进</p>
                 <p className="mt-2 text-xl font-semibold text-foreground">
-                  {memory?.version != null && memory.version > 0 ? `v${memory.version}` : "未生成"}
+                  {latestChapterNo ? `第 ${latestChapterNo} 章` : "未开始"}
                 </p>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  {memoryHealth?.latest_chapter_no
-                    ? `最近入账第 ${memoryHealth.latest_chapter_no} 章`
-                    : memory?.created_at || "刷新后会写入最新快照"}
+                  {approvedChapterCount > 0
+                    ? `${approvedChapterCount} 章已审定`
+                    : "先完成首批章节审定"}
                 </p>
               </div>
               <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">活跃待收束线</p>
-                <p className="mt-2 text-xl font-semibold text-foreground">{activeMemoryLines}</p>
-                <p className="mt-1 text-xs text-muted-foreground">跟踪跨章节持续生效的问题</p>
-              </div>
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-muted-foreground">风险信号</p>
+                <p className="text-xs text-muted-foreground">记忆已追到</p>
                 <p className="mt-2 text-xl font-semibold text-foreground">
-                  {memoryHealth ? `${memoryHealth.stale_plots.length} / ${memoryHealth.overdue_plots.length}` : "-"}
+                  {memoryStoryView?.latestNormChapter
+                    ? `第 ${memoryStoryView.latestNormChapter} 章`
+                    : "尚未同步"}
                 </p>
-                <p className="mt-1 text-xs text-muted-foreground">stale / overdue 线索数量</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {memoryStoryView
+                    ? memoryStoryView.memoryLag > 0
+                      ? `比正文落后 ${memoryStoryView.memoryLag} 章`
+                      : "已基本跟上正文进度"
+                    : "刷新记忆后会自动补齐"}
+                </p>
+              </div>
+              <div className="glass-panel-subtle p-4">
+                <p className="text-xs text-muted-foreground">活跃角色</p>
+                <p className="mt-2 text-xl font-semibold text-foreground">
+                  {memoryVisuals?.activeCharacters ?? 0}
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {memoryNorm?.characters.length
+                    ? `共 ${memoryNorm.characters.length} 名已入账人物`
+                    : "角色会在刷新后逐步成型"}
+                </p>
+              </div>
+              <div className="glass-panel-subtle p-4">
+                <p className="text-xs text-muted-foreground">待回收线索</p>
+                <p className="mt-2 text-xl font-semibold text-foreground">{activeMemoryLines}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {memoryVisuals
+                    ? `${memoryVisuals.overdueCount} 条临近超期，${memoryVisuals.staleCount} 条略显停滞`
+                    : "跨章节悬念会集中显示在这里"}
+                </p>
               </div>
             </div>
+
+            {memoryNorm && memoryStoryView && memoryVisuals ? (
+              <>
+              <div className="grid gap-4 xl:grid-cols-[1.08fr_0.92fr]">
+                <div className="signal-surface story-mesh p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div className="space-y-2">
+                      <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
+                        <Sparkles className="size-3.5" />
+                        Story Pulse
+                      </span>
+                      <h3 className="text-2xl font-semibold tracking-tight text-foreground">
+                        先看整体局势，再决定是否深入调整记忆。
+                      </h3>
+                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
+                        {shortenText(memoryStoryView.mainNarrative, 120)}
+                      </p>
+                    </div>
+                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
+                      <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
+                        最近变化
+                      </p>
+                      <p className="mt-2 text-2xl font-semibold text-foreground">
+                        {diffChangeCount(highlightedDiffSummary)}
+                      </p>
+                      <p className="mt-1 text-sm text-foreground/60">
+                        最近一次刷新识别到的结构变化
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_0.9fr]">
+                    <div className="rounded-[1.5rem] border border-border/60 bg-background/60 p-4">
+                      <div className="space-y-3">
+                        <div>
+                          <p className="text-sm font-semibold text-foreground">进度条</p>
+                          <p className="text-[11px] text-muted-foreground">
+                            一眼判断记忆有没有追上正文。
+                          </p>
+                        </div>
+                        <div className="space-y-3">
+                          <div>
+                            <div className="mb-1 flex items-center justify-between text-[11px] text-foreground/60">
+                              <span>已审定章节覆盖</span>
+                              <span>{Math.round(memoryStoryView.freshnessRatio * 100)}%</span>
+                            </div>
+                            <div className="h-2 rounded-full bg-background/75">
+                              <div
+                                className="h-full rounded-full bg-gradient-to-r from-primary via-accent to-cyan-300"
+                                style={{ width: `${Math.max(8, Math.round(memoryStoryView.freshnessRatio * 100))}%` }}
+                              />
+                            </div>
+                          </div>
+                          <div>
+                            <div className="mb-1 flex items-center justify-between text-[11px] text-foreground/60">
+                              <span>正文审定进度</span>
+                              <span>{Math.round(memoryStoryView.draftPressureRatio * 100)}%</span>
+                            </div>
+                            <div className="h-2 rounded-full bg-background/75">
+                              <div
+                                className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-primary to-sky-400"
+                                style={{ width: `${Math.max(8, Math.round(memoryStoryView.draftPressureRatio * 100))}%` }}
+                              />
+                            </div>
+                          </div>
+                        </div>
+                      </div>
+
+                      <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                        <div className="rounded-[1.1rem] border border-border/55 bg-background/68 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.16em] text-foreground/45">
+                            当前建议
+                          </p>
+                          <ul className="mt-2 space-y-2 text-sm text-foreground/72">
+                            {memoryStoryView.nextActions.map((item, index) => (
+                              <li key={`memory-next-${index}`}>- {item}</li>
+                            ))}
+                          </ul>
+                        </div>
+                        <div className="rounded-[1.1rem] border border-border/55 bg-background/68 p-3">
+                          <p className="text-[11px] uppercase tracking-[0.16em] text-foreground/45">
+                            最近章节摘要
+                          </p>
+                          <p className="mt-2 text-sm leading-6 text-foreground/72">
+                            {memoryStoryView.latestFacts
+                              ? shortenText(
+                                  memoryStoryView.latestFacts.key_facts[0] ||
+                                    memoryStoryView.latestFacts.causal_results[0] ||
+                                    memoryStoryView.latestFacts.chapter_title ||
+                                    `第 ${memoryStoryView.latestFacts.chapter_no} 章`,
+                                  78
+                                )
+                              : "最近还没有足够的章节摘要。"}
+                          </p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="rounded-[1.5rem] border border-border/60 bg-background/60 p-4">
+                      <div className="flex items-center justify-between gap-2">
+                        <div>
+                          <p className="text-sm font-semibold text-foreground">最近 8 章走势</p>
+                          <p className="text-[11px] text-muted-foreground">
+                            哪几章信息量高、哪几章埋了更多线索。
+                          </p>
+                        </div>
+                        <span className="glass-chip px-2.5 py-1 text-[11px]">
+                          {memoryStoryView.chapterMoments.length} 章
+                        </span>
+                      </div>
+                      <div className="mt-4 flex min-h-[220px] items-end gap-2">
+                        {memoryStoryView.chapterMoments.map((chapter) => {
+                          const height = Math.max(
+                            24,
+                            Math.round((chapter.signal / memoryStoryView.maxChapterSignal) * 152)
+                          );
+                          return (
+                            <div
+                              key={`chapter-signal-${chapter.chapter_no}`}
+                              className="flex flex-1 flex-col items-center gap-2"
+                            >
+                              <div className="text-[10px] text-foreground/45">
+                                {chapter.signal}
+                              </div>
+                              <div
+                                className="w-full rounded-t-2xl bg-gradient-to-t from-primary via-accent to-cyan-300/85"
+                                style={{ height }}
+                              />
+                              <div className="text-center text-[10px] text-foreground/55">
+                                <div>第{chapter.chapter_no}章</div>
+                                <div>
+                                  +{chapter.open_plots_added.length} / -{chapter.open_plots_resolved.length}
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="glass-panel-subtle space-y-3 p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-semibold text-foreground">线索看板</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        直接按紧急程度看，不必理解底层字段。
+                      </p>
+                    </div>
+                    <span className="glass-chip px-2.5 py-1 text-[11px]">
+                      共 {memoryNorm.open_plots.length} 条
+                    </span>
+                  </div>
+                  <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-1">
+                    {memoryStoryView.plotBuckets.map((bucket) => (
+                      <div
+                        key={`plot-bucket-${bucket.key}`}
+                        className="rounded-[1.25rem] border border-border/60 bg-background/60 p-4"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <p className="text-sm font-semibold text-foreground">
+                              {bucket.title}
+                            </p>
+                            <p className="text-[11px] text-muted-foreground">
+                              {bucket.hint}
+                            </p>
+                          </div>
+                          <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                            {bucket.items.length}
+                          </span>
+                        </div>
+                        {bucket.items.length > 0 ? (
+                          <div className="mt-3 space-y-2">
+                            {bucket.items.map((plot) => (
+                              <div
+                                key={`plot-card-${bucket.key}-${plot.body}`}
+                                className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                              >
+                                <div className="flex flex-wrap items-center justify-between gap-2">
+                                  <span className="rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary">
+                                    {plot.plot_type || "线索"}
+                                  </span>
+                                  <span className="text-[11px] text-foreground/55">
+                                    优先级 {plot.priority ?? 0}
+                                  </span>
+                                </div>
+                                <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                  {shortenText(formatMemoryPlotLine(plot), 84)}
+                                </p>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="mt-3 text-sm text-foreground/55">当前没有这一类线索。</p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-4 xl:grid-cols-2">
+                <div className="signal-surface p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-semibold text-foreground">能力面板</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        直接分成核心、支援、受限三类，不用自己读字段。
+                      </p>
+                    </div>
+                    <span className="glass-chip px-2.5 py-1 text-[11px]">
+                      活跃 {memoryVisuals.activeSkills} / 共 {memoryNorm.skills.length}
+                    </span>
+                  </div>
+                  {memoryNorm.skills.length > 0 ? (
+                    <div className="mt-4 grid gap-3">
+                      {[
+                        ["core", "核心能力", "这批技能决定当前主角或核心角色的上限"],
+                        ["support", "支援能力", "常用但不一定决定胜负，偏日常或辅助推进"],
+                        ["restricted", "受限能力", "目前受伤、封印、失效或暂时不宜直接调用"],
+                      ].map(([key, title, hint]) => {
+                        const items = memoryStoryView.skillGroups[
+                          key as keyof typeof memoryStoryView.skillGroups
+                        ];
+                        return (
+                          <div
+                            key={`skill-group-${key}`}
+                            className="rounded-[1.2rem] border border-border/60 bg-background/62 p-4"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div>
+                                <p className="text-sm font-semibold text-foreground">{title}</p>
+                                <p className="text-[11px] text-muted-foreground">{hint}</p>
+                              </div>
+                              <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                                {items.length}
+                              </span>
+                            </div>
+                            {items.length > 0 ? (
+                              <div className="mt-3 grid gap-3">
+                                {items.map((skill) => {
+                                  const summary = summarizeDetail(skill.detail, 72);
+                                  const owner =
+                                    typeof skill.detail?.["owner"] === "string"
+                                      ? String(skill.detail["owner"]).trim()
+                                      : "";
+                                  return (
+                                    <div
+                                      key={`skill-card-${key}-${skill.id || skill.name}`}
+                                      className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                                    >
+                                      <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <p className="text-sm font-semibold text-foreground">
+                                          {skill.name}
+                                        </p>
+                                        <span className="text-[11px] text-foreground/55">
+                                          热度 {skill.influence_score ?? 0}
+                                        </span>
+                                      </div>
+                                      <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                        {summary || "已入账，但暂时没有更多可展示的说明。"}
+                                      </p>
+                                      <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
+                                        {skill.aliases?.length ? (
+                                          <span>别名：{skill.aliases.slice(0, 2).join(" / ")}</span>
+                                        ) : null}
+                                        {owner ? <span>归属：{owner}</span> : null}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <p className="mt-3 text-sm text-foreground/55">当前没有落在这一类的技能。</p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="mt-4 text-sm text-foreground/60">当前还没有可展示的技能。</p>
+                  )}
+                </div>
+
+                <div className="signal-surface p-4">
+                  <div className="flex items-center justify-between gap-2">
+                    <div>
+                      <p className="text-sm font-semibold text-foreground">关键道具面板</p>
+                      <p className="text-[11px] text-muted-foreground">
+                        分成随身、剧情触发、已离场三类，更接近创作时的直觉。
+                      </p>
+                    </div>
+                    <span className="glass-chip px-2.5 py-1 text-[11px]">
+                      活跃 {memoryVisuals.activeInventory} / 共 {memoryNorm.inventory.length}
+                    </span>
+                  </div>
+                  {memoryNorm.inventory.length > 0 ? (
+                    <div className="mt-4 grid gap-3">
+                      {[
+                        ["carried", "随身关键物", "当前还在角色手里，后续随时可能再次使用"],
+                        ["quest", "剧情触发物", "更像钥匙、证据、信物或推进剧情的开关"],
+                        ["lost", "已离场道具", "已经遗失、损毁、交出或暂时失去作用"],
+                      ].map(([key, title, hint]) => {
+                        const items = memoryStoryView.itemGroups[
+                          key as keyof typeof memoryStoryView.itemGroups
+                        ];
+                        return (
+                          <div
+                            key={`item-group-${key}`}
+                            className="rounded-[1.2rem] border border-border/60 bg-background/62 p-4"
+                          >
+                            <div className="flex items-center justify-between gap-2">
+                              <div>
+                                <p className="text-sm font-semibold text-foreground">{title}</p>
+                                <p className="text-[11px] text-muted-foreground">{hint}</p>
+                              </div>
+                              <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                                {items.length}
+                              </span>
+                            </div>
+                            {items.length > 0 ? (
+                              <div className="mt-3 grid gap-3">
+                                {items.map((item) => {
+                                  const summary = summarizeDetail(item.detail, 72);
+                                  const holder =
+                                    typeof item.detail?.["holder"] === "string"
+                                      ? String(item.detail["holder"]).trim()
+                                      : "";
+                                  return (
+                                    <div
+                                      key={`inventory-card-${key}-${item.id || item.label}`}
+                                      className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                                    >
+                                      <div className="flex flex-wrap items-center justify-between gap-2">
+                                        <p className="text-sm font-semibold text-foreground">
+                                          {item.label}
+                                        </p>
+                                        <span className="text-[11px] text-foreground/55">
+                                          重要度 {item.influence_score ?? 0}
+                                        </span>
+                                      </div>
+                                      <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                        {summary || "已登记为关键物品，后续剧情可能继续调用。"}
+                                      </p>
+                                      <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
+                                        {item.aliases?.length ? (
+                                          <span>别名：{item.aliases.slice(0, 2).join(" / ")}</span>
+                                        ) : null}
+                                        {holder ? <span>持有者：{holder}</span> : null}
+                                      </div>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            ) : (
+                              <p className="mt-3 text-sm text-foreground/55">当前没有落在这一类的道具。</p>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <p className="mt-4 text-sm text-foreground/60">当前还没有可展示的关键道具。</p>
+                  )}
+                </div>
+              </div>
+              </>
+            ) : null}
+
+            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+              <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
+                高级视图：更新审计与结构化差异
+                <span className="ml-2 text-[11px] font-normal text-muted-foreground">
+                  需要排查记忆刷新问题时再展开
+                </span>
+              </summary>
+              <div className="mt-4 grid gap-4 xl:grid-cols-[1.05fr_0.95fr]">
+                <div className="glass-panel-subtle space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">更新记录</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      把 delta、真源写入和派生层同步拆开看，定位卡点更快。
+                    </p>
+                  </div>
+                  <span className="glass-chip px-2.5 py-1 text-[11px]">
+                    最近 {memoryUpdateRuns.length}
+                  </span>
+                </div>
+                {memoryUpdateRuns.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">暂无记忆更新 run。</p>
+                ) : (
+                  <div className="space-y-2">
+                    {memoryUpdateRuns.slice(0, 6).map((run) => (
+                      <div
+                        key={run.id}
+                        className="rounded-[1.2rem] border border-border/60 bg-background/60 p-3"
+                      >
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span
+                              className={`rounded-full border px-2.5 py-1 text-[11px] font-semibold ${memoryRunStatusTone(run.status)}`}
+                            >
+                              {run.status}
+                            </span>
+                            <span className="text-xs font-semibold text-foreground/80">
+                              {run.source}
+                              {run.chapter_no ? ` · 第 ${run.chapter_no} 章` : ""}
+                            </span>
+                          </div>
+                          <span className="text-[11px] text-muted-foreground">
+                            {formatDateTimeLabel(run.created_at)}
+                          </span>
+                        </div>
+                        <div className="mt-2 grid gap-2 md:grid-cols-5">
+                          {[
+                            ["delta", run.delta_status],
+                            ["validation", run.validation_status],
+                            ["norm", run.norm_status],
+                            ["snapshot", run.snapshot_status],
+                            ["assets", `${run.story_bible_status}/${run.rag_status}`],
+                          ].map(([label, value]) => (
+                            <div
+                              key={`${run.id}-${label}`}
+                              className="rounded-xl border border-border/50 bg-background/65 px-2.5 py-2"
+                            >
+                              <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/45">
+                                {label}
+                              </p>
+                              <p className="mt-1 text-xs font-semibold text-foreground/80">
+                                {value || "--"}
+                              </p>
+                            </div>
+                          ))}
+                        </div>
+                        <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-muted-foreground">
+                          <span>v{run.base_memory_version} → v{run.target_memory_version || run.base_memory_version}</span>
+                          <span>阶段：{run.current_stage || "queued"}</span>
+                          {diffChapterNos(run.diff_summary).length > 0 ? (
+                            <span>来源章：{diffChapterNos(run.diff_summary).join(" / ")}</span>
+                          ) : null}
+                        </div>
+                        {run.warnings && run.warnings.length > 0 ? (
+                          <p className="mt-2 text-[11px] text-amber-600 dark:text-amber-300">
+                            Warning: {run.warnings.slice(0, 2).join("；")}
+                          </p>
+                        ) : null}
+                        {run.errors && run.errors.length > 0 ? (
+                          <p className="mt-2 text-[11px] text-rose-600 dark:text-rose-300">
+                            Error: {run.errors.slice(0, 2).join("；")}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+                </div>
+
+                <div className="glass-panel-subtle space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">结构化变更</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      当前高亮最近一次刷新或当前候选，避免直接翻整包 JSON。
+                    </p>
+                  </div>
+                  <span className="glass-chip px-2.5 py-1 text-[11px]">
+                    变更 {diffChangeCount(highlightedDiffSummary)}
+                  </span>
+                </div>
+                {!highlightedDiffSummary ? (
+                  <p className="text-xs text-muted-foreground">暂无结构化 diff。</p>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="flex flex-wrap gap-2">
+                      {diffChangedTypes(highlightedDiffSummary).length > 0 ? (
+                        diffChangedTypes(highlightedDiffSummary).map((item) => (
+                          <span
+                            key={`changed-type-${item}`}
+                            className="rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary"
+                          >
+                            {item}
+                          </span>
+                        ))
+                      ) : (
+                        <span className="text-xs text-muted-foreground">没有显著结构变化</span>
+                      )}
+                    </div>
+                    {(
+                      [
+                        ["characters", highlightedDiffSummary.characters],
+                        ["inventory", highlightedDiffSummary.inventory],
+                        ["skills", highlightedDiffSummary.skills],
+                        ["relations", highlightedDiffSummary.relations],
+                        ["open_plots", highlightedDiffSummary.open_plots],
+                        ["chapters", highlightedDiffSummary.chapters],
+                      ] as const
+                    ).map(([label, section]) => {
+                      const counts =
+                        section && typeof section === "object" && "counts" in section
+                          ? (section as { counts?: Record<string, unknown> }).counts
+                          : null;
+                      const added =
+                        section && typeof section === "object" && "added" in section
+                          ? ((section as { added?: unknown[] }).added ?? [])
+                          : [];
+                      const changed =
+                        section && typeof section === "object" && "changed" in section
+                          ? ((section as { changed?: unknown[] }).changed ?? [])
+                          : [];
+                      if (!counts && added.length === 0 && changed.length === 0) return null;
+                      return (
+                        <div
+                          key={`diff-${label}`}
+                          className="rounded-[1.1rem] border border-border/60 bg-background/60 p-3"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <p className="text-xs font-semibold text-foreground/80">{label}</p>
+                            <span className="text-[11px] text-muted-foreground">
+                              {counts
+                                ? Object.entries(counts)
+                                    .map(([k, v]) => `${k}:${v}`)
+                                    .join(" · ")
+                                : `${added.length} added · ${changed.length} changed`}
+                            </span>
+                          </div>
+                          {added.length > 0 ? (
+                            <div className="mt-2 flex flex-wrap gap-2">
+                              {added.slice(0, 4).map((item, index) => (
+                                <span
+                                  key={`diff-${label}-added-${index}`}
+                                  className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-700 dark:text-emerald-300"
+                                >
+                                  {shortenText(
+                                    typeof item === "object" && item && "label" in (item as Record<string, unknown>)
+                                      ? String((item as Record<string, unknown>).label)
+                                      : safeJsonStringify(item),
+                                    32
+                                  )}
+                                </span>
+                              ))}
+                            </div>
+                          ) : null}
+                          {changed.length > 0 ? (
+                            <ul className="mt-2 space-y-1 text-[11px] text-muted-foreground">
+                              {changed.slice(0, 3).map((item, index) => {
+                                const row = item as Record<string, unknown>;
+                                const name = typeof row.label === "string" ? row.label : `#${index + 1}`;
+                                const fields = Array.isArray(row.fields)
+                                  ? row.fields.map((field) => String(field)).join(" / ")
+                                  : "字段变更";
+                                return <li key={`diff-${label}-changed-${index}`}>- {name}：{fields}</li>;
+                              })}
+                            </ul>
+                          ) : null}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+                </div>
+              </div>
+            </details>
+
+            {memoryNorm?.chapters?.length ? (
+              <div className="glass-panel-subtle space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">章节演化时间线</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      按章回看“发生了什么变化”，方便快速恢复剧情上下文。
+                    </p>
+                  </div>
+                  <span className="glass-chip px-2.5 py-1 text-[11px]">
+                    最近 {Math.min(6, memoryNorm.chapters.length)} 章
+                  </span>
+                </div>
+                <div className="grid gap-3 lg:grid-cols-3">
+                  {[...memoryNorm.chapters]
+                    .sort((a, b) => b.chapter_no - a.chapter_no)
+                    .slice(0, 6)
+                    .map((chapter) => (
+                      <div
+                        key={`timeline-${chapter.chapter_no}`}
+                        className="rounded-[1.25rem] border border-border/60 bg-background/60 p-4"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-sm font-semibold text-foreground">
+                            第{chapter.chapter_no}章
+                          </p>
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            className="h-7 px-2 text-[11px]"
+                            onClick={() =>
+                              openNormDetail(`第${chapter.chapter_no}章 · 分章脉络`, chapter)
+                            }
+                          >
+                            展开
+                          </Button>
+                        </div>
+                        <p className="mt-1 line-clamp-1 text-[11px] text-muted-foreground">
+                          {chapter.chapter_title || "未命名章节"}
+                        </p>
+                        <div className="mt-3 space-y-2 text-[11px] text-foreground/70">
+                          <p>关键事实：{chapter.key_facts.slice(0, 2).join("；") || "暂无"}</p>
+                          <p>因果结果：{chapter.causal_results.slice(0, 2).join("；") || "暂无"}</p>
+                          <p>
+                            埋线变化：+{chapter.open_plots_added.length} / -{chapter.open_plots_resolved.length}
+                          </p>
+                          {chapter.unresolved_hooks?.length ? (
+                            <p>未收钩子：{chapter.unresolved_hooks.slice(0, 2).join("；")}</p>
+                          ) : null}
+                        </div>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            ) : null}
+
+            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+              <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
+                高级视图：Story Bible 与 RAG 派生层
+                <span className="ml-2 text-[11px] font-normal text-muted-foreground">
+                  主要用于确认派生层是否跟上真源
+                </span>
+              </summary>
+              <div className="mt-4 grid gap-4 xl:grid-cols-2">
+              <div className="glass-panel-subtle space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">Story Bible 只读视图</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      直接看最新快照里的实体与事实，检查派生层是否跟上了真源。
+                    </p>
+                  </div>
+                  <span className="glass-chip px-2.5 py-1 text-[11px]">
+                    {storyBibleSnapshot ? `v${storyBibleSnapshot.version}` : "暂无"}
+                  </span>
+                </div>
+                {!storyBibleSnapshot ? (
+                  <p className="text-xs text-muted-foreground">暂无 Story Bible 快照。</p>
+                ) : (
+                  <div className="space-y-3">
+                    <div className="grid gap-3 sm:grid-cols-3">
+                      {Object.entries(storyBibleSnapshot.stats || {}).slice(0, 3).map(([key, value]) => (
+                        <div
+                          key={`story-bible-stat-${key}`}
+                          className="rounded-xl border border-border/50 bg-background/65 p-3"
+                        >
+                          <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/45">
+                            {key}
+                          </p>
+                          <p className="mt-1 text-sm font-semibold text-foreground">{String(value)}</p>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="space-y-2">
+                      {(storyBibleSnapshot.entities || []).slice(0, 6).map((entity, index) => (
+                        <div
+                          key={`story-entity-${index}`}
+                          className="rounded-[1.1rem] border border-border/55 bg-background/60 p-3"
+                        >
+                          <p className="text-xs font-semibold text-foreground">
+                            {String(entity.canonical_name || "未命名实体")}
+                          </p>
+                          <p className="mt-1 text-[11px] text-muted-foreground">
+                            {String(entity.entity_type || "entity")} · {String(entity.status || "unknown")}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              <div className="glass-panel-subtle space-y-3 p-4">
+                <div className="flex items-center justify-between gap-2">
+                  <div>
+                    <p className="text-sm font-semibold text-foreground">RAG 索引视图</p>
+                    <p className="text-[11px] text-muted-foreground">
+                      看已入索引文档和 chunk 数，结合检索日志判断索引是否新鲜。
+                    </p>
+                  </div>
+                  <span className="glass-chip px-2.5 py-1 text-[11px]">
+                    文档 {retrievalIndexDocs.length}
+                  </span>
+                </div>
+                {retrievalIndexDocs.length === 0 ? (
+                  <p className="text-xs text-muted-foreground">暂无检索索引文档。</p>
+                ) : (
+                  <div className="space-y-2">
+                    {retrievalIndexDocs.slice(0, 6).map((doc) => (
+                      <div
+                        key={doc.id}
+                        className="rounded-[1.1rem] border border-border/55 bg-background/60 p-3"
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <p className="text-xs font-semibold text-foreground">
+                            {doc.title || doc.source_id || doc.id}
+                          </p>
+                          <span className="text-[11px] text-muted-foreground">
+                            {doc.chunk_count} chunks
+                          </span>
+                        </div>
+                        <p className="mt-1 text-[11px] text-muted-foreground">
+                          {doc.source_type} · {formatDateTimeLabel(doc.updated_at)}
+                        </p>
+                        {doc.summary ? (
+                          <p className="mt-2 line-clamp-2 text-[11px] text-foreground/70">
+                            {doc.summary}
+                          </p>
+                        ) : null}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+              </div>
+            </details>
 
             {memoryNorm && memoryVisuals ? (
               <div className="grid gap-4 xl:grid-cols-[1.06fr_0.94fr]">
@@ -4765,13 +6324,13 @@ export function NovelWorkspace() {
                     <div className="space-y-2">
                       <span className="glass-chip border-primary/25 bg-primary/10 text-primary">
                         <Sparkles className="size-3.5" />
-                        Memory Atlas
+                        Character Web
                       </span>
                       <h3 className="text-2xl font-semibold tracking-tight text-foreground">
-                        把角色、关系和线索放回同一张记忆星图。
+                        把人物关系直接画出来，而不是堆成一排列表。
                       </h3>
                       <p className="max-w-2xl text-sm leading-7 text-foreground/68">
-                        先看谁最活跃、哪条线最危险，再决定要不要往下钻进结构化明细。
+                        谁最活跃、谁和谁绑定最深、当前故事重心落在哪几个人身上，这里一眼就能看懂。
                       </p>
                     </div>
                     <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
@@ -4794,6 +6353,28 @@ export function NovelWorkspace() {
                         className="pointer-events-none absolute inset-0 h-full w-full"
                         aria-hidden="true"
                       >
+                        {memoryVisuals.networkRelations.map((relation, index) => {
+                          const fromIndex = memoryVisuals.topCharacters.findIndex(
+                            (character) => character.name === relation.from
+                          );
+                          const toIndex = memoryVisuals.topCharacters.findIndex(
+                            (character) => character.name === relation.to
+                          );
+                          if (fromIndex < 0 || toIndex < 0) return null;
+                          const fromPoint = MEMORY_ATLAS_POINTS[fromIndex];
+                          const toPoint = MEMORY_ATLAS_POINTS[toIndex];
+                          return (
+                            <line
+                              key={`relation-line-${index}-${relation.from}-${relation.to}`}
+                              x1={Number.parseFloat(fromPoint.left)}
+                              y1={Number.parseFloat(fromPoint.top)}
+                              x2={Number.parseFloat(toPoint.left)}
+                              y2={Number.parseFloat(toPoint.top)}
+                              stroke="hsl(var(--accent) / 0.42)"
+                              strokeWidth="0.9"
+                            />
+                          );
+                        })}
                         {MEMORY_ATLAS_POINTS.slice(0, 6).map((point, index) => {
                           const next = MEMORY_ATLAS_POINTS[(index + 1) % 6];
                           return (
@@ -4811,6 +6392,17 @@ export function NovelWorkspace() {
                         <circle cx="50" cy="50" r="28" fill="none" stroke="hsl(var(--primary) / 0.15)" />
                         <circle cx="50" cy="50" r="18" fill="none" stroke="hsl(var(--accent) / 0.15)" />
                       </svg>
+
+                      <div className="absolute left-1/2 top-1/2 flex h-24 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-primary/20 bg-background/80 text-center shadow-[0_18px_40px_rgba(15,23,42,0.12)] backdrop-blur-xl">
+                        <div className="px-3">
+                          <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/40">
+                            故事核心
+                          </p>
+                          <p className="mt-1 text-xs font-semibold text-foreground">
+                            {shortenText(titleDraft.trim() || String(novel?.title || "本书"), 10)}
+                          </p>
+                        </div>
+                      </div>
 
                       {memoryVisuals.topCharacters.map((character, index) => {
                         const point = MEMORY_ATLAS_POINTS[index];
@@ -4853,7 +6445,7 @@ export function NovelWorkspace() {
                         {[
                           ["人物", `${memoryNorm.characters.length}`, `${memoryVisuals.activeCharacters} 名活跃中`],
                           ["关系", `${memoryNorm.relations.length}`, memoryVisuals.topRelations.length > 0 ? "已提炼人物脉络" : "等待关系沉淀"],
-                          ["线索风险", `${memoryVisuals.staleCount + memoryVisuals.overdueCount}`, `${memoryVisuals.staleCount} stale / ${memoryVisuals.overdueCount} overdue`],
+                          ["故事重压", `${memoryVisuals.staleCount + memoryVisuals.overdueCount}`, `${memoryVisuals.staleCount} 条停滞 / ${memoryVisuals.overdueCount} 条紧急`],
                         ].map(([label, value, hint]) => (
                           <div key={label} className="rounded-[1.2rem] border border-border/60 bg-background/64 px-4 py-3">
                             <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
@@ -4902,33 +6494,31 @@ export function NovelWorkspace() {
                   <div className="signal-surface p-4">
                     <div className="flex items-center gap-2">
                       <Brain className="size-4 text-primary" />
-                      <p className="text-sm font-semibold text-foreground">待收束线雷达</p>
+                      <p className="text-sm font-semibold text-foreground">角色热度榜</p>
                     </div>
-                    {memoryVisuals.topOpenPlots.length > 0 ? (
+                    {memoryVisuals.topCharacters.length > 0 ? (
                       <div className="mt-4 space-y-3">
-                        {memoryVisuals.topOpenPlots.map((plot, index) => {
-                          const progress =
-                            plot.estimated_duration && plot.introduced_chapter != null && plot.last_touched_chapter != null
-                              ? clamp01(
-                                  (plot.last_touched_chapter - plot.introduced_chapter + 1) /
-                                    Math.max(1, plot.estimated_duration)
-                                )
-                              : clamp01((plot.priority || 0) / 5);
+                        {memoryVisuals.topCharacters.map((character, index) => {
+                          const progress = clamp01(
+                            character.influence_score / memoryVisuals.maxInfluence
+                          );
                           return (
                             <div
-                              key={`plot-radar-${index}-${plot.body}`}
+                              key={`character-heat-${index}-${character.name}`}
                               className="rounded-[1.3rem] border border-border/60 bg-background/62 p-4"
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
                                 <span className="rounded-full border border-border/70 bg-background/74 px-3 py-1 text-[11px] font-semibold text-foreground/58">
-                                  {plot.plot_type || "Open Plot"}
+                                  {character.role || "角色"}
                                 </span>
                                 <span className="text-[11px] font-semibold text-foreground/56">
-                                  Priority {plot.priority ?? 0}
+                                  热度 {character.influence_score}
                                 </span>
                               </div>
                               <p className="mt-3 text-sm leading-7 text-foreground/72">
-                                {shortenText(formatMemoryPlotLine(plot), 92)}
+                                {character.status
+                                  ? `${character.name} · ${shortenText(character.status, 48)}`
+                                  : character.name}
                               </p>
                               <div className="mt-3 h-2 rounded-full bg-background/70">
                                 <div
@@ -4937,27 +6527,35 @@ export function NovelWorkspace() {
                                 />
                               </div>
                               <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
-                                {plot.introduced_chapter != null ? (
-                                  <span>引入于第 {plot.introduced_chapter} 章</span>
+                                {character.traits?.length ? (
+                                  <span>
+                                    特征：{character.traits.slice(0, 2).map((item) => String(item)).join(" / ")}
+                                  </span>
                                 ) : null}
-                                {plot.last_touched_chapter != null ? (
-                                  <span>最近触达第 {plot.last_touched_chapter} 章</span>
+                                {character.aliases?.length ? (
+                                  <span>别名：{character.aliases.slice(0, 2).join(" / ")}</span>
                                 ) : null}
-                                {plot.resolve_when ? <span>{plot.resolve_when}</span> : null}
                               </div>
                             </div>
                           );
                         })}
                       </div>
                     ) : (
-                      <p className="mt-4 text-sm text-foreground/60">当前没有待收束线。</p>
+                      <p className="mt-4 text-sm text-foreground/60">当前还没有形成稳定角色热度。</p>
                     )}
                   </div>
                 </div>
               </div>
             ) : null}
 
-            <div className="glass-panel-subtle space-y-3 p-4">
+            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+              <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
+                高级视图：结构化记忆真源与人工精修
+                <span className="ml-2 text-[11px] font-normal text-muted-foreground">
+                  适合排查和手动修补，不建议普通创作时频繁使用
+                </span>
+              </summary>
+              <div className="mt-4 glass-panel-subtle space-y-3 p-4">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <p className="text-sm font-medium">结构化记忆（分表）</p>
                 <span className="glass-chip px-2.5 py-1 text-[11px]">
@@ -5087,9 +6685,12 @@ export function NovelWorkspace() {
                               const globalIdx = page * STRUCTURED_LIST_PAGE + i + 1;
                               let preview = "";
                               if (typeof x === "object" && x !== null) {
-                                const obj = x as any;
+                                const obj = x as Record<string, unknown>;
                                 const iid = obj.id;
-                                const body = obj.body || JSON.stringify(obj);
+                                const body =
+                                  typeof obj.body === "string" && obj.body.trim()
+                                    ? obj.body
+                                    : JSON.stringify(obj);
                                 preview = iid ? `[${iid}] ${body}` : body;
                               } else {
                                 preview = String(x);
@@ -5576,22 +7177,47 @@ export function NovelWorkspace() {
                   ) : null}
                 </div>
               )}
-            </div>
+              </div>
+            </details>
             {memoryRefreshPreview ? (
               <div className="space-y-3 rounded-[1.4rem] border border-amber-500/30 bg-amber-500/5 p-4">
                 <div className="space-y-1">
                   <p className="text-sm font-medium text-amber-400">
                     {memoryRefreshPreview.tier === "blocked"
                       ? "这版候选记忆先帮你拦下来了"
-                      : "这版候选记忆建议你先看一眼"}
+                      : memoryRefreshPreview.applied
+                        ? "这次刷新已经落库，但建议你先看一下 warning"
+                        : "这版候选记忆建议你先看一眼"}
                   </p>
                   <p className="text-xs text-muted-foreground">
-                    当前仍保留生效版本 v{memoryRefreshPreview.currentVersion}。
+                    当前基线版本 v{memoryRefreshPreview.currentVersion}。
                     {memoryRefreshPreview.tier === "blocked"
                       ? " 系统判断这版改动风险过高，所以没有直接覆盖。"
-                      : " 这些改动更像是合理压缩或清理，是否替换由你决定。"}
+                      : memoryRefreshPreview.applied
+                        ? " 这次 warning 不会阻断写入，但建议你检查结构化差异与来源章节。"
+                        : " 这些改动更像是合理压缩或清理，是否替换由你决定。"}
                   </p>
                 </div>
+                {memoryRefreshPreview.diffSummary ? (
+                  <div className="list-card border-amber-500/20 p-3">
+                    <p className="mb-2 text-xs font-medium text-foreground">结构化差异摘要</p>
+                    <div className="flex flex-wrap gap-2">
+                      {diffChangedTypes(memoryRefreshPreview.diffSummary).map((item) => (
+                        <span
+                          key={`preview-diff-${item}`}
+                          className="rounded-full border border-amber-500/20 bg-amber-500/10 px-2 py-1 text-[11px] text-amber-700 dark:text-amber-300"
+                        >
+                          {item}
+                        </span>
+                      ))}
+                      {diffChapterNos(memoryRefreshPreview.diffSummary).length > 0 ? (
+                        <span className="rounded-full border border-border/60 bg-background/60 px-2 py-1 text-[11px] text-muted-foreground">
+                          来源章：{diffChapterNos(memoryRefreshPreview.diffSummary).join(" / ")}
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : null}
                 {memoryRefreshPreview.errors.length > 0 ? (
                   <div className="list-card border-amber-500/20 p-3">
                     <p className="mb-2 text-xs font-medium text-foreground">需要先处理的问题</p>
@@ -5633,7 +7259,9 @@ export function NovelWorkspace() {
                   >
                     先看候选版本
                   </Button>
-                  {memoryRefreshPreview.tier === "warning" ? (
+                  {memoryRefreshPreview.tier === "warning" &&
+                  !memoryRefreshPreview.applied &&
+                  memoryRefreshPreview.confirmationToken ? (
                     <>
                       <Button
                         type="button"
@@ -5892,18 +7520,9 @@ export function NovelWorkspace() {
               <div className="grid grid-cols-2 gap-2">
                 <Button
                   type="button"
-                  variant="outline"
-                  className="font-semibold"
-                  disabled={busy || volumeBusy}
-                  onClick={() => confirmGenerateVolumes()}
-                >
-                  生成卷
-                </Button>
-                <Button
-                  type="button"
                   className="font-bold"
                   disabled={busy || volumeBusy || !selectedVolumeId}
-                  onClick={() => confirmGenerateVolumePlan(false)}
+                  onClick={() => confirmGenerateVolumePlan()}
                 >
                   下一批计划
                 </Button>
@@ -6323,6 +7942,130 @@ export function NovelWorkspace() {
         </DialogContent>
       </Dialog>
 
+      <Dialog open={Boolean(memoryEditor)} onOpenChange={(open) => !open && closeMemoryEditor()}>
+        <DialogContent className="max-h-[85vh] max-w-xl overflow-y-auto text-foreground">
+          <DialogHeader>
+            <DialogTitle>{memoryEditor?.title || "结构化记忆编辑"}</DialogTitle>
+            <DialogDescription>{memoryEditor?.subtitle || "编辑结构化记忆。"}</DialogDescription>
+          </DialogHeader>
+          {memoryEditor ? (
+            memoryEditor.mode === "delete" ? (
+              <div className="rounded-[1.2rem] border border-amber-500/20 bg-amber-500/5 p-4 text-sm leading-6 text-foreground/75">
+                {memoryEditor.kind === "character"
+                  ? `将人物「${memoryEditor.name}」标记为退场。`
+                  : memoryEditor.kind === "relation"
+                    ? `将关系「${memoryEditor.from} → ${memoryEditor.to}」标记为失效。`
+                    : memoryEditor.kind === "skill"
+                      ? `删除技能「${memoryEditor.name}」。`
+                      : `删除物品「${memoryEditor.label}」。`}
+              </div>
+            ) : (
+              <div className="space-y-4 py-2">
+                {memoryEditor.kind === "character" ? (
+                  <>
+                    <div className="space-y-2">
+                      <Label>人物主名</Label>
+                      <Input value={memoryEditor.name} onChange={(e) => setMemoryEditor({ ...memoryEditor, name: e.target.value })} />
+                    </div>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label>人物角色</Label>
+                        <Input value={memoryEditor.role} onChange={(e) => setMemoryEditor({ ...memoryEditor, role: e.target.value })} />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>人物状态</Label>
+                        <Input value={memoryEditor.status} onChange={(e) => setMemoryEditor({ ...memoryEditor, status: e.target.value })} />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>人物特征</Label>
+                      <Textarea value={memoryEditor.traits} onChange={(e) => setMemoryEditor({ ...memoryEditor, traits: e.target.value })} placeholder="可用逗号或换行分隔" />
+                    </div>
+                  </>
+                ) : null}
+                {memoryEditor.kind === "relation" ? (
+                  <>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <div className="space-y-2">
+                        <Label>起点人物</Label>
+                        <Input value={memoryEditor.from} onChange={(e) => setMemoryEditor({ ...memoryEditor, from: e.target.value })} />
+                      </div>
+                      <div className="space-y-2">
+                        <Label>终点人物</Label>
+                        <Input value={memoryEditor.to} onChange={(e) => setMemoryEditor({ ...memoryEditor, to: e.target.value })} />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <Label>关系描述</Label>
+                      <Textarea value={memoryEditor.relation} onChange={(e) => setMemoryEditor({ ...memoryEditor, relation: e.target.value })} />
+                    </div>
+                  </>
+                ) : null}
+                {memoryEditor.kind === "skill" ? (
+                  <>
+                    <div className="space-y-2">
+                      <Label>技能名称</Label>
+                      <Input value={memoryEditor.name} onChange={(e) => setMemoryEditor({ ...memoryEditor, name: e.target.value })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>技能描述</Label>
+                      <Textarea value={memoryEditor.description} onChange={(e) => setMemoryEditor({ ...memoryEditor, description: e.target.value })} />
+                    </div>
+                  </>
+                ) : null}
+                {memoryEditor.kind === "item" ? (
+                  <>
+                    <div className="space-y-2">
+                      <Label>物品名称</Label>
+                      <Input value={memoryEditor.label} onChange={(e) => setMemoryEditor({ ...memoryEditor, label: e.target.value })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>持有人</Label>
+                      <Input value={memoryEditor.owner} onChange={(e) => setMemoryEditor({ ...memoryEditor, owner: e.target.value })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>物品描述</Label>
+                      <Textarea value={memoryEditor.description} onChange={(e) => setMemoryEditor({ ...memoryEditor, description: e.target.value })} />
+                    </div>
+                  </>
+                ) : null}
+                {memoryEditor.kind !== "relation" ? (
+                  <div className="grid gap-4 sm:grid-cols-2">
+                    <div className="space-y-2">
+                      <Label>影响力</Label>
+                      <Input type="number" min={0} max={100} value={memoryEditor.influence} onChange={(e) => setMemoryEditor({ ...memoryEditor, influence: e.target.value })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>当前状态</Label>
+                      <div className="flex gap-2">
+                        <Button type="button" size="sm" variant={memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: true })}>活跃</Button>
+                        <Button type="button" size="sm" variant={!memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: false })}>非活跃</Button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="space-y-2">
+                    <Label>关系状态</Label>
+                    <div className="flex gap-2">
+                      <Button type="button" size="sm" variant={memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: true })}>生效</Button>
+                      <Button type="button" size="sm" variant={!memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: false })}>失效</Button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )
+          ) : null}
+          <DialogFooter>
+            <Button type="button" variant="outline" onClick={closeMemoryEditor} disabled={memoryEditorBusy}>
+              取消
+            </Button>
+            <Button type="button" onClick={() => void submitMemoryEditor()} disabled={memoryEditorBusy}>
+              {memoryEditorBusy ? "处理中..." : memoryEditor?.confirmLabel || "确认"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
       <Dialog open={normDetailOpen} onOpenChange={setNormDetailOpen}>
         <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto text-foreground">
           <DialogHeader>
@@ -6371,12 +8114,31 @@ export function NovelWorkspace() {
                     <div className="flex items-center gap-2">
                       <span className="font-bold text-primary">v{item.version}</span>
                       <span className="text-[10px] text-muted-foreground">
-                        {item.created_at ? new Date(item.created_at).toLocaleString() : "-"}
+                        {item.created_at
+                          ? parseBackendUtcIso(item.created_at).toLocaleString("zh-CN", {
+                              timeZone: "Asia/Shanghai",
+                            })
+                          : "-"}
                       </span>
                     </div>
                     <p className="line-clamp-2 text-xs text-muted-foreground">
                       {item.summary || "（无摘要）"}
                     </p>
+                    <div className="flex flex-wrap gap-2 pt-1">
+                      {diffChangedTypes(item.diff_summary).slice(0, 4).map((tag) => (
+                        <span
+                          key={`history-tag-${item.version}-${tag}`}
+                          className="rounded-full border border-primary/15 bg-primary/8 px-2 py-0.5 text-[10px] font-medium text-primary/90"
+                        >
+                          {tag}
+                        </span>
+                      ))}
+                      {item.source_summary?.chapter_nos?.length ? (
+                        <span className="rounded-full border border-border/60 bg-background/70 px-2 py-0.5 text-[10px] text-muted-foreground">
+                          来源章：{item.source_summary.chapter_nos.slice(0, 4).join(" / ")}
+                        </span>
+                      ) : null}
+                    </div>
                   </div>
                   <Button
                     type="button"
@@ -6483,7 +8245,11 @@ export function NovelWorkspace() {
             </Button>
             <Button
               onClick={() => {
-                const opts: any = {};
+                const opts: {
+                  is_full?: boolean;
+                  from_chapter_no?: number;
+                  to_chapter_no?: number;
+                } = {};
                 if (refreshRangeMode === "full") opts.is_full = true;
                 else if (refreshRangeMode === "custom") {
                   opts.from_chapter_no = refreshFromNo;

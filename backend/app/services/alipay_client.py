@@ -74,6 +74,10 @@ class AlipayTradeQueryResult:
     out_trade_no: str
     total_amount: str
     raw: dict[str, Any]
+    code: str = ""
+    msg: str = ""
+    sub_code: str = ""
+    sub_msg: str = ""
 
 
 class AlipayClient:
@@ -211,4 +215,8 @@ class AlipayClient:
             out_trade_no=str(payload.get("out_trade_no") or out_trade_no),
             total_amount=str(payload.get("total_amount") or ""),
             raw=data,
+            code=str(payload.get("code") or ""),
+            msg=str(payload.get("msg") or ""),
+            sub_code=str(payload.get("sub_code") or ""),
+            sub_msg=str(payload.get("sub_msg") or ""),
         )

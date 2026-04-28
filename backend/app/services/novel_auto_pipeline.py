@@ -12,7 +12,8 @@ from typing import Any
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
-from app.models.novel import Novel, NovelMemory
+from app.core.config import settings
+from app.models.novel import Novel, NovelGenerationLog, NovelMemory
 from app.models.writing_style import WritingStyle
 from app.models.volume import NovelChapterPlan, NovelVolume
 from app.services.memory_normalize_sync import (
@@ -26,7 +27,17 @@ from app.services.novel_repo import (
     next_chapter_no_from_approved,
 )
 from app.services.novel_chapter_generate_batch import run_generate_chapters_batch_sync
-from app.services.novel_llm_service import NovelLLMService, _ANTI_AI_FLAVOR_BLOCK
+from app.services.novel_workflow_service import (
+    append_workflow_event,
+    touch_workflow_run_status,
+    upsert_workflow_step,
+)
+from app.services.novel_llm_service import (
+    NovelLLMService,
+    _ANTI_AI_FLAVOR_BLOCK,
+    coerce_novel_outline_base_fields,
+    render_volume_arcs_markdown,
+)
 from app.services.novel_volume_plan_batch import run_volume_chapter_plan_batch_sync
 from app.services.task_cancel import is_cancel_requested
 
@@ -262,6 +273,56 @@ def run_ai_create_and_start_sync(
     if not n:
         raise ValueError("小说不存在")
 
+    def _has_log_event(event: str) -> bool:
+        return (
+            db.query(NovelGenerationLog.id)
+            .filter(
+                NovelGenerationLog.novel_id == novel_id,
+                NovelGenerationLog.batch_id == batch_id,
+                NovelGenerationLog.event == event,
+            )
+            .first()
+        ) is not None
+
+    if _has_log_event("ai_create_failed"):
+        raise ValueError("该 AI 建书批次已失败，请重新发起")
+    if _has_log_event("ai_create_done"):
+        return {
+            "status": "ok",
+            "chapters_generated": 0,
+            "resume_only": True,
+            "skip_task_done_log": True,
+            "message": "该批次已完成，跳过重复执行",
+        }
+    if _has_log_event("ai_create_framework_queued"):
+        return {
+            "status": "ok",
+            "chapters_generated": 0,
+            "resume_only": True,
+            "skip_task_done_log": False,
+            "message": "框架已入队，补齐任务终态",
+        }
+    if _has_log_event("ai_create_brainstorm_done"):
+        from app.tasks.novel_tasks import novel_generate_framework_task
+
+        fw_batch_id = f"fw-gen-{int(time.time())}-{novel_id[:8]}"
+        novel_generate_framework_task.delay(novel_id, billing_user_id, fw_batch_id)
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="ai_create_framework_queued",
+            message="任务恢复：构思已完成，已重新入队大纲框架生成。",
+        )
+        db.commit()
+        return {
+            "status": "ok",
+            "chapters_generated": 0,
+            "resume_only": True,
+            "skip_task_done_log": False,
+            "message": "已恢复入队框架生成",
+        }
+
     if is_cancel_requested(batch_id):
         append_generation_log(
             db,
@@ -331,6 +392,15 @@ def run_ai_create_and_start_sync(
     else:
         length_min, length_max = base_min, base_max
 
+    # 头脑风暴 JSON 的最小信息量：随目标篇幅上浮，避免第一步就过于单薄
+    intro_min_chars = 220
+    bg_min_chars = 420
+    style_min_chars = 36
+    if length_max >= 250 or length_min >= 200:
+        intro_min_chars, bg_min_chars, style_min_chars = 360, 780, 48
+    elif length_max <= 55 or length_min <= 55:
+        intro_min_chars, bg_min_chars, style_min_chars = 180, 300, 28
+
     prompt = (
         "你是一个顶级的网络小说架构师与畅销书策划编辑，擅长构思极具吸引力的书名和宏大且逻辑严密的设定。\n"
         f"用户提供的题材/风格标签：{styles_text}\n"
@@ -343,10 +413,13 @@ def run_ai_create_and_start_sync(
         "请只输出一个严格合法、可直接 json.loads() 的 JSON 对象，禁止输出任何其他文字或 Markdown 格式。\n"
         "JSON 必须且只能包含以下五个键：\n"
         f'- title: 字符串，书名（4-20 字），要新颖且贴合题材。\n'
-        f'- intro: 字符串，1-3 段吸引读者的简介，描述核心冲突和看点。\n'
-        f'- background: 字符串，详细的背景设定、力量体系或世界观细节。\n'
-        f'- style: 字符串，描述文风的关键词，如“快节奏、反转多、细腻描写”。\n'
-        f'- target_chapters: 整数，必须在 {length_min} 到 {length_max} 之间。\n\n'
+        f"- intro: 字符串，**不少于 {intro_min_chars} 个汉字**（标点不计入）；用 2–4 个自然段；"
+        "必须写清：主角当前处境与缺陷、对立面或系统性压力、核心冲突为何「现在」爆发、读者会追的悬念/钩子；避免空泛形容词堆砌。\n"
+        f"- background: 字符串，**不少于 {bg_min_chars} 个汉字**；作为后续「大纲框架」的素材，必须尽量具体，建议覆盖（可用小节式叙述）："
+        "时代/地域或架空规则；主要势力/阵营及其利益诉求；力量或职业体系（至少两级：入门/中坚/顶层中任选两层写清差异与代价）；"
+        "经济、技术或民生底色（择一写透）；2–3 条关键历史事件或传说；社会矛盾、禁忌与信息流通方式；与世界观强相关的伏笔或未解之谜。\n"
+        f"- style: 字符串，**不少于 {style_min_chars} 个汉字**；除节奏外，需点名叙事视角、对话密度倾向、意象/氛围关键词，避免只输出三四个抽象词。\n"
+        f"- target_chapters: 整数，必须在 {length_min} 到 {length_max} 之间。\n\n"
         "输出示例：\n"
         "{\n"
         '  "title": "万古剑尊",\n'
@@ -356,6 +429,8 @@ def run_ai_create_and_start_sync(
         f'  "target_chapters": {max(length_min, min(length_max, 150))}\n'
         "}\n"
     )
+
+    brainstorm_timeout = float(settings.novel_ai_create_brainstorm_timeout or 720.0)
 
     def _run_chat(
         messages: list[dict[str, str]],
@@ -371,7 +446,7 @@ def run_ai_create_and_start_sync(
                     messages=messages,
                     temperature=temperature,
                     web_search=web_search,
-                    timeout=180.0,
+                    timeout=brainstorm_timeout,
                     response_format=response_format,
                     **llm._bill_kw(db, llm._billing_user_id),
                 )
@@ -389,6 +464,8 @@ def run_ai_create_and_start_sync(
                         "你是结构化小说策划输出器。"
                         "你的唯一任务是输出一个可被 Python json.loads() 直接解析的 JSON 对象。"
                         "禁止输出 JSON 之外的任何字符。\n"
+                        "intro、background、style 必须写满用户要求的字数下限，禁止用一两句敷衍；"
+                        "background 要可当后续「世界观圣经」使用，避免空泛设定名。\n"
                         f"{_ANTI_AI_FLAVOR_BLOCK}"
                     ),
                 },
@@ -470,7 +547,16 @@ def run_ai_create_and_start_sync(
         
     except Exception as e:
         logger.exception("ai_create brainstorm failed | novel_id=%s", novel_id)
-        raise ValueError(f"AI 构思设定失败: {str(e)}")
+        detail = str(e).strip()
+        if not detail:
+            detail = type(e).__name__
+        hint = ""
+        if type(e).__name__ in ("ReadTimeout", "ConnectTimeout", "WriteTimeout", "TimeoutException"):
+            hint = (
+                f"（上游在 {brainstorm_timeout:.0f}s 内未返回完整响应，可检查网络或在环境变量中增大 "
+                "NOVEL_AI_CREATE_BRAINSTORM_TIMEOUT）"
+            )
+        raise ValueError(f"AI 构思设定失败: {detail}{hint}") from e
 
     # 触发异步生成大纲框架
     from app.tasks.novel_tasks import novel_generate_framework_task
@@ -534,6 +620,174 @@ def _find_volume_for_chapter(db: Session, novel_id: str, chapter_no: int) -> Nov
     )
 
 
+def _volume_row_has_plot(vol: NovelVolume) -> bool:
+    if (getattr(vol, "outline_markdown", None) or "").strip():
+        return True
+    try:
+        data = json.loads(getattr(vol, "outline_json", None) or "{}")
+    except json.JSONDecodeError:
+        data = {}
+    if not isinstance(data, dict):
+        return False
+    arcs = data.get("arcs")
+    return isinstance(arcs, list) and len(arcs) > 0
+
+
+def _persist_arcs_fj_to_volume_rows(
+    db: Session,
+    *,
+    novel_id: str,
+    framework_json_with_arcs: str,
+    target_volume_nos: list[int],
+) -> None:
+    """将含 arcs 的 framework JSON 拆写到各卷 outline_*（与 novel_generate_arcs_task 一致）。"""
+    from app.tasks.novel_tasks import _arcs_overlapping_chapter_range
+
+    try:
+        arcs_data = json.loads(framework_json_with_arcs) if framework_json_with_arcs else {}
+    except json.JSONDecodeError:
+        arcs_data = {}
+    arcs_list = arcs_data.get("arcs", []) if isinstance(arcs_data, dict) else []
+    if not (isinstance(arcs_list, list) and arcs_list):
+        return
+
+    if isinstance(arcs_list, list) and arcs_list and target_volume_nos:
+        volume_size = 50
+        targets: list[int] = []
+        for raw in target_volume_nos:
+            vn: int | None = None
+            if isinstance(raw, int) and raw > 0:
+                vn = raw
+            elif isinstance(raw, float) and raw.is_integer():
+                i = int(raw)
+                if i > 0:
+                    vn = i
+            if vn is not None:
+                targets.append(vn)
+        targets = sorted(set(targets))
+        for vol_no in targets:
+            vol_lo = (vol_no - 1) * volume_size + 1
+            vol_hi = vol_no * volume_size
+            vol_arcs = _arcs_overlapping_chapter_range(arcs_list, vol_lo, vol_hi)
+            if not vol_arcs and len(targets) == 1 and vol_no == targets[0]:
+                vol_arcs = list(arcs_list)
+            vol_row = (
+                db.query(NovelVolume)
+                .filter(NovelVolume.novel_id == novel_id, NovelVolume.volume_no == vol_no)
+                .first()
+            )
+            if vol_row and vol_arcs:
+                vol_row.outline_json = json.dumps(
+                    {"volume_no": vol_no, "arcs": vol_arcs}, ensure_ascii=False
+                )
+                vol_row.outline_markdown = render_volume_arcs_markdown(vol_no, vol_arcs)
+        return
+
+    volumes = (
+        db.query(NovelVolume)
+        .filter(NovelVolume.novel_id == novel_id)
+        .order_by(NovelVolume.volume_no.asc())
+        .all()
+    )
+    if isinstance(arcs_list, list) and arcs_list and volumes:
+        for vol in volumes:
+            vol_lo = int(vol.from_chapter or 0)
+            vol_hi = int(vol.to_chapter or 0)
+            if vol_lo <= 0 or vol_hi <= 0:
+                continue
+            vol_arcs = _arcs_overlapping_chapter_range(arcs_list, vol_lo, vol_hi)
+            if vol_arcs:
+                vn = int(vol.volume_no)
+                vol.outline_json = json.dumps(
+                    {"volume_no": vn, "arcs": vol_arcs}, ensure_ascii=False
+                )
+                vol.outline_markdown = render_volume_arcs_markdown(vn, vol_arcs)
+
+
+def _ensure_volume_plot_before_plan(
+    db: Session,
+    *,
+    novel: Novel,
+    novel_id: str,
+    volume: NovelVolume,
+    billing_user_id: str | None,
+    batch_id: str,
+    current_no: int,
+) -> NovelVolume:
+    """
+    当前卷尚无分卷剧情（outline）时，先生成该卷 arcs 并落库，再继续章计划。
+    与独立「生成分卷剧情」任务共用 LLM 步骤，但不抢 Redis 锁（由 auto_pipeline 持有）。
+    """
+    db.refresh(volume)
+    if _volume_row_has_plot(volume):
+        return volume
+
+    if not getattr(novel, "base_framework_confirmed", False):
+        raise ValueError(
+            "当前卷尚无分卷剧情，且基础大纲未确认；无法自动补全卷剧情。"
+            "请先在向导中确认基础大纲，或在大纲抽屉手动生成分卷剧情后再续写。"
+        )
+
+    from app.tasks.novel_tasks import (
+        _ensure_novel_volume_rows_for_arcs_writes,
+        _generate_arcs_for_volumes_sync,
+    )
+
+    vn = int(volume.volume_no)
+    append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="auto_pipeline_volume_arcs",
+        message=f"第{vn}卷缺少分卷剧情，正在先生成该卷剧情弧线…",
+        meta={"volume_no": vn, "from_chapter": current_no},
+    )
+    db.commit()
+
+    llm = NovelLLMService(billing_user_id=billing_user_id)
+    md, fj = _generate_arcs_for_volumes_sync(
+        llm,
+        novel,
+        target_volume_nos=[vn],
+        instruction="",
+        db=db,
+        progress_callback=None,
+    )
+    try:
+        merged = json.loads(fj or "{}")
+    except json.JSONDecodeError as exc:
+        raise ValueError("自动补全卷剧情失败：返回不是合法 JSON") from exc
+    arcs_out = merged.get("arcs") if isinstance(merged, dict) else None
+    if not isinstance(arcs_out, list) or not arcs_out:
+        raise ValueError("自动补全卷剧情失败：模型未返回可用的 arcs")
+
+    base_md, base_j = coerce_novel_outline_base_fields(md, fj)
+    novel.framework_markdown = base_md
+    novel.framework_json = base_j
+
+    created = _ensure_novel_volume_rows_for_arcs_writes(db, novel, [vn])
+    if created:
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_volume_rows_autocreated",
+            level="info",
+            message=f"已为第{vn}卷自动创建卷占位以便写入剧情弧线",
+            meta={"volume_nos": created},
+        )
+
+    _persist_arcs_fj_to_volume_rows(
+        db, novel_id=novel_id, framework_json_with_arcs=fj, target_volume_nos=[vn]
+    )
+    db.commit()
+
+    refreshed = _find_volume_for_chapter(db, novel_id, current_no)
+    if not refreshed:
+        raise ValueError(f"第{current_no}章未归属任何卷，卷剧情落库后仍无法解析卷记录")
+    return refreshed
+
+
 def _next_consecutive_planned_body_chunk(
     db: Session, novel_id: str, start_no: int, end_no: int
 ) -> list[int]:
@@ -575,6 +829,7 @@ def run_full_auto_generation_sync(
     auto_plan_guard_check: bool | None = None,
     auto_plan_guard_fix: bool | None = None,
     auto_style_polish: bool | None = None,
+    workflow_run: Any | None = None,
 ) -> dict[str, Any]:
     """
     全自动 Pipeline：补齐卷 -> 补齐章计划 -> 串行生成正文。
@@ -607,11 +862,116 @@ def run_full_auto_generation_sync(
         if auto_style_polish is None
         else bool(auto_style_polish)
     )
+    resolved_auto_expressive_enhance = bool(
+        getattr(n, "auto_expressive_enhance", False)
+    )
+
+    def _auto_pipeline_log_exists(ev: str) -> bool:
+        return (
+            db.query(NovelGenerationLog.id)
+            .filter(
+                NovelGenerationLog.novel_id == novel_id,
+                NovelGenerationLog.batch_id == batch_id,
+                NovelGenerationLog.event == ev,
+            )
+            .first()
+        ) is not None
+
+    if _auto_pipeline_log_exists("auto_pipeline_done"):
+        return {
+            "status": "ok",
+            "message": "该批次已完成，跳过重复执行",
+            "chapters_generated": 0,
+            "already_done": True,
+        }
+    if _auto_pipeline_log_exists("auto_pipeline_failed") or _auto_pipeline_log_exists(
+        "auto_pipeline_cancelled"
+    ):
+        raise ValueError("该全自动批次已结束或已失败，请重新发起")
 
     next_no = next_chapter_no_from_approved(db, novel_id)
     end_no = min(next_no + target_count - 1, n.target_chapters)
+    step_seq = 0
+
+    def _workflow_running(
+        step_type: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        message: str | None = None,
+    ) -> tuple[int, Any | None]:
+        nonlocal step_seq
+        if not (workflow_run and settings.novel_workflow_v2_enabled):
+            return 0, None
+        step_seq += 1
+        step = upsert_workflow_step(
+            db,
+            run=workflow_run,
+            step_type=step_type,
+            sequence_no=step_seq,
+            status="running",
+            payload=payload,
+        )
+        touch_workflow_run_status(
+            db,
+            workflow_run,
+            status="running",
+            current_step=step_type,
+            cursor_payload=payload,
+        )
+        if message:
+            append_workflow_event(
+                db,
+                run=workflow_run,
+                step=step,
+                event_type=f"{step_type}_started",
+                message=message,
+                meta=payload,
+            )
+        db.flush()
+        return step_seq, step
+
+    def _workflow_finish(
+        step_type: str,
+        sequence_no: int,
+        *,
+        status: str,
+        result_payload: dict[str, Any] | None = None,
+        error_payload: dict[str, Any] | None = None,
+        message: str | None = None,
+        level: str = "info",
+    ) -> None:
+        if not (workflow_run and settings.novel_workflow_v2_enabled and sequence_no > 0):
+            return
+        step = upsert_workflow_step(
+            db,
+            run=workflow_run,
+            step_type=step_type,
+            sequence_no=sequence_no,
+            status=status,
+            result_payload=result_payload,
+            error_payload=error_payload,
+        )
+        if message:
+            append_workflow_event(
+                db,
+                run=workflow_run,
+                step=step,
+                event_type=f"{step_type}_{status}",
+                level=level,
+                message=message,
+                meta=result_payload if status != "failed" else error_payload,
+            )
+        db.flush()
     
     if next_no > end_no:
+        touch_workflow_run_status(
+            db,
+            workflow_run,
+            status="done",
+            current_step="noop",
+            cursor_payload={"phase": "noop"},
+            output_payload={"chapters_generated": 0},
+        ) if (workflow_run and settings.novel_workflow_v2_enabled) else None
         return {"status": "ok", "message": "已达到目标字数或设定章节数上限，无需生成", "chapters_generated": 0}
 
     logger.info(
@@ -619,17 +979,42 @@ def run_full_auto_generation_sync(
         novel_id, next_no, end_no, target_count
     )
     
-    append_generation_log(
-        db,
-        novel_id=novel_id,
-        batch_id=batch_id,
-        event="auto_pipeline_start",
-        message=f"开始全自动生成 Pipeline（目标：第{next_no}章 - 第{end_no}章）",
-        meta={"next_no": next_no, "end_no": end_no, "target_count": target_count}
-    )
+    if _auto_pipeline_log_exists("auto_pipeline_start") and not _auto_pipeline_log_exists(
+        "auto_pipeline_done"
+    ):
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_resumed",
+            level="info",
+            message=f"续跑全自动 Pipeline（目标：第{next_no}章 - 第{end_no}章）",
+            meta={"next_no": next_no, "end_no": end_no, "target_count": target_count},
+        )
+    else:
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="auto_pipeline_start",
+            message=f"开始全自动生成 Pipeline（目标：第{next_no}章 - 第{end_no}章）",
+            meta={
+                "next_no": next_no,
+                "end_no": end_no,
+                "target_count": target_count,
+            },
+        )
     db.commit()
 
     if is_cancel_requested(batch_id):
+        if workflow_run and settings.novel_workflow_v2_enabled:
+            touch_workflow_run_status(
+                db,
+                workflow_run,
+                status="cancelled",
+                current_step="cancelled_before_start",
+                cursor_payload={"phase": "cancelled_before_start"},
+            )
         append_generation_log(
             db,
             novel_id=novel_id,
@@ -646,7 +1031,30 @@ def run_full_auto_generation_sync(
             "chapter_ids": [],
         }
 
-    _ensure_volumes_cover(db, n, end_no)
+    ensure_seq, _ = _workflow_running(
+        "ensure_volumes",
+        payload={"next_no": next_no, "end_no": end_no},
+        message="开始校验并补齐分卷覆盖范围",
+    )
+    try:
+        _ensure_volumes_cover(db, n, end_no)
+    except Exception as exc:
+        _workflow_finish(
+            "ensure_volumes",
+            ensure_seq,
+            status="failed",
+            error_payload={"error": str(exc), "next_no": next_no, "end_no": end_no},
+            message="分卷覆盖范围校验失败",
+            level="error",
+        )
+        raise
+    _workflow_finish(
+        "ensure_volumes",
+        ensure_seq,
+        status="done",
+        result_payload={"next_no": next_no, "end_no": end_no},
+        message="分卷覆盖范围已校验完成",
+    )
 
     created_ids: list[str] = []
     current_no = next_no
@@ -654,6 +1062,18 @@ def run_full_auto_generation_sync(
 
     while current_no <= end_no:
         if is_cancel_requested(batch_id):
+            if workflow_run and settings.novel_workflow_v2_enabled:
+                touch_workflow_run_status(
+                    db,
+                    workflow_run,
+                    status="cancelled",
+                    current_step="cancelled",
+                    cursor_payload={
+                        "phase": "cancelled",
+                        "current_no": current_no,
+                        "chapters_generated": len(created_ids),
+                    },
+                )
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -675,6 +1095,15 @@ def run_full_auto_generation_sync(
             db, novel_id, current_no, end_no
         )
         if planned_body_chunk:
+            chapter_seq, _ = _workflow_running(
+                "generate_chapters",
+                payload={
+                    "chapter_nos": planned_body_chunk,
+                    "current_no": current_no,
+                    "end_no": end_no,
+                },
+                message=f"开始批量生成正文：第{planned_body_chunk[0]}章 - 第{planned_body_chunk[-1]}章",
+            )
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -685,23 +1114,49 @@ def run_full_auto_generation_sync(
             )
             db.commit()
 
-            res = run_generate_chapters_batch_sync(
-                db=db,
-                novel_id=novel_id,
-                billing_user_id=billing_user_id,
-                title_hint="",
-                chapter_nos=planned_body_chunk,
-                use_cold_recall=use_cold_recall,
-                cold_recall_items=cold_recall_items,
-                auto_consistency_check=resolved_auto_consistency_check,
-                auto_plan_guard_check=resolved_auto_plan_guard_check,
-                auto_plan_guard_fix=resolved_auto_plan_guard_fix,
-                auto_style_polish=resolved_auto_style_polish,
-                batch_id=batch_id,
-                source="auto_pipeline",
-            )
+            try:
+                res = run_generate_chapters_batch_sync(
+                    db=db,
+                    novel_id=novel_id,
+                    billing_user_id=billing_user_id,
+                    title_hint="",
+                    chapter_nos=planned_body_chunk,
+                    use_cold_recall=use_cold_recall,
+                    cold_recall_items=cold_recall_items,
+                    auto_consistency_check=resolved_auto_consistency_check,
+                    auto_plan_guard_check=resolved_auto_plan_guard_check,
+                    auto_plan_guard_fix=resolved_auto_plan_guard_fix,
+                    auto_style_polish=resolved_auto_style_polish,
+                    auto_expressive_enhance=resolved_auto_expressive_enhance,
+                    batch_id=batch_id,
+                    source="auto_pipeline",
+                )
+            except Exception as exc:
+                _workflow_finish(
+                    "generate_chapters",
+                    chapter_seq,
+                    status="failed",
+                    error_payload={
+                        "error": str(exc),
+                        "chapter_nos": planned_body_chunk,
+                    },
+                    message="正文生成阶段执行失败",
+                    level="error",
+                )
+                raise
             created_ids.extend(res.get("chapter_ids", []))
             if str(res.get("status") or "") == "blocked":
+                _workflow_finish(
+                    "generate_chapters",
+                    chapter_seq,
+                    status="failed",
+                    error_payload={
+                        "blocked_chapter_no": res.get("blocked_chapter_no"),
+                        "blocked_issues": res.get("blocked_issues") or [],
+                    },
+                    message="正文生成阶段被自动审定门禁阻断",
+                    level="warning",
+                )
                 return {
                     "status": "blocked",
                     "batch_id": batch_id,
@@ -710,6 +1165,16 @@ def run_full_auto_generation_sync(
                     "blocked_chapter_no": res.get("blocked_chapter_no"),
                     "blocked_issues": res.get("blocked_issues") or [],
                 }
+            _workflow_finish(
+                "generate_chapters",
+                chapter_seq,
+                status="done",
+                result_payload={
+                    "chapter_ids": res.get("chapter_ids", []),
+                    "chapters_generated": len(res.get("chapter_ids", [])),
+                },
+                message=f"正文生成完成：新增 {len(res.get('chapter_ids', []))} 章",
+            )
             current_no = planned_body_chunk[-1] + 1
             continue
 
@@ -724,7 +1189,64 @@ def run_full_auto_generation_sync(
         if not volume:
             raise ValueError(f"第{current_no}章未归属任何卷，无法自动补齐章计划")
 
+        volume_seq, _ = _workflow_running(
+            "ensure_volume_plot",
+            payload={
+                "volume_id": volume.id,
+                "volume_no": volume.volume_no,
+                "current_no": current_no,
+            },
+            message=f"开始补齐第{volume.volume_no}卷卷级剧情",
+        )
+        try:
+            volume = _ensure_volume_plot_before_plan(
+                db,
+                novel=n,
+                novel_id=novel_id,
+                volume=volume,
+                billing_user_id=billing_user_id,
+                batch_id=batch_id,
+                current_no=current_no,
+            )
+        except Exception as exc:
+            _workflow_finish(
+                "ensure_volume_plot",
+                volume_seq,
+                status="failed",
+                error_payload={
+                    "error": str(exc),
+                    "volume_id": volume.id,
+                    "volume_no": volume.volume_no,
+                    "current_no": current_no,
+                },
+                message=f"第{volume.volume_no}卷卷级剧情准备失败",
+                level="error",
+            )
+            raise
+        _workflow_finish(
+            "ensure_volume_plot",
+            volume_seq,
+            status="done",
+            result_payload={
+                "volume_id": volume.id,
+                "volume_no": volume.volume_no,
+                "current_no": current_no,
+            },
+            message=f"第{volume.volume_no}卷卷级剧情已就绪",
+        )
+
         plan_to_no = min(end_no, current_no + plan_batch_size - 1, volume.to_chapter)
+        plan_seq, _ = _workflow_running(
+            "generate_plan_batch",
+            payload={
+                "volume_id": volume.id,
+                "volume_no": volume.volume_no,
+                "from_chapter": current_no,
+                "to_chapter": plan_to_no,
+                "batch_size": plan_batch_size,
+            },
+            message=f"开始生成第{volume.volume_no}卷章计划：第{current_no}章 - 第{plan_to_no}章",
+        )
         append_generation_log(
             db,
             novel_id=novel_id,
@@ -741,6 +1263,14 @@ def run_full_auto_generation_sync(
         db.commit()
 
         if is_cancel_requested(batch_id):
+            _workflow_finish(
+                "generate_plan_batch",
+                plan_seq,
+                status="cancelled",
+                error_payload={"current_no": current_no, "chapters_generated": len(created_ids)},
+                message="章计划生成前任务被取消",
+                level="warning",
+            )
             append_generation_log(
                 db,
                 novel_id=novel_id,
@@ -758,20 +1288,50 @@ def run_full_auto_generation_sync(
                 "chapters_generated": len(created_ids),
             }
 
-        plan_res = run_volume_chapter_plan_batch_sync(
-            db=db,
-            novel_id=novel_id,
-            billing_user_id=billing_user_id,
-            volume_id=volume.id,
-            batch_id=batch_id,
-            force_regen=False,
-            batch_size=plan_batch_size,
-            from_chapter=current_no,
-        )
+        try:
+            plan_res = run_volume_chapter_plan_batch_sync(
+                db=db,
+                novel_id=novel_id,
+                billing_user_id=billing_user_id,
+                volume_id=volume.id,
+                batch_id=batch_id,
+                force_regen=False,
+                batch_size=plan_batch_size,
+                from_chapter=current_no,
+            )
+        except Exception as exc:
+            _workflow_finish(
+                "generate_plan_batch",
+                plan_seq,
+                status="failed",
+                error_payload={
+                    "error": str(exc),
+                    "volume_id": volume.id,
+                    "current_no": current_no,
+                },
+                message="章计划批生成失败",
+                level="error",
+            )
+            raise
         if not chapter_plan_exists(db, novel_id, current_no):
+            _workflow_finish(
+                "generate_plan_batch",
+                plan_seq,
+                status="failed",
+                error_payload={"plan_result": plan_res, "current_no": current_no},
+                message=f"第{current_no}章计划生成后仍不可用",
+                level="error",
+            )
             raise ValueError(
                 f"第{current_no}章计划生成失败，未产出可用章计划（结果：{plan_res}）"
             )
+        _workflow_finish(
+            "generate_plan_batch",
+            plan_seq,
+            status="done",
+            result_payload=plan_res if isinstance(plan_res, dict) else {"result": str(plan_res)},
+            message=f"章计划生成完成：第{current_no}章 - 第{plan_to_no}章",
+        )
 
     return {
         "status": "ok",

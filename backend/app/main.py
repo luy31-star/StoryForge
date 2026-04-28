@@ -13,7 +13,9 @@ from app.core.db_migrate import (
     ensure_app_config_row,
     ensure_model_price_split_columns,
     ensure_novel_memory_norm_extended_columns,
+    ensure_story_bible_columns,
     ensure_item_skill_lifecycle_columns,
+    ensure_novel_entity_state_machine_columns,
     ensure_novel_target_chapters,
     ensure_user_config_columns,
     ensure_user_email_column,
@@ -24,6 +26,7 @@ from app.core.db_migrate import (
     relax_novel_memory_norm_columns,
 )
 from app.core.database import SessionLocal
+from app.services.qdrant_store import ensure_novel_qdrant_collection
 from app.services.runtime_llm_config import ensure_app_config_llm_model_filled
 import app.models.app_config  # noqa: F401 — ensure metadata registers
 import app.models.user  # noqa: F401 — users / billing 表
@@ -31,6 +34,11 @@ import app.models.recharge_order  # noqa: F401 — recharge orders
 import app.models.invite_code  # noqa: F401 — invite codes
 import app.models.novel  # noqa: F401 — 确保 metadata 建表
 import app.models.novel_memory_norm  # noqa: F401 — 规范化记忆表
+import app.models.novel_story_bible  # noqa: F401 — Story Bible
+import app.models.novel_retrieval  # noqa: F401 — RAG 检索表
+import app.models.novel_workflow_runtime  # noqa: F401 — 工作流状态机
+import app.models.novel_memory_runtime  # noqa: F401 — 记忆更新审计
+import app.models.novel_judge  # noqa: F401 — Judge 结果
 import app.models.volume  # noqa: F401 — 确保 volumes/plan 建表
 import app.models.project  # noqa: F401 — projects.user_id
 import app.models.workflow  # noqa: F401 — workflows.user_id
@@ -113,12 +121,15 @@ def on_startup() -> None:
     ensure_novel_target_chapters(engine)
     ensure_writing_style_id_column(engine)
     ensure_novel_memory_norm_extended_columns(engine)
+    ensure_story_bible_columns(engine)
     ensure_item_skill_lifecycle_columns(engine)
+    ensure_novel_entity_state_machine_columns(engine)
     ensure_volume_outline_columns(engine)
     relax_novel_memory_norm_columns(engine)
     ensure_model_price_split_columns(engine)
     ensure_app_config_columns(engine)
     ensure_app_config_row(engine)
+    ensure_novel_qdrant_collection()
     db = SessionLocal()
     try:
         ensure_app_config_llm_model_filled(db)

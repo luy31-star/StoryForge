@@ -194,6 +194,8 @@ export function NovelShelf() {
   const [newPlot, setNewPlot] = useState("");
   const [newMood, setNewMood] = useState("");
   const [newBackground, setNewBackground] = useState("");
+  const [spotlightIntroExpanded, setSpotlightIntroExpanded] = useState(false);
+  const [expandedIntroIds, setExpandedIntroIds] = useState<Record<string, boolean>>({});
 
   const reload = useCallback(async () => {
     try {
@@ -255,6 +257,10 @@ export function NovelShelf() {
     ? themeForNovel(`${spotlightNovel.id}${spotlightNovel.title}`)
     : shelfThemes[0];
   const spotlightStage = spotlightNovel ? stageForNovel(spotlightNovel) : null;
+
+  useEffect(() => {
+    setSpotlightIntroExpanded(false);
+  }, [spotlightNovel?.id]);
 
   useEffect(() => {
     if (page > totalPages) {
@@ -507,8 +513,17 @@ export function NovelShelf() {
                   </div>
 
                   <p className="relative z-10 mt-4 max-w-2xl text-sm leading-7 text-foreground/70">
-                    {spotlightNovel.intro || "还没有简介。你可以进入工作台先补全主线、人物和核心冲突。"}
+                    <span className={spotlightIntroExpanded ? "whitespace-pre-wrap" : "line-clamp-4"}>
+                      {spotlightNovel.intro || "还没有简介。你可以进入工作台先补全主线、人物和核心冲突。"}
+                    </span>
                   </p>
+                  <button
+                    type="button"
+                    className="relative z-10 mt-1 text-xs font-semibold text-primary underline-offset-4 hover:underline"
+                    onClick={() => setSpotlightIntroExpanded((v) => !v)}
+                  >
+                    {spotlightIntroExpanded ? "收起简介" : "展开全文"}
+                  </button>
 
                   <div className="relative z-10 mt-6">
                     <NovelStageRail
@@ -715,9 +730,27 @@ export function NovelShelf() {
                               {n.title}
                             </Link>
                           </CardTitle>
-                          <CardDescription className="line-clamp-3 text-[15px] text-foreground/68">
-                            {n.intro || "还没有简介，可以先进入工作台补充世界观、人物与主线冲突。"}
+                          <CardDescription className="text-[15px] text-foreground/68">
+                            <span
+                              className={
+                                expandedIntroIds[n.id] ? "whitespace-pre-wrap" : "line-clamp-3"
+                              }
+                            >
+                              {n.intro || "还没有简介，可以先进入工作台补充世界观、人物与主线冲突。"}
+                            </span>
                           </CardDescription>
+                          <button
+                            type="button"
+                            className="text-xs font-semibold text-primary underline-offset-4 hover:underline"
+                            onClick={() =>
+                              setExpandedIntroIds((prev) => ({
+                                ...prev,
+                                [n.id]: !prev[n.id],
+                              }))
+                            }
+                          >
+                            {expandedIntroIds[n.id] ? "收起简介" : "展开全文"}
+                          </button>
                         </div>
                       </div>
 

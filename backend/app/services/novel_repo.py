@@ -809,11 +809,21 @@ def _parse_int(v: object) -> int | None:
         return None
     if isinstance(v, int):
         return v
-    if isinstance(v, str) and v.strip().isdigit():
+    if isinstance(v, float) and v.is_integer():
+        return int(v)
+    if isinstance(v, str):
+        s = v.strip()
+        if s.isdigit():
+            try:
+                return int(s)
+            except Exception:
+                return None
         try:
-            return int(v.strip())
+            f = float(s)
         except Exception:
             return None
+        if f.is_integer():
+            return int(f)
     return None
 
 
@@ -1232,7 +1242,7 @@ def chapter_execution_rules_block(chapter_no: int) -> str:
     章内执行规则：把“每章三段式 + 限制单章推进量”变成硬约束。
     目的：避免一章跨多个事件，强制出现受阻与钩子。
     """
-    return (
+    base = (
         "【章内执行规则（强约束）】\n"
         f"- 本章：第{chapter_no}章\n"
         "- 结构必须满足：开头一个明确目标；中段一次行动→受阻→调整；结尾一个小结果 + 一个新钩子。\n"
@@ -1240,6 +1250,18 @@ def chapter_execution_rules_block(chapter_no: int) -> str:
         "- 必须写成可视化场景（行动/对话/观察），避免用总结性叙述把过程带过。\n"
         "- 角色动机与信息必须在场景中自然落地：读者能看出‘他为什么这么做’与‘他凭什么这么做’。\n"
         "- 若涉及冲突升级：优先用“代价递增”（暴露、损失、人情债、误会扩大），而不是直接用更大的结果跳级。"
+    )
+    if chapter_no != 1:
+        return base
+    return (
+        base
+        + "\n"
+        + "【全书第1章·开场附加（强约束）】\n"
+        "- 读者首次进入故事：必须在本章内交代清楚与**入场**相关的背景，使读者知道「谁、处于何种时代/世界或环境、当前处境如何、故事因何被启动」。"
+        "可用具体场景、动作、对话与观察推进，但不得依赖读者自行脑补。\n"
+        "- 禁止**莫名其妙**的开场：不得从缺乏上下文的激烈冲突、大段未解释的专属名词或群像对话直接切入，"
+        "让读者在不知人物关系与因果的情况下被硬推情节。\n"
+        "- 铺背景与写事件可并行，但须让读者先或同时获得足以代入的最小信息集；禁止整章只有事件推进而读者仍不知基本情境。"
     )
 
 

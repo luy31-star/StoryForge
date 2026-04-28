@@ -41,19 +41,16 @@ from app.services.chapter_plan_schema import (
 )
 from app.services.llm_router import LLMRouter
 from app.services.novel_repo import (
+    arc_bounds_from_dict,
     build_hot_memory_for_prompt,
     build_hot_memory_from_db,
     format_chapter_continuity_bridge_from_db,
     format_cold_recall_block,
     format_cold_recall_from_db,
-    format_canonical_timeline_block,
-    format_canonical_timeline_from_db,
     format_constraints_block,
     format_entity_recall_block,
     format_entity_recall_from_db,
     format_open_plots_block,
-    format_open_plots_from_db,
-    format_volume_event_summary,
     format_volume_progress_anchor,
     chapter_content_metrics,
     chapter_execution_rules_block,
@@ -65,19 +62,22 @@ from app.services.novel_repo import (
     framework_json_base_str,
     outline_beat_hint,
     pacing_guard_block,
-    process_chapter_suggestions_block,
     truncate_framework_json,
     truncate_framework_json_stage_aware,
 )
 from app.services.runtime_llm_config import get_runtime_web_search_config
+from app.services.novel_quasi_graph_service import build_quasi_graph_context_block
+from app.services.novel_retrieval_service import retrieve_relevant_context_block
 from app.services.novel_storage import load_reference_text_for_llm
 from app.services.memory_schema import (
     clamp_int,
+    coerce_int,
     dedupe_clean_strs,
     extract_aliases,
     is_irreversible_fact,
     normalize_plot_type,
 )
+from app.services.novel_entity_lifecycle import infer_lifecycle_state
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +263,202 @@ def _writing_style_block(style: WritingStyle | None) -> str:
     return "\n".join(parts)
 
 
+def _trim_prompt_text(text: str, max_chars: int) -> str:
+    raw = str(text or "").strip()
+    if max_chars <= 0 or len(raw) <= max_chars:
+        return raw
+    if max_chars < 120:
+        return raw[:max_chars]
+    return raw[: max_chars - 12].rstrip() + "\n…（已裁剪）"
+
+
+def _compact_query_text(text: str, *, max_chars: int = 1200) -> str:
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    return clean[:max_chars]
+
+
+def _string_list_summary(values: Any, *, max_items: int, item_max_chars: int) -> list[str]:
+    if not isinstance(values, list):
+        return []
+    out: list[str] = []
+    for item in values:
+        s = str(item or "").strip()
+        if not s:
+            continue
+        out.append(s[:item_max_chars])
+        if len(out) >= max_items:
+            break
+    return out
+
+
+def _render_hot_memory_prompt_block(
+    hot_memory_json: str,
+    *,
+    include_entities: bool,
+) -> str:
+    data = _safe_json_dict(hot_memory_json)
+    if not data:
+        return ""
+
+    lines = ["【当前叙事状态（热层摘要）】"]
+    volume_context = str(data.get("volume_context_text") or "").strip()
+    if volume_context:
+        lines.append(volume_context)
+
+    main_plot = str(data.get("main_plot_hot") or "").strip()
+    if main_plot:
+        lines.append(f"- 当前主线焦点：{main_plot[:220]}")
+
+    timeline = data.get("canonical_timeline_hot")
+    if isinstance(timeline, list) and timeline:
+        lines.append("- 最近关键因果：")
+        for entry in timeline[-3:]:
+            if not isinstance(entry, dict):
+                continue
+            chapter_no = entry.get("chapter_no")
+            title = str(entry.get("chapter_title") or "").strip()
+            key_facts = _string_list_summary(entry.get("key_facts"), max_items=2, item_max_chars=80)
+            results = _string_list_summary(
+                entry.get("causal_results"), max_items=1, item_max_chars=80
+            )
+            hooks = _string_list_summary(
+                entry.get("unresolved_hooks"), max_items=1, item_max_chars=80
+            )
+            facts = "；".join([*key_facts, *results, *hooks]).strip()
+            head = f"第{chapter_no}章" if isinstance(chapter_no, int) else "最近章节"
+            if title:
+                head += f"《{title[:24]}》"
+            if facts:
+                lines.append(f"  · {head}：{facts}")
+
+    open_plots = data.get("open_plots_hot")
+    if isinstance(open_plots, list) and open_plots:
+        lines.append("- 当前必须承接的活跃线索：")
+        for plot in open_plots[:5]:
+            if not isinstance(plot, dict):
+                continue
+            body = str(plot.get("body") or "").strip()
+            if not body:
+                continue
+            stage = str(plot.get("current_stage") or "").strip()
+            resolve_when = str(plot.get("resolve_when") or "").strip()
+            extras: list[str] = []
+            if stage:
+                extras.append(f"阶段:{stage[:48]}")
+            if resolve_when:
+                extras.append(f"收束:{resolve_when[:48]}")
+            suffix = f"（{'；'.join(extras)}）" if extras else ""
+            lines.append(f"  · {body[:96]}{suffix}")
+
+    characters = data.get("characters_hot")
+    if isinstance(characters, list) and characters:
+        lines.append("- 当前高影响角色状态：")
+        for char in characters[:4]:
+            if not isinstance(char, dict):
+                continue
+            name = str(char.get("name") or "").strip()
+            if not name:
+                continue
+            role = str(char.get("role") or "").strip()
+            state = str(char.get("state") or "").strip()
+            traits = _string_list_summary(char.get("traits"), max_items=2, item_max_chars=24)
+            bits = [bit for bit in [role[:40] if role else "", state[:60] if state else ""] if bit]
+            if traits:
+                bits.append("特征:" + "、".join(traits))
+            lines.append(f"  · {name}" + (f"｜{'｜'.join(bits)}" if bits else ""))
+
+    relations = data.get("relations_hot")
+    if isinstance(relations, list) and relations:
+        lines.append("- 当前关键关系：")
+        for rel in relations[:4]:
+            if not isinstance(rel, dict):
+                continue
+            src = str(rel.get("from") or "").strip()
+            dst = str(rel.get("to") or "").strip()
+            relation = str(rel.get("relation") or "").strip()
+            if src and dst and relation:
+                lines.append(f"  · {src} -> {dst}：{relation[:72]}")
+
+    if include_entities:
+        inventory = data.get("inventory_hot")
+        skills = data.get("skills_hot")
+        pets = data.get("pets_hot")
+        entity_lines: list[str] = []
+        if isinstance(inventory, list):
+            labels = [
+                str(item.get("label") or "").strip()
+                for item in inventory[:4]
+                if isinstance(item, dict) and str(item.get("label") or "").strip()
+            ]
+            if labels:
+                entity_lines.append("物品：" + "、".join(labels))
+        if isinstance(skills, list):
+            labels = [
+                str(item.get("name") or "").strip()
+                for item in skills[:4]
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            if labels:
+                entity_lines.append("技能：" + "、".join(labels))
+        if isinstance(pets, list):
+            labels = [
+                str(item.get("name") or "").strip()
+                for item in pets[:3]
+                if isinstance(item, dict) and str(item.get("name") or "").strip()
+            ]
+            if labels:
+                entity_lines.append("同伴/宠物：" + "、".join(labels))
+        if entity_lines:
+            lines.append("- 高影响实体：" + "；".join(entity_lines))
+
+    return "\n".join(lines)
+
+
+def _build_chapter_recall_query(
+    *,
+    chapter_no: int,
+    chapter_title_hint: str,
+    chapter_plan_hint: str,
+) -> str:
+    parts = [
+        f"第{chapter_no}章",
+        _compact_query_text(chapter_title_hint, max_chars=80),
+        _compact_query_text(chapter_plan_hint, max_chars=1000),
+    ]
+    return "\n".join(part for part in parts if part).strip()
+
+
+def _should_include_recent_full_context(
+    *,
+    chapter_no: int,
+    continuity_excerpt: str,
+    recent_full_context: str,
+    chapter_plan_hint: str,
+) -> bool:
+    if not str(recent_full_context or "").strip():
+        return False
+    if chapter_no <= 3:
+        return True
+    if len(str(continuity_excerpt or "").strip()) < 900:
+        return True
+    hint = str(chapter_plan_hint or "")
+    high_risk_tokens = (
+        "上一卷",
+        "卷首",
+        "开卷",
+        "承接",
+        "真相",
+        "身份",
+        "觉醒",
+        "首次",
+        "获得",
+        "习得",
+        "回收",
+        "反转",
+    )
+    return any(token in hint for token in high_risk_tokens)
+
+
 def _build_chapter_context_bundle(
     *,
     memory_json: str,
@@ -273,6 +469,10 @@ def _build_chapter_context_bundle(
     cold_recall_items: int,
     db: Session | None = None,
     novel_id: str | None = None,
+    include_entity_recall: bool = True,
+    include_rag: bool = True,
+    include_constraints: bool = True,
+    include_continuity_bridge: bool = True,
 ) -> list[str]:
     if db and novel_id:
         hot_memory_json = build_hot_memory_from_db(
@@ -283,21 +483,10 @@ def _build_chapter_context_bundle(
             characters_hot_max=settings.novel_characters_hot_max,
             chapter_no=chapter_no,
         )
-        open_plots = format_open_plots_from_db(db, novel_id)
-        canonical_timeline = format_canonical_timeline_from_db(db, novel_id, chapter_no)
-        recall_query = "\n".join(
-            [
-                f"第{chapter_no}章",
-                chapter_title_hint or "",
-                chapter_plan_hint or "",
-                open_plots or "",
-            ]
-        ).strip()
-        entity_recall = format_entity_recall_from_db(
-            db,
-            novel_id,
-            recall_query,
-            max_items=max(2, settings.novel_memory_entity_recall_max_items),
+        recall_query = _build_chapter_recall_query(
+            chapter_no=chapter_no,
+            chapter_title_hint=chapter_title_hint,
+            chapter_plan_hint=chapter_plan_hint,
         )
     else:
         hot_memory_json = build_hot_memory_for_prompt(
@@ -306,36 +495,75 @@ def _build_chapter_context_bundle(
             open_plots_hot_max=settings.novel_open_plots_hot_max,
             characters_hot_max=settings.novel_characters_hot_max,
         )
-        open_plots = format_open_plots_block(memory_json)
-        canonical_timeline = format_canonical_timeline_block(memory_json, chapter_no)
-        recall_query = "\n".join(
-            [
-                f"第{chapter_no}章",
-                chapter_title_hint or "",
-                chapter_plan_hint or "",
-                open_plots or "",
-            ]
-        ).strip()
-        entity_recall = format_entity_recall_block(
-            memory_json,
-            recall_query,
-            max_items=max(2, settings.novel_memory_entity_recall_max_items),
+        recall_query = _build_chapter_recall_query(
+            chapter_no=chapter_no,
+            chapter_title_hint=chapter_title_hint,
+            chapter_plan_hint=chapter_plan_hint,
         )
 
-    blocks = [f"【当前结构化记忆（热层 JSON，仅注入最近关键状态）】\n{hot_memory_json}"]
-    if canonical_timeline:
-        blocks.append(canonical_timeline)
-    if db and novel_id:
+    blocks: list[str] = []
+    hot_block = _render_hot_memory_prompt_block(
+        hot_memory_json,
+        include_entities=not bool(db and novel_id and chapter_no > 0),
+    )
+    if hot_block:
+        blocks.append(hot_block)
+    if db and novel_id and include_constraints:
         cons = format_constraints_block(db, novel_id)
         if cons:
             blocks.append(cons)
+    if db and novel_id and include_continuity_bridge:
         bridge = format_chapter_continuity_bridge_from_db(db, novel_id, chapter_no)
         if bridge:
             blocks.append(bridge)
-    if open_plots:
-        blocks.append(open_plots)
-    if entity_recall:
-        blocks.append(entity_recall)
+    if include_entity_recall and recall_query:
+        entity_recall = (
+            format_entity_recall_from_db(
+                db,
+                novel_id,
+                recall_query,
+                max_items=max(2, settings.novel_memory_entity_recall_max_items),
+            )
+            if (db and novel_id)
+            else format_entity_recall_block(
+                memory_json,
+                recall_query,
+                max_items=max(2, settings.novel_memory_entity_recall_max_items),
+            )
+        )
+        if entity_recall:
+            blocks.append(entity_recall)
+    if include_rag and db and novel_id and settings.novel_rag_enabled and recall_query:
+        try:
+            rag_block = retrieve_relevant_context_block(
+                db,
+                novel_id,
+                recall_query,
+                top_k=settings.novel_retrieval_top_k,
+                chapter_no=chapter_no,
+            )
+        except Exception:
+            logger.exception(
+                "build chapter rag context failed | novel_id=%s chapter_no=%s",
+                novel_id,
+                chapter_no,
+            )
+            rag_block = ""
+        if rag_block:
+            blocks.append(rag_block)
+    if db and novel_id and settings.novel_quasi_graph_enabled and settings.novel_story_bible_enabled:
+        try:
+            qg = build_quasi_graph_context_block(
+                db, novel_id, chapter_no=chapter_no, plan_hint=chapter_plan_hint
+            )
+            if qg:
+                blocks.append(qg)
+        except Exception:
+            logger.exception(
+                "quasi graph context failed | novel_id=%s chapter_no=%s",
+                novel_id,
+                chapter_no,
+            )
     if use_cold_recall:
         if db and novel_id:
             cold_block = format_cold_recall_from_db(
@@ -348,6 +576,137 @@ def _build_chapter_context_bundle(
         if cold_block:
             blocks.append(cold_block)
     return blocks
+
+
+def _format_character_voice_profiles_for_prompt(
+    db: Any,
+    novel_id: str,
+    chapter_no: int,
+    *,
+    max_items: int = 6,
+) -> str:
+    if not db:
+        return ""
+    rows = (
+        db.query(NovelMemoryNormCharacter)
+        .filter(
+            NovelMemoryNormCharacter.novel_id == novel_id,
+            NovelMemoryNormCharacter.introduced_chapter <= chapter_no,
+        )
+        .order_by(
+            NovelMemoryNormCharacter.influence_score.desc(),
+            NovelMemoryNormCharacter.sort_order.asc(),
+        )
+        .limit(max_items)
+        .all()
+    )
+    lines: list[str] = ["【角色语音档案（对白与视角必须贴合）】"]
+    used = 0
+    for row in rows:
+        expired = getattr(row, "expired_chapter", None)
+        if isinstance(expired, int) and expired and expired <= chapter_no:
+            continue
+        try:
+            detail = json.loads(getattr(row, "detail_json", "") or "{}")
+        except Exception:
+            detail = {}
+        if not isinstance(detail, dict):
+            detail = {}
+        voice = detail.get("voice_profile") if isinstance(detail.get("voice_profile"), dict) else {}
+        speech_style = str(
+            voice.get("speech_style")
+            or detail.get("speech_style")
+            or detail.get("speaking_style")
+            or ""
+        ).strip()
+        emotional_trigger = str(
+            voice.get("emotional_trigger")
+            or detail.get("emotional_trigger")
+            or detail.get("emotion_trigger")
+            or ""
+        ).strip()
+        address_habit = str(
+            voice.get("address_habit")
+            or detail.get("address_habit")
+            or detail.get("forms_of_address")
+            or ""
+        ).strip()
+        taboo = str(
+            voice.get("taboo_expression")
+            or detail.get("taboo_expression")
+            or detail.get("speech_taboo")
+            or ""
+        ).strip()
+        sample = str(
+            voice.get("sample_line")
+            or detail.get("sample_line")
+            or detail.get("voice_sample")
+            or ""
+        ).strip()
+        if not any([speech_style, emotional_trigger, address_habit, taboo, sample]):
+            continue
+        name = str(getattr(row, "name", "") or "").strip() or "角色"
+        bits = [f"- {name}"]
+        if speech_style:
+            bits.append(f"说话方式：{speech_style}")
+        if emotional_trigger:
+            bits.append(f"情绪触发：{emotional_trigger}")
+        if address_habit:
+            bits.append(f"称呼习惯：{address_habit}")
+        if taboo:
+            bits.append(f"禁用表达：{taboo}")
+        if sample:
+            bits.append(f"语气样例：{sample}")
+        lines.append("；".join(bits))
+        used += 1
+    return "\n".join(lines) if used else ""
+
+
+def _format_state_snapshot_for_prompt(db: Any, novel_id: str, chapter_no: int) -> str:
+    if not db or chapter_no <= 1:
+        return ""
+    row = (
+        db.query(NovelMemoryNormChapter)
+        .filter(
+            NovelMemoryNormChapter.novel_id == novel_id,
+            NovelMemoryNormChapter.chapter_no == chapter_no - 1,
+        )
+        .first()
+    )
+    if not row:
+        return ""
+    try:
+        snapshot = json.loads(getattr(row, "state_snapshot_json", None) or "{}")
+    except Exception:
+        snapshot = {}
+    try:
+        transitions = json.loads(getattr(row, "state_transition_summary_json", None) or "[]")
+    except Exception:
+        transitions = []
+    parts: list[str] = []
+    if isinstance(snapshot, dict) and snapshot:
+        counts = snapshot.get("counts")
+        if isinstance(counts, dict) and counts:
+            bits: list[str] = []
+            for key, label in (
+                ("characters", "角色"),
+                ("relations", "关系"),
+                ("items", "物品"),
+                ("skills", "技能"),
+                ("pets", "宠物"),
+            ):
+                val = counts.get(key)
+                if isinstance(val, int):
+                    bits.append(f"{label}{val}")
+            if bits:
+                parts.append("上一章收束时可延续状态：" + "，".join(bits))
+    if isinstance(transitions, list) and transitions:
+        cleaned = [str(x).strip() for x in transitions if str(x).strip()]
+        if cleaned:
+            parts.append("上一章关键状态变更：\n" + "\n".join(f"- {x}" for x in cleaned[:8]))
+    if not parts:
+        return ""
+    return "【章节状态快照（承接上一章）】\n" + "\n".join(parts)
 
 
 def _chapter_messages(
@@ -388,18 +747,21 @@ def _chapter_messages(
     pacing_guard = pacing_guard_block(chapter_no, efw, memory_json)
     future_arc_guard = forbidden_future_arcs_block(chapter_no, efw)
     chapter_rules = chapter_execution_rules_block(chapter_no)
-    process_suggest = process_chapter_suggestions_block(chapter_no, efw, memory_json)
     style_block = _writing_style_block(getattr(novel, "writing_style", None))
 
     # 新增：卷进度锚点和卷事件摘要 + 可用物品/技能清单
     volume_progress = ""
-    volume_events = ""
     available_entities = ""
+    voice_profiles = ""
+    state_snapshot = ""
     if db:
         try:
             volume_progress = format_volume_progress_anchor(db, novel.id, chapter_no, efw)
-            volume_events = format_volume_event_summary(db, novel.id, chapter_no)
             available_entities = format_available_entities_for_chapter(db, novel.id, chapter_no)
+            voice_profiles = _format_character_voice_profiles_for_prompt(
+                db, novel.id, chapter_no
+            )
+            state_snapshot = _format_state_snapshot_for_prompt(db, novel.id, chapter_no)
         except Exception:
             # 如果失败，不影响主流程
             pass
@@ -420,8 +782,8 @@ def _chapter_messages(
         "必须使用完整标点，禁止输出一整坨几乎不分段、缺少标点或只有超长段落的文本。"
     )
     user_parts = [
-        f"【世界观与框架摘要（Markdown）】\n{bible}",
-        f"【框架 JSON（大纲/规则锚点，截断）】\n{fj_block}",
+        f"【世界观与长期规则（摘要）】\n{_trim_prompt_text(bible, 3200)}",
+        f"【本书硬设定锚点（JSON摘录）】\n{_trim_prompt_text(fj_block, 2600)}",
     ]
     if style_block:
         user_parts.append(style_block)
@@ -430,22 +792,31 @@ def _chapter_messages(
     # 新增：卷级上下文（在摘录之前，提供整体视图）
     if volume_progress:
         user_parts.append(volume_progress)
-    if volume_events:
-        user_parts.append(volume_events)
     if available_entities:
         user_parts.append(available_entities)
+    if voice_profiles:
+        user_parts.append(voice_profiles)
+    if state_snapshot:
+        user_parts.append(state_snapshot)
 
     user_parts.append(
         f"【前文衔接摘录（含再前一章与上一章结尾，若有）】\n{continuity_excerpt or '（首章）'}"
     )
-    if recent_full_context:
-        user_parts.append(recent_full_context)
+    if _should_include_recent_full_context(
+        chapter_no=chapter_no,
+        continuity_excerpt=continuity_excerpt,
+        recent_full_context=recent_full_context,
+        chapter_plan_hint=chapter_plan_hint,
+    ):
+        user_parts.append(
+            "【最近已审定章节完整正文（增强衔接）】\n"
+            + _trim_prompt_text(recent_full_context, 6000)
+        )
     user_parts.append(beat)
     user_parts.append(pacing_guard)
     if future_arc_guard:
         user_parts.append(future_arc_guard)
     user_parts.append(chapter_rules)
-    user_parts.append(process_suggest)
     if chapter_plan_hint:
         user_parts.append(chapter_plan_hint)
     user_parts.append(
@@ -454,6 +825,21 @@ def _chapter_messages(
     )
     target_words = _chapter_target_words(novel)
 
+    if chapter_no == 1:
+        user_parts.append(
+            "【全书第1章特别要求】\n"
+            "读者第一次打开本书：正文须在前段或随场景推进**交代清楚**基本背景——至少包括与入场相关的：时代/世界或环境定位、主角身份与当前处境、"
+            "即将牵动主线的矛盾/契机/目标为何出现；与【世界观与框架摘要】一致，须可感知、可代入，不要信息真空。\n"
+            "禁止「莫名其妙」：不得用缺乏情境铺垫的群战、满篇生造设定名、或读者尚不知谁与谁为何起冲突就写结果；"
+            "若用悬念开头，须尽快给出能理解情境的最小线索，避免为悬念而悬念。"
+        )
+
+    ch1_rule_8 = ""
+    if chapter_no == 1:
+        ch1_rule_8 = (
+            "8) 若本书为第1章：除满足【全书第1章特别要求】外，正文须让读者在章内获得「谁、何处、因何如此」的最低可理解度，"
+            "与上述章内执行规则、本章计划中的 must_not 不冲突；禁止整章读毕仍搞不清基本设定与主角处境。\n"
+        )
     user_parts.append(
         "【统一输出规则】\n"
         f"1) 第一行必须输出：第{chapter_no}章《章名》；\n"
@@ -463,6 +849,7 @@ def _chapter_messages(
         "5) 用场景、对白与细节描写支撑篇幅，避免用一两段概括带过，也不要为了凑字数重复心理、环境或解释。\n"
         "6) 正文必须按自然阅读节奏分段：一般 2～6 句一段；场景切换、人物对话、动作变化、心理转折处要主动换段。\n"
         "7) 必须使用规范中文标点；禁止连续大段无标点铺陈，禁止整章只有少数几个超长段落。"
+        f"\n{ch1_rule_8}"
     )
     user = "\n\n".join(user_parts)
     return [
@@ -479,11 +866,28 @@ def _revise_chapter_messages(
     user_prompt: str,
     db: Any = None,
 ) -> list[dict[str, str]]:
-    bible = novel.framework_markdown[:6000] if novel.framework_markdown else novel.background
-    fj_block = truncate_framework_json(effective_framework_json_for_prompt(db, novel), 4000)
+    efw = effective_framework_json_for_prompt(db, novel)
+    bible = (
+        format_stage_aware_framework_bible(novel, chapter.chapter_no, framework_json_for_arcs=efw)
+        if db
+        else (novel.framework_markdown[:6000] if novel.framework_markdown else novel.background)
+    )
+    fj_block = truncate_framework_json_stage_aware(efw, chapter.chapter_no)
     fb = "\n".join(f"- {b}" for b in feedback_bodies) or "（无）"
     style_block = _writing_style_block(getattr(novel, "writing_style", None))
     target_words = _chapter_target_words(novel)
+    memory_blocks = _build_chapter_context_bundle(
+        memory_json=memory_json,
+        chapter_no=chapter.chapter_no,
+        chapter_title_hint=chapter.title,
+        chapter_plan_hint=user_prompt,
+        use_cold_recall=False,
+        cold_recall_items=0,
+        db=db,
+        novel_id=novel.id,
+        include_entity_recall=False,
+        include_rag=False,
+    )
     sys = (
         "你是资深小说编辑。在保持世界观与人物一致的前提下，根据历史反馈意见与用户最新指令，"
         "对章节全文进行改写。框架 JSON 中的 world_rules 与已定设定不得被改稿推翻；只输出改写后的正文，"
@@ -492,16 +896,21 @@ def _revise_chapter_messages(
         f"{_ANTI_AI_FLAVOR_BLOCK}"
     )
     user_parts = [
-        f"【框架摘要（Markdown）】\n{bible}",
-        f"【框架 JSON（锚点）】\n{fj_block}",
-        f"【结构化记忆 JSON】\n{memory_json}",
+        f"【世界观与长期规则（摘要）】\n{_trim_prompt_text(bible, 2600)}",
+        f"【本书硬设定锚点（JSON摘录）】\n{_trim_prompt_text(fj_block, 2200)}",
     ]
     if style_block:
         user_parts.append(style_block)
+    user_parts.extend(memory_blocks)
     user_parts.append(f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}")
     user_parts.append(f"第 {chapter.chapter_no} 章《{chapter.title}》\n\n【当前正文（正式稿）】\n{chapter.content}")
     user_parts.append(f"【历史改进意见】\n{fb}")
     user_parts.append(f"【用户本次指令】\n{user_prompt}")
+    if chapter.chapter_no == 1:
+        user_parts.append(
+            "【全书第1章】改稿后须仍能让首次入场的读者理解：基本背景、主角处境、故事因何启动；"
+            "避免改完后变成更莫名其妙或更缺信息的切入。"
+        )
     user = "\n\n".join(user_parts)
     return [
         {"role": "system", "content": sys},
@@ -518,9 +927,32 @@ def _check_and_fix_chapter_messages(
     chapter_text: str,
     db: Any = None,
 ) -> list[dict[str, str]]:
-    bible = novel.framework_markdown[:6000] if novel.framework_markdown else novel.background
-    fj_block = truncate_framework_json(effective_framework_json_for_prompt(db, novel), 4000)
+    efw = effective_framework_json_for_prompt(db, novel)
+    bible = (
+        format_stage_aware_framework_bible(novel, chapter_no, framework_json_for_arcs=efw)
+        if db
+        else (novel.framework_markdown[:6000] if novel.framework_markdown else novel.background)
+    )
+    fj_block = truncate_framework_json_stage_aware(efw, chapter_no)
     target_words = _chapter_target_words(novel)
+    memory_blocks = _build_chapter_context_bundle(
+        memory_json=memory_json,
+        chapter_no=chapter_no,
+        chapter_title_hint=chapter_title_hint,
+        chapter_plan_hint="",
+        use_cold_recall=False,
+        cold_recall_items=0,
+        db=db,
+        novel_id=novel.id,
+        include_entity_recall=False,
+        include_rag=False,
+    )
+    available_entities = ""
+    if db:
+        try:
+            available_entities = format_available_entities_for_chapter(db, novel.id, chapter_no)
+        except Exception:
+            available_entities = ""
     sys = (
         "你是小说一致性编辑。你的任务是对「待核对正文」做最小修改，解决设定漂移与前后因果断裂。"
         "严格遵守世界观与人物设定，必要时以【框架 JSON】与 world_rules 为准修正正文。"
@@ -529,22 +961,36 @@ def _check_and_fix_chapter_messages(
         "修订时需保留并优化正文可读性：自然分段、标点完整，避免出现一整坨不分段的文本。\n"
         f"{_ANTI_AI_FLAVOR_BLOCK}"
     )
-    user = (
-        f"【框架 Markdown】\n{bible}\n\n"
-        f"【框架 JSON（锚点，截断）】\n{fj_block}\n\n"
-        f"【结构化记忆 JSON（含 canonical_timeline 与 open_plots）】\n{memory_json}\n\n"
-        f"【本章信息】第 {chapter_no} 章"
-        f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}\n\n"
-        f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}\n\n"
-        f"【前文衔接摘录（含再前一章与上一章结尾）】\n{continuity_excerpt or '（首章）'}\n\n"
-        f"【待核对正文】\n{chapter_text}\n\n"
-        "【要求】\n"
-        "1) 若发现与 world_rules/canonical_timeline 冲突，必须修正正文；不得只做说明。\n"
-        "2) 允许做必要的因果补线、人物状态修正、伏笔承接与收束呈现，但不要大幅重写风格。\n"
-        "3) 维持中文小说的正常排版与阅读节奏：对话、动作、场景切换、心理变化处应合理换段。\n"
-        "4) 修正后正文仍必须严格满足上述目标字数范围要求。\n"
-        "5) 只输出最终正文。"
+    user_parts = [
+        f"【世界观与长期规则（摘要）】\n{_trim_prompt_text(bible, 2200)}",
+        f"【本书硬设定锚点（JSON摘录）】\n{_trim_prompt_text(fj_block, 1800)}",
+    ]
+    user_parts.extend(memory_blocks)
+    if available_entities:
+        user_parts.append(available_entities)
+    user_parts.extend(
+        [
+            f"【本章信息】第 {chapter_no} 章"
+            f"{('，章标题建议：' + chapter_title_hint) if chapter_title_hint else ''}",
+            f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}",
+            f"【前文衔接摘录（含再前一章与上一章结尾）】\n{continuity_excerpt or '（首章）'}",
+            f"【待核对正文】\n{chapter_text}",
+            "【要求】\n"
+            "1) 若发现与 world_rules/canonical_timeline/设定防火墙冲突，必须修正正文；不得只做说明。\n"
+            "2) 允许做必要的因果补线、人物状态修正、伏笔承接与收束呈现，但不要大幅重写风格。\n"
+            "3) 若正文使用了未在【当前可用物品与技能】中列出的物品/技能，必须改成已铺垫版本，或补出明确引入过程。\n"
+            "4) 维持中文小说的正常排版与阅读节奏：对话、动作、场景切换、心理变化处应合理换段。\n"
+            "5) 修正后正文仍必须严格满足上述目标字数范围要求。\n"
+            "6) 只输出最终正文。",
+        ]
     )
+    user = "\n\n".join(user_parts)
+    if chapter_no == 1:
+        user = (
+            user
+            + "\n\n【全书第1章补充】若待核对正文存在「读完全章仍不知基本世界/主角处境/故事因何启动」或明显莫名其妙切入，"
+            "须做最小增删补，使上述信息在章内可理解呈现，并仍满足字数范围。"
+        )
     return [
         {"role": "system", "content": sys},
         {"role": "user", "content": user},
@@ -595,14 +1041,37 @@ def _fix_chapter_to_plan_messages(
     violations: list[str],
     db: Any = None,
 ) -> list[dict[str, str]]:
-    bible = novel.framework_markdown[:6000] if novel.framework_markdown else novel.background
-    fj_block = truncate_framework_json(effective_framework_json_for_prompt(db, novel), 4000)
+    efw = effective_framework_json_for_prompt(db, novel)
+    bible = (
+        format_stage_aware_framework_bible(novel, chapter_no, framework_json_for_arcs=efw)
+        if db
+        else (novel.framework_markdown[:6000] if novel.framework_markdown else novel.background)
+    )
+    fj_block = truncate_framework_json_stage_aware(efw, chapter_no)
     target_words = _chapter_target_words(novel)
     plan_payload = chapter_plan_guard_payload(
         beats,
         chapter_no=chapter_no,
         plan_title=plan_title,
     )
+    memory_blocks = _build_chapter_context_bundle(
+        memory_json=memory_json,
+        chapter_no=chapter_no,
+        chapter_title_hint="",
+        chapter_plan_hint=json.dumps(plan_payload, ensure_ascii=False),
+        use_cold_recall=False,
+        cold_recall_items=0,
+        db=db,
+        novel_id=novel.id,
+        include_entity_recall=False,
+        include_rag=False,
+    )
+    available_entities = ""
+    if db:
+        try:
+            available_entities = format_available_entities_for_chapter(db, novel.id, chapter_no)
+        except Exception:
+            available_entities = ""
     sys = (
         "你是小说执行卡纠偏编辑。你的任务是对正文做最小必要改写，使其重新满足本章执行卡。"
         "必须补齐 must_happen / required_callbacks，删除或改写 must_not 与 reserved_for_later 的越界内容，"
@@ -610,26 +1079,31 @@ def _fix_chapter_to_plan_messages(
         "不得破坏既有世界观、人物逻辑与前后承接。只输出修订后的正文，不要解释。\n"
         f"{_ANTI_AI_FLAVOR_BLOCK}"
     )
-    user = (
-        f"【框架 Markdown】\n{bible}\n\n"
-        f"【框架 JSON（锚点，截断）】\n{fj_block}\n\n"
-        f"【结构化记忆 JSON】\n{memory_json}\n\n"
-        f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}\n\n"
-        f"【前文衔接摘录】\n{continuity_excerpt or '（首章）'}\n\n"
-        "【执行卡】\n"
-        f"{json.dumps(plan_payload, ensure_ascii=False)}\n\n"
-        "【当前正文】\n"
-        f"{chapter_text}\n\n"
-        "【已发现问题】\n"
-        f"{json.dumps(violations or [], ensure_ascii=False)}\n\n"
-        "【修正要求】\n"
-        "1) 优先解决硬约束 violations；\n"
-        "2) 保持本章标题行格式与章号正确；\n"
-        "3) 尽量保留已有可用段落，只改冲突处；\n"
-        "4) 章末尽量贴近 ending_hook，但不要额外越级推进；\n"
-        "5) 修正后正文必须严格满足上述目标字数范围要求；\n"
-        "6) 只输出最终正文。"
+    user_parts = [
+        f"【世界观与长期规则（摘要）】\n{_trim_prompt_text(bible, 2000)}",
+        f"【本书硬设定锚点（JSON摘录）】\n{_trim_prompt_text(fj_block, 1800)}",
+    ]
+    user_parts.extend(memory_blocks)
+    if available_entities:
+        user_parts.append(available_entities)
+    user_parts.extend(
+        [
+            f"【字数硬约束】\n{_strong_chapter_word_rule(target_words)}",
+            f"【前文衔接摘录】\n{continuity_excerpt or '（首章）'}",
+            "【执行卡】\n" + json.dumps(plan_payload, ensure_ascii=False),
+            "【当前正文】\n" + chapter_text,
+            "【已发现问题】\n" + json.dumps(violations or [], ensure_ascii=False),
+            "【修正要求】\n"
+            "1) 优先解决硬约束 violations；\n"
+            "2) 保持本章标题行格式与章号正确；\n"
+            "3) 若正文使用了未在【当前可用物品与技能】中列出的物品/技能，必须改成已铺垫版本，或明确补出引入过程；\n"
+            "4) 尽量保留已有可用段落，只改冲突处；\n"
+            "5) 章末尽量贴近 ending_hook，但不要额外越级推进；\n"
+            "6) 修正后正文必须严格满足上述目标字数范围要求；\n"
+            "7) 只输出最终正文。",
+        ]
     )
+    user = "\n\n".join(user_parts)
     return [
         {"role": "system", "content": sys},
         {"role": "user", "content": user},
@@ -645,8 +1119,6 @@ def _de_ai_chapter_messages(
     chapter_text: str,
     db: Any = None,
 ) -> list[dict[str, str]]:
-    bible = novel.framework_markdown[:6000] if novel.framework_markdown else novel.background
-    fj_block = truncate_framework_json(effective_framework_json_for_prompt(db, novel), 4000)
     style_block = _writing_style_block(getattr(novel, "writing_style", None))
     plan_payload = chapter_plan_guard_payload(
         beats,
@@ -667,10 +1139,7 @@ def _de_ai_chapter_messages(
         "只输出润色后的正文，不要解释。\n"
         f"{_ANTI_AI_FLAVOR_BLOCK}"
     )
-    parts = [
-        f"【框架 Markdown】\n{bible}",
-        f"【框架 JSON（锚点，截断）】\n{fj_block}",
-    ]
+    parts: list[str] = []
     if style_block:
         parts.append(style_block)
     parts.extend(
@@ -683,7 +1152,56 @@ def _de_ai_chapter_messages(
             "3) 可以缩短、拆句、换更自然的表达，但不要扩写，也不要大幅删减有效情节与描写；\n"
             f"4) {_strong_chapter_word_rule(target_words)}\n"
             f"5) 当前正文约 {original_body_chars} 字，润色后必须重新计数并修正到允许范围内；\n"
-            "6) 优先处理解释腔、总结腔、空泛心理句、重复修饰和机械比喻。",
+            "6) 物品、技能、人物关系和章末结果都视为硬事实，禁止润色时改动；\n"
+            "7) 优先处理解释腔、总结腔、空泛心理句、重复修饰和机械比喻。",
+            f"【当前正文】\n{chapter_text}",
+        ]
+    )
+    return [
+        {"role": "system", "content": sys},
+        {"role": "user", "content": "\n\n".join(parts)},
+    ]
+
+
+def _expressive_enhance_chapter_messages(
+    novel: Novel,
+    *,
+    chapter_no: int,
+    plan_title: str,
+    beats: dict[str, Any],
+    chapter_text: str,
+    strength: str,
+    db: Any = None,
+) -> list[dict[str, str]]:
+    plan_payload = chapter_plan_guard_payload(
+        beats,
+        chapter_no=chapter_no,
+        plan_title=plan_title,
+    )
+    st = (strength or "safe").strip().lower()
+    strength_hint = {
+        "safe": "轻量：只加强少数画面/对白节奏，避免大幅增删。",
+        "strong": "中等：可重排小段落、增强镜头感与潜台词，不得动事实。",
+        "cinematic": "强：更电影化分镜与张力，仍禁止动事实。",
+    }.get(st, "以提升阅读张力为主，禁止改事件。")
+    style_block = _writing_style_block(getattr(novel, "writing_style", None))
+    voice_profiles = _format_character_voice_profiles_for_prompt(db, novel.id, chapter_no)
+    state_snapshot = _format_state_snapshot_for_prompt(db, novel.id, chapter_no)
+    sys = (
+        "你是资深网文执行编辑。本轮只负责「表现力增强」：强画面、动作、感官、对白与潜台词；"
+        "必须保留首行章标题。禁止增删/颠倒/改写剧情硬事实、禁止新设定、禁止改人名地名、禁止改章末收束与执行卡'必须'项。"
+        f"\n强度：{strength_hint}\n{_ANTI_AI_FLAVOR_BLOCK}"
+    )
+    parts: list[str] = []
+    if style_block:
+        parts.append(style_block)
+    if voice_profiles:
+        parts.append(voice_profiles)
+    if state_snapshot:
+        parts.append(state_snapshot)
+    parts.extend(
+        [
+            "【硬边界：执行卡】\n" + json.dumps(plan_payload, ensure_ascii=False),
             f"【当前正文】\n{chapter_text}",
         ]
     )
@@ -945,6 +1463,55 @@ def coerce_novel_outline_base_fields(
     return base_md, base_j
 
 
+def _collect_arc_body_for_markdown(arc: dict) -> str:
+    """从单条 arc 对象提取可读正文（兼容 summary / sub_arcs / key_events 等结构）。"""
+    chunks: list[str] = []
+
+    for key in ("summary", "description", "detail", "plot", "outline", "content", "notes"):
+        v = arc.get(key)
+        if isinstance(v, str) and v.strip():
+            chunks.append(v.strip())
+
+    subs = arc.get("sub_arcs")
+    if isinstance(subs, list):
+        for j, sa in enumerate(subs, 1):
+            if not isinstance(sa, dict):
+                continue
+            st = str(sa.get("title") or sa.get("name") or f"子阶段{j}").strip()
+            block: list[str] = []
+            for key in ("summary", "description", "detail", "plot"):
+                vv = sa.get(key)
+                if isinstance(vv, str) and vv.strip():
+                    block.append(vv.strip())
+            if block:
+                body = " ".join(block)
+                chunks.append(f"**{st}** {body}" if st else body)
+
+    ke = arc.get("key_events")
+    if isinstance(ke, list):
+        bullets: list[str] = []
+        for x in ke:
+            if isinstance(x, str) and x.strip():
+                bullets.append(f"- {x.strip()}")
+            elif isinstance(x, dict):
+                t = str(x.get("title") or x.get("name") or "").strip()
+                body = (
+                    x.get("summary")
+                    or x.get("text")
+                    or x.get("event")
+                    or x.get("description")
+                )
+                if isinstance(body, str) and body.strip():
+                    if t:
+                        bullets.append(f"- **{t}** {body.strip()}")
+                    else:
+                        bullets.append(f"- {body.strip()}")
+        if bullets:
+            chunks.append("\n".join(bullets))
+
+    return "\n\n".join(chunks) if chunks else ""
+
+
 def render_volume_arcs_markdown(volume_no: int, arcs: list[Any]) -> str:
     """由本卷 arcs 列表生成可读 Markdown，写入 novel_volumes.outline_markdown。"""
     lines: list[str] = [f"## 第{volume_no}卷 分卷剧情弧线（Arcs）", ""]
@@ -954,19 +1521,107 @@ def render_volume_arcs_markdown(volume_no: int, arcs: list[Any]) -> str:
             continue
         n += 1
         title = str(arc.get("title") or arc.get("name") or f"弧线{n}").strip()
-        summ = str(arc.get("summary") or "").strip()
-        r0 = arc.get("from_chapter") if isinstance(arc.get("from_chapter"), int) else arc.get("from")
-        r1 = arc.get("to_chapter") if isinstance(arc.get("to_chapter"), int) else arc.get("to")
-        rng = ""
-        if isinstance(r0, int) and isinstance(r1, int):
-            rng = f"（约第{r0}—{r1}章）"
+        b = arc_bounds_from_dict(arc)
+        rng = f"（约第{b[0]}—{b[1]}章）" if b else ""
+        body = _collect_arc_body_for_markdown(arc)
         lines.append(f"### {title} {rng}".rstrip())
-        if summ:
-            lines.append(summ)
+        if body:
+            lines.append(body)
+        else:
+            lines.append("（本 5 章段未返回 summary，请重新生成分卷剧情。）")
+        hook = arc.get("hook")
+        if isinstance(hook, str) and hook.strip():
+            lines.append(f"- **钩子**：{hook.strip()}")
+        mn = arc.get("must_not")
+        if isinstance(mn, list) and mn:
+            mns = [str(x).strip() for x in mn if str(x).strip()]
+            if mns:
+                lines.append(
+                    "- **禁止推进（本段内不得）**："
+                    + "；".join(mns)
+                )
+        elif isinstance(mn, str) and mn.strip():
+            lines.append(f"- **禁止推进（本段内不得）**：{mn.strip()}")
+        pa = arc.get("progress_allowed")
+        if isinstance(pa, list) and pa:
+            pas = [str(x).strip() for x in pa if str(x).strip()]
+            if pas:
+                lines.append(
+                    "- **允许推进（本段应完成/可写）**："
+                    + "；".join(pas)
+                )
+        elif isinstance(pa, str) and pa.strip():
+            lines.append(f"- **允许推进（本段应完成/可写）**：{pa.strip()}")
         lines.append("")
     if n == 0:
         return ""
     return "\n".join(lines).rstrip()
+
+
+def _build_prior_volumes_arcs_context_block(
+    framework_json: dict[str, Any] | None,
+    *,
+    min_target_volume_no: int,
+    volume_size: int,
+    max_chars: int = 14000,
+    max_prior_volumes: int = 3,
+) -> str:
+    """
+    增量生成分卷 arcs 时，把「目标卷之前」已存在于 framework_json 的弧线摘要喂给模型，
+    避免后卷与已写前卷脱节。（仅用于 prompt，不修改存库结构。）
+
+    默认只纳入「紧邻新卷之前」的若干整卷弧线（max_prior_volumes），避免第 10 卷等把全书
+    前 9 卷全文塞进 prompt；主线与设定已由第一阶段基础大纲覆盖。
+    若仍超长，截断时**保留靠近新卷的一端**（尾部），避免丢掉刚发生的剧情。
+    """
+    if min_target_volume_no <= 1 or not isinstance(framework_json, dict):
+        return ""
+    arcs = framework_json.get("arcs")
+    if not isinstance(arcs, list) or not arcs:
+        return ""
+    ch_start = (min_target_volume_no - 1) * volume_size + 1
+    prev_last_vol = min_target_volume_no - 1
+    span = max(1, int(max_prior_volumes))
+    earliest_vol = max(1, prev_last_vol - span + 1)
+    earliest_ch = (earliest_vol - 1) * volume_size + 1
+    picked: list[dict[str, Any]] = []
+    for arc in arcs:
+        if not isinstance(arc, dict):
+            continue
+        b = arc_bounds_from_dict(arc)
+        if not b:
+            continue
+        fc, _tc = b
+        if fc < ch_start and fc >= earliest_ch:
+            picked.append(arc)
+
+    def _sort_key(a: dict[str, Any]) -> int:
+        b2 = arc_bounds_from_dict(a)
+        return b2[0] if b2 else 999999
+
+    picked.sort(key=_sort_key)
+    lines: list[str] = []
+    for arc in picked:
+        title = str(arc.get("title") or arc.get("name") or "弧线").strip()
+        b = arc_bounds_from_dict(arc)
+        rng = f"第{b[0]}—{b[1]}章" if b else "章号未定"
+        body = _collect_arc_body_for_markdown(arc)
+        if body:
+            body = body[:900]
+        hook = arc.get("hook")
+        hook_s = hook.strip()[:400] if isinstance(hook, str) and hook.strip() else ""
+        chunk = f"### {title}（{rng}）\n{(body or '（无 summary）').strip()}"
+        if hook_s:
+            chunk += f"\n卷末/段末钩子：{hook_s}"
+        lines.append(chunk)
+    if not lines:
+        return ""
+    out = "\n\n".join(lines)
+    if len(out) > max_chars:
+        # 保留靠近目标卷的一端（列表已按章号升序，尾部更关键）
+        tail = out[-(max_chars - 48) :].lstrip()
+        out = "…（更早卷弧线已从摘要中省略；以下贴近当前卷）\n" + tail
+    return out
 
 
 def _merge_arcs_into_framework(
@@ -1012,16 +1667,17 @@ def _merge_arcs_into_framework(
             def _arc_in_target(arc: dict[str, Any]) -> bool:
                 if not isinstance(arc, dict):
                     return False
-                fc = arc.get("from_chapter") or arc.get("from")
-                tc = arc.get("to_chapter") or arc.get("to")
-                if isinstance(fc, int) and isinstance(tc, int):
-                    for lo, hi in target_chapter_ranges:
-                        if fc >= lo and fc <= hi:
-                            return True
-                        if tc >= lo and tc <= hi:
-                            return True
-                        if fc < lo and tc >= hi:
-                            return True
+                b = arc_bounds_from_dict(arc)
+                if not b:
+                    return False
+                fc, tc = b
+                for lo, hi in target_chapter_ranges:
+                    if fc >= lo and fc <= hi:
+                        return True
+                    if tc >= lo and tc <= hi:
+                        return True
+                    if fc < lo and tc >= hi:
+                        return True
                 return False
 
             # 保留不在目标卷范围内的旧 arcs
@@ -1030,9 +1686,9 @@ def _merge_arcs_into_framework(
             # 按 from_chapter 排序
             def _arc_sort_key(a: dict[str, Any]) -> int:
                 if isinstance(a, dict):
-                    fc = a.get("from_chapter") or a.get("from")
-                    if isinstance(fc, int):
-                        return fc
+                    b = arc_bounds_from_dict(a)
+                    if b:
+                        return b[0]
                 return 99999
             kept.sort(key=_arc_sort_key)
             merged["arcs"] = kept
@@ -1477,18 +2133,61 @@ class NovelLLMService:
         target_chapters, _, _ = self._framework_target_meta(novel)
         ws_block = self._framework_style_block_for_novel(novel, db=db)
 
+        tc_scale = int(target_chapters) if isinstance(target_chapters, int) and target_chapters > 0 else 120
+        if tc_scale >= 300:
+            framework_depth_contract = (
+                "【篇幅与细节契约（须严格遵守）】目标章数偏多，禁止「设定名词堆砌」或一句话带过。\n"
+                "- Markdown 三部分合计建议不少于 **2800 汉字**；其中「## 一、世界观与核心设定」不少于 **1000 汉字**，"
+                "须覆盖：权力结构/日常与异常的张力、力量或规则的**代价与边界**、信息如何流动、至少两处可被剧情反复利用的「硬设定钩子」。\n"
+                "- 「## 二、核心人物」至少 **6 名**有姓名的关键角色（主角、主要对手或制度性阻力、导师/盟友、至少两名功能性强的配角）；"
+                "每人 Markdown 不少于 **180 汉字**，写清：外在目标、内在匮乏或恐惧、与同阵营/对手的关系张力、可被读者记住的行为或语言习惯。\n"
+                "- 「## 三、主线剧情与长期矛盾」不少于 **700 汉字**，写出阶段性升级与至少两条支线种子。\n"
+                "- JSON：characters 数组至少 **6** 条；每人 traits 用分号串联 **不少于 6 条**可表演化标签；motivation 每人不少于 **70 汉字**；"
+                "world_rules 总字数不少于 **220 汉字**且用短句分条；main_plot 不少于 **400 汉字**，须以「阶段—关键事件—阶段性后果」链式写出至少三段递进，"
+                "并能读出「开篇势能—中段对抗—终局方向/悬念」；"
+                "themes 不少于 **40 汉字**。\n"
+            )
+        elif tc_scale <= 60:
+            framework_depth_contract = (
+                "【篇幅与细节契约（须严格遵守）】偏中短篇仍要写透可用设定。\n"
+                "- Markdown 三部分合计建议不少于 **1200 汉字**；「## 一」不少于 **420 汉字**；「## 二」至少 **4 名**核心角色，每人不少于 **110 汉字**；"
+                "「## 三」不少于 **380 汉字**。\n"
+                "- JSON：characters 至少 **4** 条；traits 每人不少于 **4** 条标签；motivation 每人不少于 **45 汉字**；"
+                "world_rules 不少于 **120 汉字**；main_plot 不少于 **220 汉字**，须含至少两段「谁做什么→遭遇什么→得到/失去什么」的具体推进；"
+                "themes 不少于 **28 汉字**。\n"
+            )
+        else:
+            framework_depth_contract = (
+                "【篇幅与细节契约（须严格遵守）】\n"
+                "- Markdown 三部分合计建议不少于 **2000 汉字**；「## 一」不少于 **800 汉字**；「## 二」至少 **5 名**核心角色，每人不少于 **150 汉字**；"
+                "「## 三」不少于 **550 汉字**。\n"
+                "- JSON：characters 至少 **5** 条；traits 每人不少于 **5** 条标签；motivation 每人不少于 **55 汉字**；"
+                "world_rules 不少于 **180 汉字**；main_plot 不少于 **320 汉字**，须含至少三段可执行推进（每段含具体冲突或信息反转位）；"
+                "themes 不少于 **36 汉字**。\n"
+            )
+
+        framework_markdown_structure_contract = (
+            "【Markdown 结构要求】\n"
+            "- 只输出基础框架，必须包含且仅按以下三个一级章节组织：## 一、世界观与核心设定；## 二、核心人物；## 三、主线剧情与长期矛盾。\n"
+            "- 除非用户明确要求改变格式，否则不要改章节标题名、不要改章节顺序、不要把人物或主线拆成额外的同级大节。\n"
+        )
+        framework_content_contract = (
+            "【内容要求】\n"
+            "- 世界观：除法则与力量体系外，须点名主要势力/地理或空间结构、资源稀缺性、普通人 vs 超凡者的日常差异。\n"
+            "- 人物：禁止只写「高冷/温柔」等抽象词；traits 要能指导对白与行为；说明人物在主线中的功能（推动/阻碍/误导/牺牲等）。\n"
+            "- 主线：必须写清「谁想要什么、为何现在拿不到、拿不到会怎样」；并写出可执行故事线：至少点明主要对手或制度性阻力在做什么、"
+            "至少两处中盘反转或信息反转的伏笔位、至少两个带代价或时限的压力点；避免只用抽象词概括成长或逆袭。\n"
+        )
+
         if mode == "create":
             sys = (
                 "你是资深网文策划与世界观编辑。当前是第一阶段，只生成基础框架：设定、人物、主线，不生成卷级概览，不生成分卷剧情大纲（arcs）。\n"
                 "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
                 "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
-                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
-                "【Markdown 结构要求】\n"
-                "- 只输出基础框架，建议包含：## 一、世界观与核心设定；## 二、核心人物；## 三、主线剧情与长期矛盾。\n"
-                "【内容要求】\n"
-                "- 世界观 (world_rules)：必须包含核心法则、力量/等级体系详情、特殊设定等。\n"
-                "- 人物 (characters)：除了姓名和性格，必须提供核心动机(motivation)，并说明阶段目标或成长方向。\n"
-                "- 主线 (main_plot)：明确长期主冲突、阶段性升级路线、终局方向与主要悬念。\n"
+                "可以补充 forbidden_constraints、key_locations、key_factions 等硬约束或索引键，但严禁输出 arcs、volume_overview、volumes。\n"
+                f"{framework_markdown_structure_contract}"
+                f"{framework_content_contract}"
+                f"{framework_depth_contract}"
                 f"{_ANTI_AI_FLAVOR_BLOCK}\n"
                 "参考文本仅借鉴结构与文风，禁止抄袭原句。"
             )
@@ -1497,6 +2196,8 @@ class NovelLLMService:
                 f"背景设定：{novel.background}\n文风关键词：{novel.style}\n"
                 f"{ws_block}"
                 f"目标章节数：{target_chapters}\n\n"
+                "请把简介与背景设定中的信息**展开、细化、落地**到 Markdown 与 JSON 中，而不是复述一遍短句；"
+                "若简介与背景互有缺口，可在不违背用户意图的前提下做合理推演补全。\n"
                 "本阶段不要写卷级概览，不要写分卷剧情大纲，不要输出 arcs。\n\n"
                 f"参考文本节选：\n{ref or '（无）'}"
             )
@@ -1508,7 +2209,10 @@ class NovelLLMService:
                 "卷级概览与分卷剧情大纲（arcs）将在第二阶段单独生成。\n"
                 "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
                 "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
-                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                "可以补充 forbidden_constraints、key_locations、key_factions 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                f"{framework_markdown_structure_contract}"
+                f"{framework_content_contract}"
+                f"{framework_depth_contract}"
                 f"{_ANTI_AI_FLAVOR_BLOCK}\n"
                 "参考文本仅借鉴结构与文风，禁止抄袭原句。"
             )
@@ -1519,6 +2223,7 @@ class NovelLLMService:
                 f"【当前框架 Markdown（截断）】\n{md_block or '（空）'}\n\n"
                 f"【当前框架 JSON（截断）】\n{fj_block}\n\n"
                 f"【用户修改指令】\n{(instruction or '').strip()}\n\n"
+                "请优先保留当前版本里已经合理、可用的部分，在此基础上重写并补强；若用户指令未明确要求换格式，就继续维持三段式基础大纲骨架。\n"
                 "本阶段只处理设定/人物/主线，不要输出卷级概览，不要输出 arcs。\n\n"
                 f"参考文本节选：\n{ref or '（无）'}"
             )
@@ -1531,8 +2236,9 @@ class NovelLLMService:
                 "卷级概览与分卷剧情大纲（arcs）将在第二阶段基于本结果单独生成。\n"
                 "请输出两部分：1) 完整可读 Markdown；2) 末尾单独一个 JSON 代码块，包含 "
                 "world_rules, main_plot, characters[{name,role,traits,motivation}], themes 等基础键；"
-                "可以补充 forbidden_constraints 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
+                "可以补充 forbidden_constraints、key_locations、key_factions 等硬约束，但严禁输出 arcs、volume_overview、volumes。\n"
                 "要求：人物列表以用户提供为准；需要时可以补充少量关键配角，但不得删除用户给出的主角。\n"
+                f"{framework_depth_contract}"
                 f"{_ANTI_AI_FLAVOR_BLOCK}"
             )
             user = (
@@ -1573,6 +2279,7 @@ class NovelLLMService:
         instruction: str = "",
         characters: list[dict[str, Any]] | None = None,
         target_volume_nos: list[int] | None = None,
+        prior_volumes_arcs_context: str = "",
     ) -> tuple[str, dict[str, Any]]:
         router = self._router(db=db)
         ref = load_reference_text_for_llm(
@@ -1607,20 +2314,63 @@ class NovelLLMService:
                 f"- 默认每卷约 {volume_size} 章；总卷数约 {volume_n if volume_n else '请按目标章节数估算'}。\n"
             )
 
+        vol_seg_block = ""
+        tc = int(target_chapters) if isinstance(target_chapters, int) and target_chapters > 0 else 0
+        if target_volume_nos and tc > 0:
+            parts: list[str] = []
+            for raw in sorted(target_volume_nos):
+                try:
+                    vn = int(raw)
+                except (TypeError, ValueError):
+                    continue
+                if vn < 1:
+                    continue
+                lo = (vn - 1) * volume_size + 1
+                hi = min(tc, vn * volume_size)
+                if lo > hi:
+                    continue
+                n_arc = max(1, (hi - lo + 1 + 4) // 5)
+                parts.append(
+                    f"  · 第{vn}卷为全书第 {lo}—{hi} 章：JSON 的 arcs 中，针对该卷**必须出现恰好 {n_arc} 条** arc，"
+                    f"按**每 5 章一条**连续切分（相邻 arc 的章节号衔接、不重不漏，最后一条可到 {hi}）。"
+                )
+            if parts:
+                vol_seg_block = (
+                    "【本请求须满足的卷内条数（与下方 JSON 的 arcs 数组一一对应）】\n"
+                    + "\n".join(parts)
+                    + "\n"
+                )
+
+        prior_arcs_sys = ""
+        if prior_volumes_arcs_context.strip():
+            prior_arcs_sys = (
+                "若用户消息中包含「已生成的前序分卷剧情弧线摘要」，你必须将其视为已定剧情走向："
+                "新卷 arcs 与卷级概览须自然承接其中人物状态、未收束悬念与冲突升级，不得重置或无视前序已定内容。\n"
+            )
         sys = (
             "你是资深网文策划与长篇连载分卷编辑。当前是第二阶段：只负责补完「卷级概览 + 分卷剧情大纲（Arcs）」。\n"
+            f"{prior_arcs_sys}"
             "你必须严格沿用既有的世界观、人物、主线，不得重写 world_rules、main_plot、characters、themes，只能在其基础上细化长篇推进节奏。\n"
             "请输出两部分：1) 只包含新增部分的 Markdown 片段，且只写 `## 四、卷级概览` 与 `## 五、分卷剧情大纲 (Arcs)` 两节；"
             "2) 末尾单独一个 JSON 代码块，只包含 volume_overview 与 arcs 两个键，其中 arcs 必填。\n"
             "【卷级概览要求】\n"
             f"{volume_scope_hint}"
             "- 用卷为粒度概括每卷的主目标、核心冲突、阶段成果、卷末钩子。\n"
-            "【Arcs 细化要求】\n"
-            "- 每个 arc 需明确章节范围（from_chapter/to_chapter 或 chapters: \"x-y\"）。\n"
-            "- 每个 arc 必须进一步拆解为每 10 章一个固定子阶段（sub_arcs 或 key_events）。\n"
-            "- 每个 10 章子阶段必须足够详细，后半程的细节密度不能下降，禁止越往后越简写。\n"
-            "- 每个子阶段应写清：具体事件推进、人物关系变化、心理转折、伏笔投放/回收、阶段阻碍与阶段结果。\n"
-            "- arcs 的关键节点必须能体现主角成长、冲突升级、资源变化与代价积累。\n"
+            "【分卷剧情 arcs 的硬性切分（必须遵守）】\n"
+            f"- 以全书连续章号书写 from_chapter、to_chapter；默认每卷约 {volume_size} 章。\n"
+            "- **每一卷内**按**每 5 章为一条 arc** 切分：在标准 50 章的卷中必须输出**恰好 10 条** arc，"
+            "对应全书章号 1-5、6-10、11-15、16-20、21-25、26-30、31-35、36-40、41-45、46-50"
+            f"（若该卷在全书中的章节起点不是 1，则整体平移到该卷的 from–to 范围内，仍保持每 5 章一条）。\n"
+            "- 若某卷章数不是 5 的倍数，最后一条 arc 的 to_chapter 可到该卷末，前面仍按每 5 章一条。\n"
+            "- **禁止**仅用 1-30、31-50 等两三条粗弧代替整卷的 5 章细弧。\n"
+            "- 每个 arc 使用 JSON 整数 from_chapter、to_chapter（勿用字符串）；\n"
+            "每条必须包含 **title**（短标题）与 **summary**（必填，**至少约 80 个汉字**），"
+            "写清该段内的目标、冲突、转折、人物与伏笔；**禁止**只输出标题不写 summary。\n"
+            "每条 arc **还必须**包含以下与执行约束相关的键（都不得为空泛占位）：\n"
+            "- **hook**（string）：本段收束时留给下一段的悬念/钩子，1-3 句，可接剧情。\n"
+            "- **must_not**（string[]）：**至少 1 条**，写明本段内**禁止**提前推进、揭露或完结的内容（如终局真相、某身份、某势力底牌等）。\n"
+            "- **progress_allowed**（string 或 string[]）：**至少 1 项**，写明本段**允许且应当**推进到的阶段/可写事件，与 must_not 不矛盾。\n"
+            "- 若仍有余力，可在 arc 内附加 sub_arcs 或 key_events 作补充，**但不得**用子结构代替使 summary、hook、must_not、progress_allowed 留空。\n"
             f"{_ANTI_AI_FLAVOR_BLOCK}\n"
             "参考文本仅借鉴结构与文风，禁止抄袭原句。"
         )
@@ -1628,12 +2378,19 @@ class NovelLLMService:
             f"书名：{novel.title}\n简介：{novel.intro}\n背景设定：{novel.background}\n文风关键词：{novel.style}\n"
             f"{ws_block}"
             f"目标章节数：{target_chapters}\n"
-            f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n\n"
+            f"分卷规则：默认每卷 {volume_size} 章；总卷数约：{volume_n if volume_n else '（请按目标章节数自行估算）'}\n"
+            f"{vol_seg_block}\n"
             f"【第一阶段基础框架 Markdown】\n{base_markdown or '（空）'}\n\n"
             f"【第一阶段基础框架 JSON】\n{base_json_text}\n"
             f"{instruction_block}"
             f"{chars_block}\n"
-            "请只补全卷级概览与 arcs，不要重复输出前面已经定好的设定/人物/主线全文。\n\n"
+            + (
+                f"\n【已生成的前序分卷剧情弧线摘要（承接用；勿逐字复述，须与本批新卷内容连贯）】\n"
+                f"{prior_volumes_arcs_context.strip()}\n"
+                if prior_volumes_arcs_context.strip()
+                else ""
+            )
+            + "请只补全卷级概览与 arcs，不要重复输出前面已经定好的设定/人物/主线全文。\n\n"
             f"参考文本节选：\n{ref or '（无）'}"
         )
         text = await router.chat_text(
@@ -1721,6 +2478,20 @@ class NovelLLMService:
 
         _notify_progress(progress_callback, f"生成第{','.join(str(v) for v in (target_volume_nos or []))}卷的 Arcs")
 
+        prior_ctx = ""
+        if target_volume_nos:
+            try:
+                min_v = min(int(x) for x in target_volume_nos)
+            except (TypeError, ValueError):
+                min_v = 1
+            if min_v > 1:
+                _, vs, _ = self._framework_target_meta(novel)
+                prior_ctx = _build_prior_volumes_arcs_context_block(
+                    current_fw,
+                    min_target_volume_no=min_v,
+                    volume_size=vs,
+                )
+
         arcs_markdown, arcs_payload = await self._generate_framework_arcs_stage(
             novel,
             base_markdown=base_markdown,
@@ -1728,6 +2499,7 @@ class NovelLLMService:
             db=db,
             instruction=instruction,
             target_volume_nos=target_volume_nos,
+            prior_volumes_arcs_context=prior_ctx,
         )
 
         # 增量合并：只替换/追加指定卷的 arcs
@@ -1778,6 +2550,7 @@ class NovelLLMService:
         to_chapter: int,
         memory_json: str,
         prev_batch_context: str = "",
+        cross_volume_tail_context: str = "",
         db: Any = None,
     ) -> str:
         """
@@ -1786,6 +2559,7 @@ class NovelLLMService:
         设计目的：
         - 前端/用户手动点击推进，每次只跑一批，成功即落库，避免整卷循环导致超时白跑。
         - 通过 prev_batch_context 传递上一批末两章关键信息，保证连续性。
+        - cross_volume_tail_context：新开卷首批时由调用方注入上一卷末计划/正文摘录。
         """
         batch_label = f"卷{volume_no} 批次 {from_chapter}-{to_chapter}"
         batch_json_str = await self._generate_single_batch_plan(
@@ -1796,6 +2570,7 @@ class NovelLLMService:
             to_chapter=to_chapter,
             memory_json=memory_json,
             prev_batch_context=prev_batch_context,
+            cross_volume_tail_context=cross_volume_tail_context,
             db=db,
         )
         batch_data = self._parse_volume_plan_llm_json(batch_json_str, batch_label=batch_label)
@@ -1939,6 +2714,7 @@ class NovelLLMService:
                 to_chapter=to_chapter,
                 memory_json=memory_json,
                 prev_batch_context="",
+                cross_volume_tail_context="",
                 db=db,
             )
             batch_data = self._parse_volume_plan_llm_json(
@@ -1990,6 +2766,7 @@ class NovelLLMService:
                 to_chapter=batch_end,
                 memory_json=memory_json,
                 prev_batch_context=prev_batch_context,
+                cross_volume_tail_context="",
                 db=db,
             )
 
@@ -2040,6 +2817,7 @@ class NovelLLMService:
         to_chapter: int,
         memory_json: str,
         prev_batch_context: str = "",
+        cross_volume_tail_context: str = "",
         db: Any = None,
     ) -> str:
         """生成单批次章计划"""
@@ -2059,6 +2837,15 @@ class NovelLLMService:
             f"{_ANTI_AI_FLAVOR_BLOCK}"
         )
 
+        cross_volume_hint = ""
+        if cross_volume_tail_context.strip():
+            cross_volume_hint = (
+                "\n\n【跨卷衔接：上一卷末（须承接，与下列事实无矛盾）】\n"
+                f"{cross_volume_tail_context.strip()}\n"
+                "要求：本批为当前卷起始章计划，须在人物状态、悬念与未结冲突上自然接续上一卷末；"
+                "不得重置剧情线或无视上文已发生的事实；volume_summary 须点出与上一卷的承接关系。\n"
+            )
+
         # 构建前文上下文提示
         continuity_hint = ""
         if prev_batch_context:
@@ -2075,6 +2862,7 @@ class NovelLLMService:
             f"【框架 Markdown（摘要）】\n{(novel.framework_markdown or novel.background or '')[:8000]}\n\n"
             f"【框架 JSON】\n{novel.framework_json or '{}'}\n\n"
             f"【结构化记忆（open_plots/canonical_timeline 等）】\n{memory_json}\n"
+            f"{cross_volume_hint}"
             f"{continuity_hint}"
             "【输出要求（严格 JSON）】\n"
             "{\n"
@@ -2092,9 +2880,30 @@ class NovelLLMService:
             '        \"plot_summary\": string,\n'
             '        \"stage_position\": string,\n'
             '        \"pacing_justification\": string,\n'
+            '        \"expressive_brief\": {\n'
+            '          \"pov_strategy\": string,\n'
+            '          \"emotional_curve\": string,\n'
+            '          \"sensory_focus\": string,\n'
+            '          \"dialogue_strategy\": string,\n'
+            '          \"scene_tempo\": string,\n'
+            '          \"reveal_strategy\": string\n'
+            '        },\n'
             '        \"progress_allowed\": string 或 string[],\n'
             '        \"must_not\": string[],\n'
-            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ]\n'
+            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ],\n'
+            '        \"scene_cards\": [\n'
+            '          {\n'
+            '            \"label\": string,\n'
+            '            \"goal\": string,\n'
+            '            \"conflict\": string,\n'
+            '            \"content\": string,\n'
+            '            \"outcome\": string,\n'
+            '            \"emotion_beat\": string,\n'
+            '            \"camera\": string,\n'
+            '            \"dialogue_density\": string,\n'
+            '            \"words\": number\n'
+            '          }\n'
+            '        ]\n'
             "      },\n"
             '      \"open_plots_intent_added\": string[],\n'
             '      \"open_plots_intent_resolved\": string[]\n'
@@ -2106,8 +2915,10 @@ class NovelLLMService:
             "beats 字段说明：plot_summary 为本章剧情梗概（约 5～12 句，须写清场景转换、关键行动、信息边界、章末停笔点）；"
             "stage_position 用一两句说明本章在「当前大纲弧/本卷」中的位置（例如「第一弧约 15% 处、仅完成铺垫」）；"
             "pacing_justification 用一两句说明本章为何**不会**提前触发后续弧或更大阶段的核心事件（避免与 must_not 矛盾）；"
+            "expressive_brief 必填，负责规定本章怎么写而不是写什么：至少写清 POV 站位、情绪推进、感官焦点、对白策略、场景节奏、信息揭示方式；"
             "progress_allowed 写明本章允许推进的内容；must_not 列出本章绝对不得出现的情节、能力觉醒、设定点名、剧透；"
-            "reserved_for_later 列出须延后到指定章节号及之后才允许在正文成真或点名的条目（not_before_chapter 为全局章节号）。\n\n"
+            "reserved_for_later 列出须延后到指定章节号及之后才允许在正文成真或点名的条目（not_before_chapter 为全局章节号）；"
+            "scene_cards 必填，按顺序拆成 2-4 个场景，每个场景除剧情内容外还要包含 emotion_beat / camera / dialogue_density，确保后续写作有表现抓手。\n\n"
             "【硬约束】\n"
             f"1) chapters 数组必须恰好包含 {batch_chapter_count} 个对象（第 {from_chapter}～{to_chapter} 章，缺一不可、也不可合并）；"
             f"chapter_no 从 {from_chapter} 起连续递增；输出前自检 JSON 中 chapters.length === {batch_chapter_count}；\n"
@@ -2122,7 +2933,16 @@ class NovelLLMService:
             "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致；\n"
             "9) 每章必须填写 stage_position 与 pacing_justification，且与 plot_summary、must_not 一致；\n"
             "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件；\n"
-            f"{anti_repetition_block}"
+            + (
+                "11) 本批次若包含**全书第1章**（存在 chapter_no=1）：该章必须是「可入场的第1章」——"
+                "plot_summary 须写清如何通过场景/对白/观察呈现：基本时空或环境、主角身份与当前处境、主线矛盾或故事契机的来由，"
+                "使读者不依赖脑补即可理解谁、何处、因何进入当前局面；"
+                "goal 与 conflict 须与上述交代自然衔接，不得写成无情境骨架的事件清单；"
+                "must_not 须明确禁止缺乏铺垫的「莫名其妙」开场（例如未解释的多方混战、大段生造专名砸脸、读者尚不知人物关系就写终局式结果等）。\n"
+                if from_chapter <= 1 <= to_chapter
+                else ""
+            )
+            + f"{anti_repetition_block}"
         )
         return await router.chat_text(
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
@@ -2184,6 +3004,7 @@ class NovelLLMService:
         to_chapter: int,
         memory_json: str,
         prev_batch_context: str = "",
+        cross_volume_tail_context: str = "",
         db: Any = None,
     ) -> str:
         """生成单批次章计划（同步，供 Celery worker 使用）。"""
@@ -2202,6 +3023,14 @@ class NovelLLMService:
             "【核心原则】剧情必须递进，禁止原地踏步式的重复！每一章都必须推动故事前进，不得重复已有的冲突模式。\n"
             f"{_ANTI_AI_FLAVOR_BLOCK}"
         )
+        cross_volume_hint = ""
+        if cross_volume_tail_context.strip():
+            cross_volume_hint = (
+                "\n\n【跨卷衔接：上一卷末（须承接，与下列事实无矛盾）】\n"
+                f"{cross_volume_tail_context.strip()}\n"
+                "要求：本批为当前卷起始章计划，须在人物状态、悬念与未结冲突上自然接续上一卷末；"
+                "不得重置剧情线或无视上文已发生的事实；volume_summary 须点出与上一卷的承接关系。\n"
+            )
         continuity_hint = ""
         if prev_batch_context:
             continuity_hint = (
@@ -2216,6 +3045,7 @@ class NovelLLMService:
             f"【框架 Markdown（摘要）】\n{(novel.framework_markdown or novel.background or '')[:8000]}\n\n"
             f"【框架 JSON】\n{novel.framework_json or '{}'}\n\n"
             f"【结构化记忆（open_plots/canonical_timeline 等）】\n{memory_json}\n"
+            f"{cross_volume_hint}"
             f"{continuity_hint}"
             "【输出要求（严格 JSON）】\n"
             "{\n"
@@ -2233,9 +3063,30 @@ class NovelLLMService:
             '        \"plot_summary\": string,\n'
             '        \"stage_position\": string,\n'
             '        \"pacing_justification\": string,\n'
+            '        \"expressive_brief\": {\n'
+            '          \"pov_strategy\": string,\n'
+            '          \"emotional_curve\": string,\n'
+            '          \"sensory_focus\": string,\n'
+            '          \"dialogue_strategy\": string,\n'
+            '          \"scene_tempo\": string,\n'
+            '          \"reveal_strategy\": string\n'
+            '        },\n'
             '        \"progress_allowed\": string 或 string[],\n'
             '        \"must_not\": string[],\n'
-            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ]\n'
+            '        \"reserved_for_later\": [ { \"item\": string, \"not_before_chapter\": number } ],\n'
+            '        \"scene_cards\": [\n'
+            '          {\n'
+            '            \"label\": string,\n'
+            '            \"goal\": string,\n'
+            '            \"conflict\": string,\n'
+            '            \"content\": string,\n'
+            '            \"outcome\": string,\n'
+            '            \"emotion_beat\": string,\n'
+            '            \"camera\": string,\n'
+            '            \"dialogue_density\": string,\n'
+            '            \"words\": number\n'
+            '          }\n'
+            '        ]\n'
             "      },\n"
             '      \"open_plots_intent_added\": string[],\n'
             '      \"open_plots_intent_resolved\": string[]\n'
@@ -2263,12 +3114,21 @@ class NovelLLMService:
             "8) reserved_for_later 可为空数组；若框架无明确章节锚点，按 arcs 节拍合理分配 not_before_chapter，且与 must_not 一致；\n"
             "9) 每章必须填写 stage_position 与 pacing_justification，且与 plot_summary、must_not 一致；\n"
             "10) 若本批次章节落在框架 JSON 中某一弧的章节范围内，不得让本批次计划实质跨入下一弧的核心事件；\n"
-            "【防剧情重复硬约束 - 必须遵守】\n"
-            "11) 自检：若前批次已出现「质疑-举证-被否定」的冲突循环，本批次不得再使用相同模式，必须让剧情进入新阶段（如：误会加深导致关系破裂、发现新证据、引入新人物、冲突升级等）；\n"
-            "12) 禁止重复使用相同的心理活动描写模式：如「心里乱成一团」、「感到深深的疲惫」、「嘴角挂着冷笑」等固定句式，同一卷内不得在不同章重复出现；\n"
-            "13) 禁止重复的环境描写开场：如「月光惨白」、「村里的狗吠」、「红木桌子」等，同一卷内各章的场景氛围必须有所变化（时间、天气、环境、氛围）；\n"
-            "14) 每章的 conflict 必须与前3章的冲突有本质区别或递进，不得只是换汤不换药的重复争吵；自检：如果本章 conflict 只是前章的「再来一次」，必须重新设计；\n"
-            "15) 人物情绪必须递进：如二舅对男主的态度应从信任→怀疑→动摇→愤怒→决裂逐步演变，不得在同一情绪层级反复横跳。\n"
+            + (
+                "【全书第1章（仅当本批次含第1章时适用）】\n"
+                "若 chapters 含 chapter_no=1：该章须为「可入场」第1章——plot_summary/goal/conflict 须体现基本时空或环境、主角身份与处境、故事契机的来由；"
+                "must_not 须明确禁止缺乏铺垫的莫名其妙开场（未解释的多方混战、大段生造专名、人物关系未明就写终局式结果等）。\n"
+                if from_chapter <= 1 <= to_chapter
+                else ""
+            )
+            + (
+                "【防剧情重复硬约束 - 必须遵守】\n"
+                "11) 自检：若前批次已出现「质疑-举证-被否定」的冲突循环，本批次不得再使用相同模式，必须让剧情进入新阶段（如：误会加深导致关系破裂、发现新证据、引入新人物、冲突升级等）；\n"
+                "12) 禁止重复使用相同的心理活动描写模式：如「心里乱成一团」、「感到深深的疲惫」、「嘴角挂着冷笑」等固定句式，同一卷内不得在不同章重复出现；\n"
+                "13) 禁止重复的环境描写开场：如「月光惨白」、「村里的狗吠」、「红木桌子」等，同一卷内各章的场景氛围必须有所变化（时间、天气、环境、氛围）；\n"
+                "14) 每章的 conflict 必须与前3章的冲突有本质区别或递进，不得只是换汤不换药的重复争吵；自检：如果本章 conflict 只是前章的「再来一次」，必须重新设计；\n"
+                "15) 人物情绪必须递进：如二舅对男主的态度应从信任→怀疑→动摇→愤怒→决裂逐步演变，不得在同一情绪层级反复横跳。\n"
+            )
         )
         return router.chat_text_sync(
             messages=[{"role": "system", "content": sys}, {"role": "user", "content": user}],
@@ -2289,6 +3149,7 @@ class NovelLLMService:
         to_chapter: int,
         memory_json: str,
         prev_batch_context: str = "",
+        cross_volume_tail_context: str = "",
         db: Any = None,
     ) -> str:
         """同步版：生成指定区间的一批章计划 JSON 字符串（供 Celery）。"""
@@ -2301,6 +3162,7 @@ class NovelLLMService:
             to_chapter=to_chapter,
             memory_json=memory_json,
             prev_batch_context=prev_batch_context,
+            cross_volume_tail_context=cross_volume_tail_context,
             db=db,
         )
         batch_data = self._parse_volume_plan_llm_json(batch_json_str, batch_label=batch_label)
@@ -2372,9 +3234,30 @@ class NovelLLMService:
             '    "plot_summary": string,\n'
             '    "stage_position": string,\n'
             '    "pacing_justification": string,\n'
+            '    "expressive_brief": {\n'
+            '      "pov_strategy": string,\n'
+            '      "emotional_curve": string,\n'
+            '      "sensory_focus": string,\n'
+            '      "dialogue_strategy": string,\n'
+            '      "scene_tempo": string,\n'
+            '      "reveal_strategy": string\n'
+            '    },\n'
             '    "progress_allowed": string[],\n'
             '    "must_not": string[],\n'
-            '    "reserved_for_later": [ { "item": string, "not_before_chapter": number } ]\n'
+            '    "reserved_for_later": [ { "item": string, "not_before_chapter": number } ],\n'
+            '    "scene_cards": [\n'
+            '      {\n'
+            '        "label": string,\n'
+            '        "goal": string,\n'
+            '        "conflict": string,\n'
+            '        "content": string,\n'
+            '        "outcome": string,\n'
+            '        "emotion_beat": string,\n'
+            '        "camera": string,\n'
+            '        "dialogue_density": string,\n'
+            '        "words": number\n'
+            '      }\n'
+            '    ]\n'
             '  },\n'
             '  "open_plots_intent_added": string[],\n'
             '  "open_plots_intent_resolved": string[]\n'
@@ -2782,6 +3665,41 @@ class NovelLLMService:
                 )
             ),
             temperature=0.25,
+            web_search=False,
+            timeout=settings.novel_consistency_check_timeout,
+            **self._bill_kw(db, self._billing_user_id),
+        )
+
+    def expressive_enhance_chapter_sync(
+        self,
+        novel: Novel,
+        *,
+        chapter_no: int,
+        plan_title: str,
+        beats: dict[str, Any],
+        chapter_text: str,
+        db: Any = None,
+        strength: str | None = None,
+    ) -> str:
+        st = (strength or settings.novel_expressive_enhance_strength or "safe").strip()
+        router = self._router(db=db)
+        return self._chat_text_sync_with_timeout_retry(
+            router=router,
+            operation="expressive_enhance_chapter",
+            novel_id=novel.id,
+            chapter_no=chapter_no,
+            messages=self._budget_chapter_messages(
+                _expressive_enhance_chapter_messages(
+                    novel,
+                    chapter_no=chapter_no,
+                    plan_title=plan_title,
+                    beats=beats,
+                    chapter_text=chapter_text,
+                    strength=st,
+                    db=db,
+                )
+            ),
+            temperature=0.35,
             web_search=False,
             timeout=settings.novel_consistency_check_timeout,
             **self._bill_kw(db, self._billing_user_id),
@@ -3868,6 +4786,59 @@ class NovelLLMService:
                     new_traits = _dedupe_str_list([*old_traits, str(traits)])
                 char.traits_json = json.dumps(new_traits, ensure_ascii=False)
 
+            aliases = dedupe_clean_strs(item.get("aliases"))
+            if not aliases:
+                aliases = extract_aliases(item)
+            if aliases:
+                old_aliases = json.loads(char.aliases_json or "[]")
+                if not isinstance(old_aliases, list):
+                    old_aliases = []
+                char.aliases_json = json.dumps(
+                    dedupe_clean_strs([*old_aliases, *aliases]),
+                    ensure_ascii=False,
+                )
+
+            tags = item.get("tags")
+            if isinstance(tags, list) and tags:
+                old_tags = json.loads(char.tags_json or "[]")
+                if not isinstance(old_tags, list):
+                    old_tags = []
+                char.tags_json = json.dumps(
+                    dedupe_clean_strs([*old_tags, *[str(x) for x in tags]]),
+                    ensure_ascii=False,
+                )
+
+            introduced_chapter = coerce_int(
+                item.get("introduced_chapter") or item.get("source_chapter_no"),
+                default=int(char.introduced_chapter or 0),
+            )
+            source_chapter_no = coerce_int(
+                item.get("source_chapter_no"),
+                default=int(char.source_chapter_no or introduced_chapter),
+            )
+            last_seen_chapter_no = coerce_int(
+                item.get("last_seen_chapter_no"),
+                default=max(
+                    latest_delta_chapter_no,
+                    int(char.last_seen_chapter_no or 0),
+                    introduced_chapter,
+                ),
+            )
+            expired_raw = item.get("expired_chapter")
+            expired_chapter = (
+                coerce_int(expired_raw, default=0) if expired_raw is not None else None
+            )
+            char.introduced_chapter = introduced_chapter
+            char.source_chapter_no = source_chapter_no
+            char.last_seen_chapter_no = last_seen_chapter_no
+            char.expired_chapter = expired_chapter
+            if item.get("identity_stage"):
+                char.identity_stage = str(item.get("identity_stage") or "").strip()[:64]
+            if item.get("exposed_identity_level") is not None:
+                char.exposed_identity_level = str(
+                    item.get("exposed_identity_level") or ""
+                ).strip()[:32]
+
             detail = json.loads(char.detail_json or "{}")
             for k, v in item.items():
                 if k not in ("name", "role", "status", "traits", "is_active"):
@@ -3894,6 +4865,14 @@ class NovelLLMService:
                 char.is_active = False
             elif not status or char.is_active is None:
                 char.is_active = True
+            explicit_lifecycle = str(item.get("lifecycle_state") or "").strip() or None
+            char.lifecycle_state = infer_lifecycle_state(
+                is_active=bool(char.is_active),
+                introduced_chapter=int(char.introduced_chapter or 0),
+                last_seen_chapter=int(char.last_seen_chapter_no or 0),
+                expired_chapter=char.expired_chapter,
+                explicit=explicit_lifecycle,
+            )
             char.memory_version = memory_version
             return char
 
@@ -4230,6 +5209,24 @@ class NovelLLMService:
                     db.add(skill)
                 
                 if isinstance(item, dict):
+                    aliases = dedupe_clean_strs(item.get("aliases"))
+                    if aliases:
+                        old_aliases = json.loads(skill.aliases_json or "[]")
+                        if not isinstance(old_aliases, list):
+                            old_aliases = []
+                        skill.aliases_json = json.dumps(
+                            dedupe_clean_strs([*old_aliases, *aliases]),
+                            ensure_ascii=False,
+                        )
+                    tags = item.get("tags")
+                    if isinstance(tags, list) and tags:
+                        old_tags = json.loads(skill.tags_json or "[]")
+                        if not isinstance(old_tags, list):
+                            old_tags = []
+                        skill.tags_json = json.dumps(
+                            dedupe_clean_strs([*old_tags, *[str(x) for x in tags]]),
+                            ensure_ascii=False,
+                        )
                     detail = json.loads(skill.detail_json or "{}")
                     for k, v in item.items():
                         if k != "name":
@@ -4243,6 +5240,47 @@ class NovelLLMService:
                         skill.is_active = bool(item.get("is_active"))
                     else:
                         skill.is_active = True
+                    introduced_chapter = coerce_int(
+                        item.get("introduced_chapter") or item.get("source_chapter_no"),
+                        default=int(skill.introduced_chapter or 0),
+                    )
+                    source_chapter_no = coerce_int(
+                        item.get("source_chapter_no"),
+                        default=int(skill.source_chapter_no or introduced_chapter),
+                    )
+                    last_used_chapter = coerce_int(
+                        item.get("last_used_chapter"),
+                        default=int(skill.last_used_chapter or 0),
+                    )
+                    last_seen_chapter_no = coerce_int(
+                        item.get("last_seen_chapter_no"),
+                        default=max(
+                            latest_delta_chapter_no,
+                            int(skill.last_seen_chapter_no or 0),
+                            last_used_chapter,
+                            introduced_chapter,
+                        ),
+                    )
+                    expired_raw = item.get("expired_chapter")
+                    skill.introduced_chapter = introduced_chapter
+                    skill.source_chapter_no = source_chapter_no
+                    skill.last_used_chapter = last_used_chapter
+                    skill.last_seen_chapter_no = last_seen_chapter_no
+                    skill.expired_chapter = (
+                        coerce_int(expired_raw, default=0)
+                        if expired_raw is not None
+                        else None
+                    )
+                    explicit_lifecycle = (
+                        str(item.get("lifecycle_state") or "").strip() or None
+                    )
+                    skill.lifecycle_state = infer_lifecycle_state(
+                        is_active=bool(skill.is_active),
+                        introduced_chapter=int(skill.introduced_chapter or 0),
+                        last_seen_chapter=int(skill.last_seen_chapter_no or 0),
+                        expired_chapter=skill.expired_chapter,
+                        explicit=explicit_lifecycle,
+                    )
                 skill.memory_version = memory_version
                 stats["skills_updated"] += 1
 
@@ -5075,6 +6113,12 @@ class NovelLLMService:
                 "warnings": [],
                 "auto_pass_notes": [],
                 "stats": {},
+                "stage_status": {
+                    "delta": "failed",
+                    "validation": "skipped",
+                    "norm": "skipped",
+                    "snapshot": "skipped",
+                },
             }
         
         # 1. 计算合并后的 JSON (用于校验和快照)
@@ -5111,10 +6155,18 @@ class NovelLLMService:
                 "auto_pass_notes": auto_pass_notes,
                 "stats": stats,
                 "delta": delta,
+                "stage_status": {
+                    "delta": "ok",
+                    "validation": "blocked",
+                    "norm": "skipped",
+                    "snapshot": "skipped",
+                },
             }
 
         # 3. 如果没有 blocking_errors 且有 db，则执行规范化表更新
         new_version = 0
+        norm_status = "skipped"
+        snapshot_status = "skipped" if skip_snapshot else "pending"
         if db and not blocking_errors:
             try:
                 # 使用 Savepoint 保护事务，防止局部失败导致全局回滚（如章节审批状态丢失）
@@ -5131,6 +6183,7 @@ class NovelLLMService:
                     # 合并统计信息
                     for k, v in db_stats.items():
                         stats[k] = max(stats.get(k, 0), v)
+                    norm_status = "ok"
                     
                     # 确保大纲表存在，防止 sync 时由于缺少 outline 行导致快照为空
                     from app.models.novel_memory_norm import NovelMemoryNormOutline
@@ -5151,6 +6204,9 @@ class NovelLLMService:
                             db, novel.id, summary="规范化存储自动快照（batch/incremental）"
                         )
                         new_version = snap_ver
+                        snapshot_status = "ok"
+                    else:
+                        snapshot_status = "skipped"
                 
                 # 显式 flush 确保状态可见，但由外部调用者（Router）负责最终 commit
                 db.flush()
@@ -5167,7 +6223,25 @@ class NovelLLMService:
             except Exception as e:
                 # 局部回滚 Savepoint，不影响外部事务（如章节审批状态）
                 logger.exception("Failed to update normalized memory tables (savepoint rolled back): %s", e)
-                # 依然标记 ok=True，因为 JSON 合并已成功，不阻断审定流程
+                return {
+                    "ok": False,
+                    "status": "failed",
+                    "payload_json": prev_memory,
+                    "candidate_json": candidate_json,
+                    "errors": [f"更新规范化表失败：{e}"],
+                    "blocking_errors": [],
+                    "warnings": warnings,
+                    "auto_pass_notes": auto_pass_notes,
+                    "stats": stats,
+                    "delta": delta,
+                    "error": f"更新规范化表失败: {e}",
+                    "stage_status": {
+                        "delta": "ok",
+                        "validation": "ok",
+                        "norm": "failed",
+                        "snapshot": "failed" if not skip_snapshot else "skipped",
+                    },
+                }
         
         return {
             "ok": True,
@@ -5181,6 +6255,12 @@ class NovelLLMService:
             "stats": stats,
             "delta": delta,
             "version": new_version,
+            "stage_status": {
+                "delta": "ok",
+                "validation": "warning" if warnings else "ok",
+                "norm": norm_status,
+                "snapshot": snapshot_status,
+            },
         }
 
     def _apply_memory_delta_batch_sync(
@@ -5240,6 +6320,12 @@ class NovelLLMService:
                 "warnings": [],
                 "auto_pass_notes": [],
                 "stats": {},
+                "stage_status": {
+                    "delta": "failed",
+                    "validation": "skipped",
+                    "norm": "skipped",
+                    "snapshot": "skipped",
+                },
             }
         
         # 1. 计算合并后的 JSON (用于校验和快照)
@@ -5276,10 +6362,18 @@ class NovelLLMService:
                 "auto_pass_notes": auto_pass_notes,
                 "stats": stats,
                 "delta": delta,
+                "stage_status": {
+                    "delta": "ok",
+                    "validation": "blocked",
+                    "norm": "skipped",
+                    "snapshot": "skipped",
+                },
             }
 
         # 3. 如果没有 blocking_errors 且有 db，则执行规范化表更新
         new_version = 0
+        norm_status = "skipped"
+        snapshot_status = "skipped" if skip_snapshot else "pending"
         if db and not blocking_errors:
             try:
                 with db.begin_nested():
@@ -5295,6 +6389,7 @@ class NovelLLMService:
                     # 合并统计信息
                     for k, v in db_stats.items():
                         stats[k] = max(stats.get(k, 0), v)
+                    norm_status = "ok"
                     
                     # 确保大纲表存在
                     from app.models.novel_memory_norm import NovelMemoryNormOutline
@@ -5314,6 +6409,9 @@ class NovelLLMService:
                             db, novel.id, summary="规范化存储自动快照（batch_sync/incremental）"
                         )
                         new_version = snap_ver
+                        snapshot_status = "ok"
+                    else:
+                        snapshot_status = "skipped"
                 
                 db.flush()
                 
@@ -5330,8 +6428,22 @@ class NovelLLMService:
                 logger.exception("Failed to update normalized memory tables (sync savepoint): %s", e)
                 return {
                     "ok": False,
+                    "status": "failed",
                     "error": f"更新规范化表失败: {e}",
-                    "payload_json": candidate_json,
+                    "payload_json": prev_memory,
+                    "candidate_json": candidate_json,
+                    "errors": [f"更新规范化表失败：{e}"],
+                    "blocking_errors": [],
+                    "warnings": warnings,
+                    "auto_pass_notes": auto_pass_notes,
+                    "stats": stats,
+                    "delta": delta,
+                    "stage_status": {
+                        "delta": "ok",
+                        "validation": "ok",
+                        "norm": "failed",
+                        "snapshot": "failed" if not skip_snapshot else "skipped",
+                    },
                 }
         
         return {
@@ -5346,6 +6458,12 @@ class NovelLLMService:
             "stats": stats,
             "delta": delta,
             "version": new_version,
+            "stage_status": {
+                "delta": "ok",
+                "validation": "warning" if warnings else "ok",
+                "norm": norm_status,
+                "snapshot": snapshot_status,
+            },
         }
 
     async def refresh_memory_from_chapters(
@@ -5435,6 +6553,12 @@ class NovelLLMService:
             "warnings": _dedupe_str_list(collected_warnings),
             "auto_pass_notes": _dedupe_str_list(collected_auto_pass_notes),
             "stats": total_stats,
+            "stage_status": {
+                "delta": "ok",
+                "validation": "warning" if collected_warnings else "ok",
+                "norm": "ok" if db else "skipped",
+                "snapshot": "ok" if db else "skipped",
+            },
         }
         if db:
             out["version"] = self._get_latest_memory_version(db, novel.id)
@@ -5543,6 +6667,12 @@ class NovelLLMService:
             "warnings": _dedupe_str_list(collected_warnings),
             "auto_pass_notes": _dedupe_str_list(collected_auto_pass_notes),
             "stats": total_stats,
+            "stage_status": {
+                "delta": "ok",
+                "validation": "warning" if collected_warnings else "ok",
+                "norm": "ok" if db else "skipped",
+                "snapshot": "ok" if db else "skipped",
+            },
         }
         if db:
             out_sync["version"] = self._get_latest_memory_version(db, novel.id)
