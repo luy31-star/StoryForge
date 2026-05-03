@@ -426,6 +426,35 @@ export async function chapterContextChatStream(
   );
 }
 
+export async function generateVolumeChapterPlanStream(
+  novelId: string,
+  volumeId: string,
+  chapterNo: number,
+  handlers: StreamHandlers,
+  signal?: AbortSignal
+) {
+  return postSSE(
+    `${BASE}/${novelId}/volumes/${volumeId}/chapter-plan/generate-stream`,
+    { chapter_no: chapterNo },
+    handlers,
+    signal
+  );
+}
+
+export async function generateChapterStream(
+  novelId: string,
+  chapterNo: number,
+  handlers: StreamHandlers,
+  signal?: AbortSignal
+) {
+  return postSSE(
+    `${BASE}/${novelId}/chapters/generate-stream`,
+    { chapter_no: chapterNo },
+    handlers,
+    signal
+  );
+}
+
 export async function createNovel(body: {
   title: string;
   intro?: string;
@@ -450,6 +479,51 @@ export async function createNovel(body: {
   return r.json() as Promise<{ id: string }>;
 }
 
+// ─── AI 抽卡 ─────────────────────────────────────────────────────────────
+
+export async function drawWorldOptions(body: {
+  styles?: string[];
+  subjects?: string[];
+  backgrounds?: string[];
+  moods?: string[];
+}) {
+  const r = await apiFetch(`${BASE}/draw-world-options`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ options: Record<string, unknown>[] }>;
+}
+
+export async function drawProtagonistOptions(body: {
+  styles?: string[];
+  subjects?: string[];
+  protagonist_count?: number;
+  selected_world?: Record<string, unknown> | null;
+}) {
+  const r = await apiFetch(`${BASE}/draw-protagonist-options`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ options: Record<string, unknown>[] }>;
+}
+
+export async function drawCheatOptions(body: {
+  styles?: string[];
+  subjects?: string[];
+  plot_type?: string;
+  selected_world?: Record<string, unknown> | null;
+  selected_protagonist?: Record<string, unknown> | null;
+}) {
+  const r = await apiFetch(`${BASE}/draw-cheat-options`, {
+    method: "POST",
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ options: Record<string, unknown>[] }>;
+}
+
 export async function aiCreateAndStartNovel(body: {
   styles?: string[];
   subjects?: string[];
@@ -469,6 +543,9 @@ export async function aiCreateAndStartNovel(body: {
   auto_style_polish?: boolean;
   auto_expressive_enhance?: boolean;
   writing_style_id?: string;
+  selected_world?: Record<string, unknown> | null;
+  selected_protagonist?: Record<string, unknown> | null;
+  selected_cheat?: Record<string, unknown> | null;
 }) {
   const r = await apiFetch(`${BASE}/ai-create-and-start`, {
     method: "POST",
@@ -626,6 +703,20 @@ export async function generateArcs(
   return r.json() as Promise<{ status: string; batch_id?: string; task_id?: string | null }>;
 }
 
+export async function createChapter(
+  novelId: string,
+  chapterNo: number,
+  title: string = "",
+  content: string = ""
+) {
+  const r = await apiFetch(`${BASE}/${novelId}/chapters`, {
+    method: "POST",
+    body: JSON.stringify({ chapter_no: chapterNo, title, content }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json() as Promise<{ id: string }>;
+}
+
 export async function listChapters(novelId: string) {
   const r = await apiFetch(`${BASE}/${novelId}/chapters`);
   if (!r.ok) throw new Error(await r.text());
@@ -648,7 +739,7 @@ export async function generateChapters(
   count = 1,
   title_hint = "",
   options?: {
-    use_cold_recall?: boolean;
+    use_cold_recall?: boolean | null;
     cold_recall_items?: number;
     auto_consistency_check?: boolean;
     auto_plan_guard_check?: boolean;
@@ -662,7 +753,7 @@ export async function generateChapters(
   const payload: Record<string, unknown> = {
     count,
     title_hint,
-    use_cold_recall: Boolean(options?.use_cold_recall),
+    use_cold_recall: options?.use_cold_recall ?? null,
     cold_recall_items: options?.cold_recall_items ?? 5,
     chapter_no: options?.chapter_no,
     source: options?.source,

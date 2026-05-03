@@ -32,8 +32,8 @@ from app.services.novel_workflow_service import (
     touch_workflow_run_status,
     upsert_workflow_step,
 )
-from app.services.novel_llm_service import (
-    NovelLLMService,
+from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_llm_utils import (
     _ANTI_AI_FLAVOR_BLOCK,
     coerce_novel_outline_base_fields,
     render_volume_arcs_markdown,
@@ -262,6 +262,10 @@ def run_ai_create_and_start_sync(
     target_chapters: int | None,
     billing_user_id: str | None,
     batch_id: str,
+    *,
+    selected_world: dict[str, Any] | None = None,
+    selected_protagonist: dict[str, Any] | None = None,
+    selected_cheat: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     一键AI建书（仅生成设定与大纲草案）：
@@ -272,6 +276,9 @@ def run_ai_create_and_start_sync(
     n = db.get(Novel, novel_id)
     if not n:
         raise ValueError("小说不存在")
+    # 记录任务启动时快照：若用户在任务运行中手动保存了设置，后续不应被流程回写覆盖。
+    initial_target_chapters = int(getattr(n, "target_chapters", 0) or 0)
+    initial_style = str(getattr(n, "style", "") or "")
 
     def _has_log_event(event: str) -> bool:
         return (
@@ -310,9 +317,18 @@ def run_ai_create_and_start_sync(
         append_generation_log(
             db,
             novel_id=novel_id,
+            batch_id=fw_batch_id,
+            event="framework_generate_queued",
+            message="已入队：异步生成全书大纲框架（来源：AI 一键建书恢复续跑）",
+            meta={"source": "ai_create_recovery", "parent_batch_id": batch_id},
+        )
+        append_generation_log(
+            db,
+            novel_id=novel_id,
             batch_id=batch_id,
             event="ai_create_framework_queued",
             message="任务恢复：构思已完成，已重新入队大纲框架生成。",
+            meta={"framework_batch_id": fw_batch_id},
         )
         db.commit()
         return {
@@ -367,7 +383,7 @@ def run_ai_create_and_start_sync(
     # 0. 准备文风约束
     style_hint = ""
     if n.writing_style_id:
-        from app.services.novel_llm_service import _writing_style_block
+        from app.services.novel_llm_utils import _writing_style_block
         ws = db.get(WritingStyle, n.writing_style_id)
         if ws:
             style_hint = f"\n【特定文风深度定制要求】\n{_writing_style_block(ws)}\n"
@@ -401,6 +417,63 @@ def run_ai_create_and_start_sync(
     elif length_max <= 55 or length_min <= 55:
         intro_min_chars, bg_min_chars, style_min_chars = 180, 300, 28
 
+    # 构建用户已选择的具体设定（来自抽卡结果）
+    world_block = ""
+    if selected_world and isinstance(selected_world, dict):
+        wt = selected_world.get("world_type", "")
+        mc = selected_world.get("main_conflict", "")
+        ss = selected_world.get("social_structure", "")
+        cf = selected_world.get("cultural_features", "")
+        ur = selected_world.get("unique_rules", "")
+        va = selected_world.get("visual_atmosphere", "")
+        world_block = (
+            f"\n【用户已选定世界观】\n"
+            f"世界类型：{wt}\n"
+            f"核心矛盾：{mc}\n"
+            f"社会结构：{ss}\n"
+            f"文化特色：{cf}\n"
+            f"特殊规则：{ur}\n"
+            f"视觉氛围关键词：{va}\n"
+        )
+
+    protagonist_block = ""
+    if selected_protagonist and isinstance(selected_protagonist, dict):
+        name = selected_protagonist.get("name", "")
+        role = selected_protagonist.get("role_identity", "")
+        desire = selected_protagonist.get("core_desire", "")
+        traits = ",".join(selected_protagonist.get("personality_traits", []))
+        ability = selected_protagonist.get("starting_ability", "")
+        backstory = selected_protagonist.get("backstory_hint", "")
+        secret = selected_protagonist.get("secret_identity", "")
+        protagonist_block = (
+            f"\n【用户已选定主角设定】\n"
+            f"姓名：{name}\n"
+            f"身份与处境：{role}\n"
+            f"核心欲望：{desire}\n"
+            f"性格关键词：{traits}\n"
+            f"初始能力/资源：{ability}\n"
+            f"背景故事线索：{backstory}\n"
+            f"隐藏身份/秘密：{secret}\n"
+        )
+
+    cheat_block = ""
+    if selected_cheat and isinstance(selected_cheat, dict):
+        cn = selected_cheat.get("cheat_name", "")
+        ct = selected_cheat.get("cheat_type", "")
+        pl = selected_cheat.get("power_level", "")
+        cm = selected_cheat.get("core_mechanic", "")
+        gl = selected_cheat.get("growth_limit", "")
+        ib = selected_cheat.get("initial_benefit", "")
+        twist = selected_cheat.get("hidden_twist", "")
+        cheat_block = (
+            f"\n【用户已选定金手指设定】\n"
+            f"名称：{cn}（类型：{ct}，强度定位：{pl}）\n"
+            f"核心机制：{cm}\n"
+            f"成长限制/代价：{gl}\n"
+            f"初始收益：{ib}\n"
+            f"隐藏隐患/秘密：{twist}\n"
+        )
+
     prompt = (
         "你是一个顶级的网络小说架构师与畅销书策划编辑，擅长构思极具吸引力的书名和宏大且逻辑严密的设定。\n"
         f"用户提供的题材/风格标签：{styles_text}\n"
@@ -408,6 +481,9 @@ def run_ai_create_and_start_sync(
         f"目标总章节数要求在 {length_min}-{length_max} 章之间。\n"
         f"用户创作初衷/补充备注：{notes_text or '（无）'}\n"
         f"{style_hint}\n"
+        f"{world_block}\n"
+        f"{protagonist_block}\n"
+        f"{cheat_block}\n"
         "任务：请基于上述输入，头脑风暴并输出一部原创小说的核心构思。\n"
         "【关键：书名必须具有商业吸引力，不要直接照抄用户的备注。】\n\n"
         "请只输出一个严格合法、可直接 json.loads() 的 JSON 对象，禁止输出任何其他文字或 Markdown 格式。\n"
@@ -418,7 +494,7 @@ def run_ai_create_and_start_sync(
         f"- background: 字符串，**不少于 {bg_min_chars} 个汉字**；作为后续「大纲框架」的素材，必须尽量具体，建议覆盖（可用小节式叙述）："
         "时代/地域或架空规则；主要势力/阵营及其利益诉求；力量或职业体系（至少两级：入门/中坚/顶层中任选两层写清差异与代价）；"
         "经济、技术或民生底色（择一写透）；2–3 条关键历史事件或传说；社会矛盾、禁忌与信息流通方式；与世界观强相关的伏笔或未解之谜。\n"
-        f"- style: 字符串，**不少于 {style_min_chars} 个汉字**；除节奏外，需点名叙事视角、对话密度倾向、意象/氛围关键词，避免只输出三四个抽象词。\n"
+        f"- style: 字符串，**不少于 {style_min_chars} 个汉字，且最多不超过 150 字**；除节奏外，需点名叙事视角、对话密度倾向、意象/氛围关键词，避免只输出三四个抽象词。\n"
         f"- target_chapters: 整数，必须在 {length_min} 到 {length_max} 之间。\n\n"
         "输出示例：\n"
         "{\n"
@@ -430,27 +506,31 @@ def run_ai_create_and_start_sync(
         "}\n"
     )
 
-    brainstorm_timeout = float(settings.novel_ai_create_brainstorm_timeout or 720.0)
+    brainstorm_timeout = float(settings.novel_ai_create_brainstorm_timeout or 900.0)
+    brainstorm_retry_n = max(0, int(settings.novel_ai_create_brainstorm_max_retries or 0))
 
     def _run_chat(
         messages: list[dict[str, str]],
         web_search: bool = False,
         temperature: float = 0.8,
-        response_format: dict[str, Any] | None = None,
     ) -> str:
         loop = asyncio.new_event_loop()
         try:
             asyncio.set_event_loop(loop)
-            return loop.run_until_complete(
-                llm._router(db=db).chat_text(
+            async def _stream_and_collect() -> str:
+                chunks = []
+                async for chunk in llm._router(db=db, model=n.framework_model).chat_text_stream(
                     messages=messages,
                     temperature=temperature,
                     web_search=web_search,
                     timeout=brainstorm_timeout,
-                    response_format=response_format,
+                    max_retries=brainstorm_retry_n,
                     **llm._bill_kw(db, llm._billing_user_id),
-                )
-            )
+                ):
+                    if chunk.get("type") == "text":
+                        chunks.append(chunk.get("delta", ""))
+                return "".join(chunks)
+            return loop.run_until_complete(_stream_and_collect())
         finally:
             asyncio.set_event_loop(None)
             loop.close()
@@ -463,7 +543,7 @@ def run_ai_create_and_start_sync(
                     "content": (
                         "你是结构化小说策划输出器。"
                         "你的唯一任务是输出一个可被 Python json.loads() 直接解析的 JSON 对象。"
-                        "禁止输出 JSON 之外的任何字符。\n"
+                        "禁止输出 JSON 之外的任何字符，也不要带有 Markdown 代码块包裹（如 ```json）。\n"
                         "intro、background、style 必须写满用户要求的字数下限，禁止用一两句敷衍；"
                         "background 要可当后续「世界观圣经」使用，避免空泛设定名。\n"
                         f"{_ANTI_AI_FLAVOR_BLOCK}"
@@ -472,7 +552,6 @@ def run_ai_create_and_start_sync(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            response_format={"type": "json_object"},
         )
 
         data = _extract_brainstorm_payload(reply)
@@ -485,11 +564,10 @@ def run_ai_create_and_start_sync(
             )
             repaired = _run_chat(
                 [
-                    {"role": "system", "content": "你是 JSON 修复助手，只输出严格 JSON。"},
+                    {"role": "system", "content": "你是 JSON 修复助手，只输出严格 JSON，不要带 markdown 代码块。"},
                     {"role": "user", "content": f"{repair_prompt}\n\n原始内容如下：\n{reply}"},
                 ],
                 temperature=0.1,
-                response_format={"type": "json_object"},
             )
             data = _extract_brainstorm_payload(repaired)
         if data is None:
@@ -527,12 +605,19 @@ def run_ai_create_and_start_sync(
             )
             db.commit()
 
-        n.title = data.get("title", f"{clean_styles[0]}小说")
+        # 重要：刷新一次，吸收任务运行期间用户可能保存过的最新设置。
+        db.refresh(n)
+        user_changed_target = int(getattr(n, "target_chapters", 0) or 0) != initial_target_chapters
+        user_changed_style = str(getattr(n, "style", "") or "") != initial_style
+
+        n.title = data.get("title", f"{clean_styles[0]}小说")[:510]
         n.intro = data.get("intro", "")
         n.background = data.get("background", "")
-        n.style = data.get("style", "")
+        if not user_changed_style:
+            n.style = data.get("style", "")[:250]
         raw_target = int(data.get("target_chapters", length_min))
-        n.target_chapters = max(length_min, min(length_max, raw_target))
+        if not user_changed_target:
+            n.target_chapters = max(length_min, min(length_max, raw_target))
         n.status = "draft"
         db.commit()
         
@@ -562,6 +647,14 @@ def run_ai_create_and_start_sync(
     from app.tasks.novel_tasks import novel_generate_framework_task
     fw_batch_id = f"fw-gen-{int(time.time())}-{novel_id[:8]}"
     novel_generate_framework_task.delay(novel_id, billing_user_id, fw_batch_id)
+    append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=fw_batch_id,
+        event="framework_generate_queued",
+        message="已入队：异步生成全书大纲框架（来源：AI 一键建书）",
+        meta={"source": "ai_create", "parent_batch_id": batch_id},
+    )
 
     append_generation_log(
         db,
@@ -569,6 +662,7 @@ def run_ai_create_and_start_sync(
         batch_id=batch_id,
         event="ai_create_framework_queued",
         message="小说构思已完成，大纲框架生成任务已入队异步执行。",
+        meta={"framework_batch_id": fw_batch_id},
     )
     db.commit()
 
@@ -583,12 +677,19 @@ def _ensure_volumes_cover(db: Session, novel: Novel, end_no: int) -> None:
         .all()
     )
 
-    max_vol_to_chapter = 0
-    if existing_vols:
-        max_vol_to_chapter = max(v.to_chapter for v in existing_vols)
+    if not existing_vols:
+        vol_no = 1
+        ch_start = 1
+    else:
+        last_vol = existing_vols[-1]
+        if last_vol.to_chapter >= end_no:
+            return
+        last_vol.to_chapter = min(novel.target_chapters, end_no)
+        db.commit()
+        return
 
-    vol_no = len(existing_vols) + 1
-    ch_start = max(max_vol_to_chapter + 1, 1)
+    vol_no = 1
+    ch_start = 1
     while ch_start <= end_no:
         hi = min(novel.target_chapters, ch_start + 50 - 1)
         db.add(
@@ -1235,6 +1336,9 @@ def run_full_auto_generation_sync(
             message=f"第{volume.volume_no}卷卷级剧情已就绪",
         )
 
+        if current_no > volume.to_chapter:
+            volume.to_chapter = min(novel.target_chapters, end_no, current_no + plan_batch_size - 1)
+            db.commit()
         plan_to_no = min(end_no, current_no + plan_batch_size - 1, volume.to_chapter)
         plan_seq, _ = _workflow_running(
             "generate_plan_batch",

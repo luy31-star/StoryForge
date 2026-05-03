@@ -237,7 +237,7 @@ export function MyTasks() {
         </section>
       </div>
 
-      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] md:hidden">
         <div className="novel-container space-y-2 px-4">
           <p className="text-[11px] font-medium text-foreground/60">
             {hasRunning ? "存在进行中的后台任务，列表会自动刷新" : `当前共 ${total} 条任务记录`}

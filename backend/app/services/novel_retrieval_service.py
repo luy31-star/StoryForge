@@ -444,6 +444,7 @@ def _rerank_hits(
     chapter_no: int | None = None,
     top_k: int = 8,
 ) -> list[dict[str, Any]]:
+    cn = try_int(chapter_no) if chapter_no is not None else None
     toks = set(
         t for t in re.split(r"[\s、，,。！？「」\[\]\"']+", query) if t and len(t) > 1
     ) | set(
@@ -452,6 +453,14 @@ def _rerank_hits(
     scored: list[tuple[float, dict[str, Any]]] = []
     for h in raw:
         p = h.get("payload") or {}
+        # 硬过滤：生成第 N 章时，RAG 不允许召回“未来章内容”。
+        if cn is not None:
+            p_ch = try_int(p.get("chapter_no"))
+            p_intro = try_int(p.get("introduced_chapter"))
+            if p_ch is not None and p_ch > cn:
+                continue
+            if p_intro is not None and p_intro > cn:
+                continue
         text = f"{p.get('title', '')} {p.get('text', '')}"
         f = float(h.get("_fused", h.get("score", 0.0)) or 0.0)
         for t in toks:
@@ -467,8 +476,7 @@ def _rerank_hits(
             ecn = int(ec) if ec is not None and ec != "" else 0
         except Exception:
             ecn = 0
-        if chapter_no is not None and try_int(chapter_no) is not None:
-            cn = try_int(chapter_no) or 0
+        if cn is not None:
             if icn and 0 < icn <= cn:
                 f += 0.12
             if ecn and ecn and cn > ecn:

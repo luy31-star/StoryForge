@@ -221,6 +221,7 @@ def _novel_llm_for_novel(novel: Novel) -> NovelLLMService:
 
 _CHAPTER_GEN_TASK_NAME = "novel.generate_chapters_for_novel"
 _VOLUME_PLAN_TASK_NAME = "novel.volume_plan_batch_for_volume"
+_FRAMEWORK_GEN_TASK_NAME = "novel.novel_generate_framework_task"
 
 
 def _batch_id_from_celery_task_args(args: object) -> str | None:
@@ -261,7 +262,7 @@ def _inspect_item_name_and_args(
     return (name, args)
 
 
-def _iter_inspect_task_dicts() -> list[dict[str, Any]]:
+def _iter_inspect_task_dicts() -> list[dict[str, Any]] | None:
     out: list[dict[str, Any]] = []
     try:
         insp = celery_app.control.inspect(timeout=1.0)
@@ -273,7 +274,8 @@ def _iter_inspect_task_dicts() -> list[dict[str, Any]]:
                     if isinstance(t, dict):
                         out.append(t)
     except Exception:
-        return []
+        logger.exception("celery inspect failed")
+        return None
     return out
 
 
@@ -286,7 +288,10 @@ def celery_chapter_batch_held_in_workers(batch_id: str) -> bool | None:
     if not batch_id:
         return False
     try:
-        for t in _iter_inspect_task_dicts():
+        inspected = _iter_inspect_task_dicts()
+        if inspected is None:
+            return None
+        for t in inspected:
             parsed = _inspect_item_name_and_args(t)
             if not parsed:
                 continue
@@ -313,7 +318,10 @@ def celery_pipeline_batch_held_in_workers(batch_id: str) -> bool | None:
         )
     )
     try:
-        for t in _iter_inspect_task_dicts():
+        inspected = _iter_inspect_task_dicts()
+        if inspected is None:
+            return None
+        for t in inspected:
             parsed = _inspect_item_name_and_args(t)
             if not parsed:
                 continue
@@ -336,7 +344,10 @@ def celery_volume_plan_batch_held_in_workers(batch_id: str) -> bool | None:
     if not batch_id:
         return False
     try:
-        for t in _iter_inspect_task_dicts():
+        inspected = _iter_inspect_task_dicts()
+        if inspected is None:
+            return None
+        for t in inspected:
             parsed = _inspect_item_name_and_args(t)
             if not parsed:
                 continue
@@ -352,6 +363,30 @@ def celery_volume_plan_batch_held_in_workers(batch_id: str) -> bool | None:
         return None
 
 
+def celery_framework_batch_held_in_workers(batch_id: str) -> bool | None:
+    """Celery 中是否仍有基础大纲生成任务持有该 batch。"""
+    if not batch_id:
+        return False
+    try:
+        inspected = _iter_inspect_task_dicts()
+        if inspected is None:
+            return None
+        for t in inspected:
+            parsed = _inspect_item_name_and_args(t)
+            if not parsed:
+                continue
+            name, args = parsed
+            if name != _FRAMEWORK_GEN_TASK_NAME:
+                continue
+            bid = _batch_id_from_celery_task_args(args)
+            if bid == str(batch_id):
+                return True
+        return False
+    except Exception:
+        logger.exception("celery_framework_batch_held_in_workers failed | batch_id=%s", batch_id)
+        return None
+
+
 def _has_active_auto_pipeline_task(
     novel_id: str,
     *,
@@ -362,7 +397,8 @@ def _has_active_auto_pipeline_task(
         active = inspect.active() or {}
     except Exception:
         logger.exception("inspect active auto pipeline failed | novel_id=%s", novel_id)
-        return False
+        # inspect 不可用时保守处理：视作可能仍有活动任务，避免误删锁和误续跑
+        return True
 
     ignored = exclude_task_ids or set()
     for tasks in active.values():
@@ -400,12 +436,47 @@ def _batch_has_forbidden_for_auto_requeue(
     ) is not None
 
 
+def _batch_recently_requeued_for_auto(
+    db: Session, novel_id: str, batch_id: str, *, seconds: int = 90
+) -> bool:
+    cutoff = datetime.utcnow() - timedelta(seconds=max(1, int(seconds)))
+    return (
+        db.query(NovelGenerationLog.id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event.in_(
+                ("auto_pipeline_resume_enqueued", "ai_create_resume_enqueued")
+            ),
+            NovelGenerationLog.created_at >= cutoff,
+        )
+        .first()
+    ) is not None
+
+
+def _friendly_task_error_message(prefix: str, error: Exception) -> str:
+    detail = (str(error) or "").strip() or type(error).__name__
+    raw = f"{type(error).__name__}:{detail}".lower()
+    timeout_keys = (
+        "timeout",
+        "timed out",
+        "readtimeout",
+        "connecttimeout",
+        "timeoutexception",
+    )
+    if any(k in raw for k in timeout_keys):
+        return f"{prefix}：请求超时，请稍后重试；若持续出现请检查模型服务或网络。"
+    return f"{prefix}：{detail}"
+
+
 def try_requeue_stale_auto_or_ai_batch(
     db: Session, novel_id: str, batch_id: str
 ) -> bool:
     """全自动 / 一键建书：Worker 丢失且未出现业务终态时按 user_tasks 再入队。"""
     hb = celery_pipeline_batch_held_in_workers(batch_id)
     if hb is not False:
+        return False
+    if _batch_recently_requeued_for_auto(db, novel_id, batch_id):
         return False
     if _batch_has_forbidden_for_auto_requeue(db, novel_id, batch_id):
         return False
@@ -552,6 +623,87 @@ def try_requeue_stale_volume_plan_batch(
     return True
 
 
+def _batch_recently_requeued_for_framework(
+    db: Session, novel_id: str, batch_id: str, *, seconds: int = 90
+) -> bool:
+    cutoff = datetime.utcnow() - timedelta(seconds=max(1, int(seconds)))
+    return (
+        db.query(NovelGenerationLog.id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event == "framework_generate_resume_enqueued",
+            NovelGenerationLog.created_at >= cutoff,
+        )
+        .first()
+    ) is not None
+
+
+def try_requeue_stale_framework_generate_batch(
+    db: Session, novel_id: str, batch_id: str, *, held: bool | None
+) -> bool:
+    if held is not False:
+        return False
+    if (
+        db.query(NovelGenerationLog.id)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event.in_(
+                ("framework_generate_done", "framework_generate_failed", "framework_generate_enqueue_failed")
+            ),
+        )
+        .first()
+    ):
+        return False
+    if _batch_recently_requeued_for_framework(db, novel_id, batch_id):
+        return False
+    resume_count = (
+        db.query(func.count(NovelGenerationLog.id))
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id == batch_id,
+            NovelGenerationLog.event == "framework_generate_resume_enqueued",
+        )
+        .scalar()
+        or 0
+    )
+    if int(resume_count) >= _MAX_AUTO_RESUME_COUNT:
+        return False
+
+    n = db.get(Novel, novel_id)
+    if not n:
+        return False
+    user_id = str(getattr(n, "user_id", "") or "").strip() or None
+    try:
+        task = novel_generate_framework_task.delay(novel_id, user_id, batch_id)
+        tid = getattr(task, "id", None)
+    except Exception:
+        logger.exception(
+            "try_requeue_stale_framework_generate_batch.delay failed | batch_id=%s",
+            batch_id,
+        )
+        return False
+
+    append_generation_log(
+        db,
+        novel_id=novel_id,
+        batch_id=batch_id,
+        event="framework_generate_resume_enqueued",
+        level="info",
+        message="检测到基础大纲任务已丢失，已自动重新入队续跑",
+        meta={"celery_task_id": tid, "auto_resume_count": int(resume_count) + 1},
+    )
+    db.commit()
+    logger.warning(
+        "framework batch requeued after stale | novel_id=%s batch_id=%s n=%s",
+        novel_id,
+        batch_id,
+        int(resume_count) + 1,
+    )
+    return True
+
+
 def recover_stale_auto_pipeline_state(
     db,
     novel_id: str,
@@ -638,6 +790,9 @@ def recover_stale_auto_pipeline_state(
             continue
         hb = celery_pipeline_batch_held_in_workers(batch_id)
         if hb is True:
+            continue
+        if hb is None:
+            # inspect 不可用时不判定为僵尸，避免误触发续跑
             continue
         stale_batches.append(batch_id)
 
@@ -1760,7 +1915,7 @@ def novel_generate_chapters_for_novel(
             billing_user_id=user_id,
             title_hint=str(body.get("title_hint") or ""),
             chapter_nos=chapter_nos,
-            use_cold_recall=bool(body.get("use_cold_recall")),
+            use_cold_recall=body.get("use_cold_recall"),
             cold_recall_items=max(1, min(int(body.get("cold_recall_items") or 5), 12)),
             auto_consistency_check=bool(body.get("auto_consistency_check")),
             auto_plan_guard_check=bool(body.get("auto_plan_guard_check")),
@@ -2042,6 +2197,74 @@ def novel_chapter_consistency_fix(
         db.close()
 
 
+@celery_app.task(name="novel.deferred_consistency_check", bind=True, queue="novel")
+def novel_deferred_consistency_check(
+    self,
+    *,
+    novel_id: str,
+    chapter_no: int,
+    chapter_title: str,
+    memory_json: str,
+    continuity: str,
+    chapter_content: str,
+) -> dict[str, Any]:
+    """批量生成后异步执行一致性修订，直接覆写章节内容（无需人工审阅）。"""
+    db = SessionLocal()
+    try:
+        n = db.get(Novel, novel_id)
+        if not n:
+            raise ValueError("小说不存在")
+        c = (
+            db.query(Chapter)
+            .filter(Chapter.novel_id == novel_id, Chapter.chapter_no == chapter_no)
+            .order_by(Chapter.updated_at.desc())
+            .first()
+        )
+        if not c:
+            raise ValueError(f"第 {chapter_no} 章不存在")
+
+        llm = NovelLLMService(billing_user_id=n.user_id)
+        fixed_text = llm.check_and_fix_chapter_sync(
+            n, chapter_no, chapter_title, memory_json, continuity, chapter_content, db=db,
+        )
+        if fixed_text and fixed_text.strip() != (chapter_content or "").strip():
+            c.content = fixed_text
+            fixed_metrics = chapter_content_metrics(fixed_text)
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=f"deferred_{chapter_no}",
+                event="chapter_consistency_done",
+                chapter_no=chapter_no,
+                message=f"第 {chapter_no} 章异步一致性修订完成（正文约 {fixed_metrics['body_chars']} 字）",
+                meta=fixed_metrics,
+            )
+            db.commit()
+        return {"status": "ok", "novel_id": novel_id, "chapter_no": chapter_no}
+    except Exception as e:
+        logger.exception(
+            "novel.deferred_consistency_check failed | novel_id=%s chapter_no=%s",
+            novel_id, chapter_no,
+        )
+        try:
+            db.rollback()
+            append_generation_log(
+                db,
+                novel_id=novel_id,
+                batch_id=f"deferred_{chapter_no}",
+                event="chapter_consistency_failed",
+                chapter_no=chapter_no,
+                level="error",
+                message=f"异步一致性修订失败：{e}",
+            )
+            db.commit()
+        except Exception:
+            db.rollback()
+        return {"status": "error", "error": str(e)}
+    finally:
+        db.close()
+
+
 @celery_app.task(name="novel.chapter_revise")
 def novel_chapter_revise(
     chapter_id: str,
@@ -2168,7 +2391,11 @@ def novel_consolidate_memory(novel_id: str) -> dict[str, Any]:
         db.close()
 
 
-@celery_app.task(name="novel.ai_create_and_start_task")
+@celery_app.task(
+    name="novel.ai_create_and_start_task",
+    soft_time_limit=max(60, int(settings.novel_ai_create_task_soft_time_limit or 900)),
+    time_limit=max(120, int(settings.novel_ai_create_task_time_limit or 960)),
+)
 def novel_ai_create_and_start_task(
     novel_id: str,
     user_id: str | None,
@@ -2176,8 +2403,7 @@ def novel_ai_create_and_start_task(
     styles: list[str],
     notes: str,
     length_type: str,
-    target_generate_chapters: int,
-    target_chapters: int | None = None,
+    body: dict[str, Any] | None,
 ) -> dict[str, Any]:
     db = SessionLocal()
     r = _redis_for_novel_queue()
@@ -2226,10 +2452,13 @@ def novel_ai_create_and_start_task(
             styles=styles,
             notes=notes,
             length_type=length_type,
-            target_generate_chapters=target_generate_chapters,
-            target_chapters=target_chapters,
+            target_generate_chapters=int((body or {}).get("target_generate_chapters") or 0),
+            target_chapters=(body or {}).get("target_chapters"),
             billing_user_id=user_id,
             batch_id=batch_id,
+            selected_world=(body or {}).get("selected_world"),
+            selected_protagonist=(body or {}).get("selected_protagonist"),
+            selected_cheat=(body or {}).get("selected_cheat"),
         )
         if result.get("resume_only"):
             db.commit()
@@ -2264,6 +2493,7 @@ def novel_ai_create_and_start_task(
         logger.exception("novel_ai_create_and_start_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
             db.rollback()
+            friendly_msg = _friendly_task_error_message("AI 一键建书失败", e)
             # 更新小说状态为 failed 标识失败
             from app.models.novel import Novel
             n = db.get(Novel, novel_id)
@@ -2276,7 +2506,7 @@ def novel_ai_create_and_start_task(
                 batch_id=batch_id,
                 event="ai_create_failed",
                 level="error",
-                message=f"AI 一键建书失败：{e}",
+                message=friendly_msg,
                 meta={"error": str(e)}
             )
             db.commit()
@@ -2284,7 +2514,7 @@ def novel_ai_create_and_start_task(
                 db,
                 batch_id=batch_id,
                 status="failed",
-                message=f"失败：{e}",
+                message=friendly_msg,
             )
         except Exception:
             db.rollback()
@@ -3229,7 +3459,7 @@ def novel_auto_pipeline_task(
             target_count=target_count,
             billing_user_id=user_id,
             batch_id=batch_id,
-            use_cold_recall=False,
+            use_cold_recall=None,
             cold_recall_items=5,
             auto_consistency_check=None,
             auto_plan_guard_check=None,
@@ -3361,6 +3591,7 @@ def novel_auto_pipeline_task(
         logger.exception("novel_auto_pipeline_task failed | novel_id=%s batch_id=%s", novel_id, batch_id)
         try:
             db.rollback()
+            friendly_msg = _friendly_task_error_message("全自动生成失败", e)
             if workflow_run is not None:
                 touch_workflow_run_status(
                     db,
@@ -3375,7 +3606,7 @@ def novel_auto_pipeline_task(
                     run=workflow_run,
                     event_type="failed",
                     level="error",
-                    message=f"全自动生成失败：{e}",
+                    message=friendly_msg,
                     meta={"error": str(e)},
                 )
             # 更新小说状态为 failed
@@ -3389,7 +3620,7 @@ def novel_auto_pipeline_task(
                 batch_id=batch_id,
                 event="auto_pipeline_failed",
                 level="error",
-                message=f"全自动生成失败：{e}",
+                message=friendly_msg,
                 meta={"error": str(e)}
             )
             db.commit()
@@ -3397,7 +3628,7 @@ def novel_auto_pipeline_task(
                 db,
                 batch_id=batch_id,
                 status="failed",
-                message=f"失败：{e}",
+                message=friendly_msg,
             )
         except Exception:
             db.rollback()

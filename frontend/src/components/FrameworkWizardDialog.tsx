@@ -392,7 +392,7 @@ export function FrameworkWizardDialog(props: {
                   <textarea
                     value={props.frameworkMarkdown || ""}
                     readOnly
-                    className="mt-2 min-h-[260px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                    className="mt-2 min-h-[260px] w-full rounded-2xl border border-border bg-background p-4 font-mono text-sm text-foreground"
                   />
                 )}
               </div>
@@ -471,7 +471,7 @@ export function FrameworkWizardDialog(props: {
                 {characters.length ? (
                   <div className="space-y-3">
                     {characters.map((c, idx) => (
-                      <div key={c.id} className="rounded-2xl border border-border/70 bg-background/60 p-4">
+                      <div key={c.id} className="rounded-2xl border border-border bg-background p-4">
                         <div className="grid gap-3 sm:grid-cols-3">
                           <div className="space-y-1">
                             <Label className="text-xs font-semibold text-foreground/70">名称</Label>
@@ -579,7 +579,7 @@ export function FrameworkWizardDialog(props: {
                 <textarea
                   value={props.frameworkMarkdown || ""}
                   readOnly
-                  className="mt-2 min-h-[220px] w-full rounded-2xl border border-border/70 bg-background/70 p-4 font-mono text-sm text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)]"
+                  className="mt-2 min-h-[220px] w-full rounded-2xl border border-border bg-background p-4 font-mono text-sm text-foreground"
                 />
               </div>
               <div className="flex flex-wrap gap-2">

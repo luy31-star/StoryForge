@@ -99,7 +99,7 @@ export function Login() {
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-6">
-      <Card className="w-full max-w-md border-border/60 bg-card/80">
+      <Card className="w-full max-w-md border-border bg-card">
         <CardHeader>
           <CardTitle className="text-2xl">{mode === "login" ? "登录 StoryForge" : "找回密码"}</CardTitle>
         </CardHeader>

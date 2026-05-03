@@ -30,6 +30,8 @@ _CHAPTER_GENERATION_PER_CHAPTER_BUFFER_SECONDS = 900
 _CHAPTER_GENERATION_IF_WORKER_GONE_GRACE = timedelta(minutes=5)
 _VOLUME_PLAN_BASE_STALE_GRACE = timedelta(minutes=45)
 _VOLUME_PLAN_IF_WORKER_GONE_GRACE = timedelta(minutes=5)
+_FRAMEWORK_GEN_BASE_STALE_GRACE = timedelta(minutes=20)
+_FRAMEWORK_GEN_IF_WORKER_GONE_GRACE = timedelta(minutes=3)
 
 logger = logging.getLogger(__name__)
 
@@ -824,6 +826,105 @@ def recover_stale_volume_plan_batches(db: Session, novel_id: str) -> dict[str, A
     return {"recovered_batches": recovered, "requeued_batches": requeued_vol}
 
 
+def recover_stale_framework_generate_batches(db: Session, novel_id: str) -> dict[str, Any]:
+    """
+    基础大纲生成（fw-gen-*）在 Worker 重启后可能丢失；自动检测并续跑。
+    """
+    from app.tasks import novel_tasks as _novel_tasks
+
+    rows = (
+        db.query(NovelGenerationLog)
+        .filter(
+            NovelGenerationLog.novel_id == novel_id,
+            NovelGenerationLog.batch_id.like("fw-gen-%"),
+        )
+        .order_by(NovelGenerationLog.created_at.asc())
+        .all()
+    )
+    batches: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        bid = str(row.batch_id or "")
+        if not bid:
+            continue
+        info = batches.setdefault(
+            bid,
+            {"events": set(), "last_at": row.created_at},
+        )
+        info["events"].add(str(row.event or ""))
+        if row.created_at and (
+            info["last_at"] is None or row.created_at > info["last_at"]
+        ):
+            info["last_at"] = row.created_at
+
+    terminal = {
+        "framework_generate_done",
+        "framework_generate_failed",
+        "framework_generate_enqueue_failed",
+    }
+    nonterminal = {
+        "framework_generate_queued",
+        "framework_generate_started",
+        "framework_generate_progress",
+        "framework_generate_resume_enqueued",
+    }
+    now = datetime.utcnow()
+    recovered: list[str] = []
+    requeued: list[str] = []
+    for batch_id, info in batches.items():
+        events = info["events"]
+        if events & terminal:
+            continue
+        if not (events & nonterminal):
+            continue
+        last_at = info.get("last_at")
+        if not last_at:
+            continue
+        held = _novel_tasks.celery_framework_batch_held_in_workers(batch_id)
+        if held is True:
+            grace = _FRAMEWORK_GEN_BASE_STALE_GRACE
+        elif held is False:
+            grace = _FRAMEWORK_GEN_IF_WORKER_GONE_GRACE
+        else:
+            grace = _FRAMEWORK_GEN_BASE_STALE_GRACE
+        if now - last_at < grace:
+            continue
+        if _novel_tasks.try_requeue_stale_framework_generate_batch(
+            db, novel_id, batch_id, held=held
+        ):
+            requeued.append(batch_id)
+            continue
+        append_generation_log(
+            db,
+            novel_id=novel_id,
+            batch_id=batch_id,
+            event="framework_generate_failed",
+            level="warning",
+            message="基础大纲生成疑似因进程重启或异常退出中断，系统已自动回收僵尸批次",
+            meta={
+                "reason": "stale_recovered",
+                "last_event_at": last_at.isoformat() if last_at else None,
+                "stale_grace_seconds": int(grace.total_seconds()),
+            },
+        )
+        recovered.append(batch_id)
+
+    if recovered or requeued:
+        db.commit()
+        if recovered:
+            logger.warning(
+                "recovered stale framework batches | novel_id=%s batches=%s",
+                novel_id,
+                recovered,
+            )
+        if requeued:
+            logger.warning(
+                "requeued framework batches after stale | novel_id=%s batches=%s",
+                novel_id,
+                requeued,
+            )
+    return {"recovered_batches": recovered, "requeued_batches": requeued}
+
+
 def has_pending_auto_pipeline_batch(
     db: Session, novel_id: str, *, exclude_batch_id: str | None = None
 ) -> bool:
@@ -910,14 +1011,35 @@ def get_active_auto_pipeline_count(db: Session) -> int:
         .all()
     )
     
+    batch_ids = [str(bid) for (bid,) in rows if bid]
+    latest_user_task_status_by_batch: dict[str, str] = {}
+    if batch_ids:
+        task_rows = (
+            db.query(UserTask.batch_id, UserTask.status)
+            .filter(
+                UserTask.batch_id.in_(batch_ids),
+                UserTask.kind.in_(("auto_generate", "ai_create_and_start")),
+            )
+            .order_by(UserTask.created_at.desc())
+            .all()
+        )
+        for bid, status in task_rows:
+            if not bid:
+                continue
+            key = str(bid)
+            if key in latest_user_task_status_by_batch:
+                continue
+            latest_user_task_status_by_batch[key] = str(status or "")
+
     count = 0
     for (bid,) in rows:
         if not bid:
             continue
+        bid_str = str(bid)
         terminal = (
             db.query(NovelGenerationLog.id)
             .filter(
-                NovelGenerationLog.batch_id == bid,
+                NovelGenerationLog.batch_id == bid_str,
                 NovelGenerationLog.event.in_(
                     [
                         "auto_pipeline_done",
@@ -932,6 +1054,10 @@ def get_active_auto_pipeline_count(db: Session) -> int:
             .first()
         )
         if not terminal:
+            task_status = latest_user_task_status_by_batch.get(bid_str, "")
+            if task_status in TERMINAL_STATUSES:
+                # 兜底：部分历史批次可能缺失终态日志，但用户任务已结束，不应继续占用队列名额。
+                continue
             count += 1
     return count
 

@@ -120,7 +120,7 @@ export function AppLayout() {
           <div className="glass-panel-subtle px-4 py-3">
             <div className="flex items-center justify-between gap-3">
               <Link to="/" className="min-w-0 flex items-center gap-3">
-                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/12 text-primary shadow-[inset_0_1px_0_rgba(255,255,255,0.45)]">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-2xl bg-primary/12 text-primary">
                   <img src="/favicon.svg" className="h-5 w-5" alt="" aria-hidden="true" />
                 </div>
                 <div className="min-w-0">
@@ -149,7 +149,7 @@ export function AppLayout() {
                   {user?.points_balance ?? 0}
                 </span>
               </div>
-              <Button variant="glass" size="sm" asChild className="shrink-0">
+              <Button variant="secondary" size="sm" asChild className="shrink-0">
                 <Link to="/recharge">
                   <HelpCircle className="mr-1 size-3.5" />
                   获取积分
@@ -178,13 +178,13 @@ export function AppLayout() {
                     {user?.points_balance ?? 0}
                   </span>
                 </div>
-                <Button variant="glass" size="sm" asChild>
+                <Button variant="secondary" size="sm" asChild>
                   <Link to="/recharge">
                     <HelpCircle className="mr-1 size-3.5" />
                     积分获取
                   </Link>
                 </Button>
-                <div className="ml-2 flex h-9 items-center gap-2 rounded-full border border-border/40 bg-card/40 pl-3 pr-1 shadow-sm backdrop-blur-xl">
+                <div className="ml-2 flex h-9 items-center gap-2 rounded-full border border-border/40 bg-card/40 pl-3 pr-1 shadow-sm">
                   <div className="flex items-center gap-2 border-r border-border/40 pr-3">
                     <div className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-primary">
                       <User className="h-3 w-3" />
@@ -221,7 +221,7 @@ export function AppLayout() {
       <Outlet />
 
       <Dialog open={mobileNavOpen} onOpenChange={setMobileNavOpen}>
-        <DialogContent className="left-3 right-3 top-auto bottom-3 w-auto max-w-none translate-x-0 translate-y-0 overflow-y-auto rounded-[1.8rem] p-5 md:hidden">
+        <DialogContent className="left-3 right-3 top-auto bottom-3 w-auto max-w-none translate-x-0 translate-y-0 overflow-y-auto rounded-lg p-5 md:hidden">
           <DialogHeader className="text-left">
             <DialogTitle>快捷导航</DialogTitle>
             <DialogDescription>
@@ -323,7 +323,7 @@ export function AppLayout() {
                     className={`relative flex flex-col items-center justify-center gap-2 rounded-2xl border p-4 transition-all duration-300 ${
                       theme === item.id
                         ? "border-primary/35 bg-primary/8 text-primary shadow-[0_16px_36px_hsl(var(--primary)/0.12)]"
-                        : "border-border/70 bg-background/40 text-foreground dark:text-muted-foreground hover:border-muted-foreground/30 hover:bg-background/60"
+                        : "border-border bg-background/40 text-foreground dark:text-muted-foreground hover:border-muted-foreground/30 hover:bg-background"
                     }`}
                   >
                     <item.icon className="h-5 w-5" />

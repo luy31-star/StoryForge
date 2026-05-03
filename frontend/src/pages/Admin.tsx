@@ -464,7 +464,7 @@ export function Admin() {
                 {rows.map((r) => (
                   <div
                     key={r.id}
-                    className="flex flex-col gap-3 rounded-lg border border-border/60 p-4 md:flex-row md:items-center"
+                    className="flex flex-col gap-3 rounded-lg border border-border p-4 md:flex-row md:items-center"
                   >
                     <div className="flex-1 space-y-1">
                       <div className="font-medium">{r.display_name || r.model_id}</div>
@@ -539,7 +539,7 @@ export function Admin() {
                 </div>
               </CardHeader>
               <CardContent className="space-y-3">
-                <div className="flex items-center justify-between rounded-lg border border-border/60 bg-background/50 p-3">
+                <div className="flex items-center justify-between rounded-lg border border-border bg-background/50 p-3">
                   <div className="space-y-0.5">
                     <div className="text-sm font-medium">注册策略</div>
                     <div className="text-xs text-muted-foreground">
@@ -562,7 +562,7 @@ export function Admin() {
                   const used = Boolean(it.used_by_user_id || it.used_at);
                   const exp = it.expires_at ? new Date(it.expires_at).toLocaleString() : "永不过期";
                   return (
-                    <div key={it.id} className="flex flex-col gap-2 rounded-lg border border-border/60 p-4 md:flex-row md:items-center md:justify-between">
+                    <div key={it.id} className="flex flex-col gap-2 rounded-lg border border-border p-4 md:flex-row md:items-center md:justify-between">
                       <div className="space-y-1">
                         <div className="flex items-center gap-2">
                           <span className="font-mono text-sm">{it.code}</span>

@@ -21,8 +21,6 @@ from app.services.chapter_plan_schema import normalize_beats_to_v2
 from app.services.novel_generation_common import (
     append_generation_log,
     build_chapter_plan_hint,
-    build_future_plan_summary,
-    build_multi_chapter_plan_hint,
     ensure_chapter_heading,
 )
 from app.services.novel_judge_service import run_chapter_judge_suite
@@ -48,6 +46,35 @@ from app.services.novel_workflow_service import get_workflow_run_by_batch_id
 from app.services.task_cancel import is_cancel_requested
 
 logger = logging.getLogger(__name__)
+
+
+def _compact_future_plan_refs(rows: list[NovelChapterPlan], *, max_items: int = 3) -> str:
+    refs: list[str] = []
+    for row in rows[:max_items]:
+        title = str(getattr(row, "chapter_title", "") or "").strip()
+        if title:
+            refs.append(f"第{row.chapter_no}章《{title}》")
+        else:
+            refs.append(f"第{row.chapter_no}章")
+    if not refs:
+        return ""
+    return (
+        "【后续章节仅作边界提醒】\n"
+        f"后续已规划：{'、'.join(refs)}。\n"
+        "本次只允许完成当前章，禁止提前展开后续章节的关键事件。"
+    )
+
+
+def _chapter_one_background_ready(text: str) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    body = raw.replace("\n", "")
+    # 开篇至少应包含「环境/身份/冲突触发」中的多数信息，避免直接跳事件。
+    env_hits = sum(1 for kw in ("宗门", "城", "镇", "王朝", "学院", "世界", "年代", "边境", "天界", "秘境", "现代", "古代") if kw in body)
+    identity_hits = sum(1 for kw in ("主角", "少年", "少女", "弟子", "身份", "出身", "家族", "他是", "她是") if kw in body)
+    trigger_hits = sum(1 for kw in ("因为", "因此", "为了", "必须", "危机", "矛盾", "目标", "契机", "冲突", "追杀") if kw in body)
+    return (env_hits > 0 and identity_hits > 0 and trigger_hits > 0) or (env_hits + identity_hits + trigger_hits >= 4)
 
 
 def _chapter_saved_nos_for_batch(
@@ -101,7 +128,7 @@ def run_generate_chapters_batch_sync(
     billing_user_id: str | None,
     title_hint: str,
     chapter_nos: list[int],
-    use_cold_recall: bool,
+    use_cold_recall: bool | None,
     cold_recall_items: int,
     auto_consistency_check: bool,
     auto_plan_guard_check: bool,
@@ -285,8 +312,7 @@ def run_generate_chapters_batch_sync(
             no, plan.chapter_title, beats, added, resolved
         )
 
-        # 查询后续章计划摘要（最多9章）
-        future_plans: list[dict[str, Any]] = []
+        # 仅保留后续章号边界提醒，不再注入后续执行卡细节，避免当前章“偷跑”。
         future_rows = (
             db.query(NovelChapterPlan)
             .filter(
@@ -294,23 +320,12 @@ def run_generate_chapters_batch_sync(
                 NovelChapterPlan.chapter_no > no,
             )
             .order_by(NovelChapterPlan.chapter_no.asc())
-            .limit(9)
+            .limit(3)
             .all()
         )
-        for fp in future_rows:
-            try:
-                fp_beats = json.loads(fp.beats_json or "{}")
-            except Exception:
-                fp_beats = {}
-            fp_beats = normalize_beats_to_v2(fp_beats)
-            summary = build_future_plan_summary(
-                fp.chapter_no, fp.chapter_title, fp_beats
-            )
-            future_plans.append({"summary": summary})
-
-        chapter_plan_hint = build_multi_chapter_plan_hint(
-            chapter_plan_hint, future_plans
-        )
+        future_guard = _compact_future_plan_refs(future_rows, max_items=3)
+        if future_guard:
+            chapter_plan_hint = f"{chapter_plan_hint}\n\n{future_guard}"
         effective_title_hint = (plan.chapter_title or title_hint or "").strip()
         append_generation_log(
             db,
@@ -336,7 +351,33 @@ def run_generate_chapters_batch_sync(
             cold_recall_items=cold_recall_items,
         )
         content = raw_content
-        draft_metrics = chapter_content_metrics(raw_content)
+        if no == 1 and not _chapter_one_background_ready(content):
+            try:
+                content = llm.check_and_fix_chapter_sync(
+                    n,
+                    no,
+                    effective_title_hint,
+                    mem,
+                    continuity,
+                    content,
+                    db=db,
+                )
+                append_generation_log(
+                    db,
+                    novel_id=novel_id,
+                    batch_id=batch_id,
+                    event="chapter_intro_guard_fixed",
+                    chapter_no=no,
+                    message="第 1 章补充背景引导完成，已修正为可读开篇",
+                )
+                db.commit()
+            except Exception:
+                logger.exception(
+                    "chapter intro guard fix failed | novel_id=%s chapter_no=%s",
+                    novel_id,
+                    no,
+                )
+        draft_metrics = chapter_content_metrics(content)
         append_generation_log(
             db,
             novel_id=novel_id,
@@ -345,48 +386,40 @@ def run_generate_chapters_batch_sync(
             chapter_no=no,
             message=f"第 {no} 章初稿生成完成（正文约 {draft_metrics['body_chars']} 字）",
             meta={
-                "raw_chars": len(raw_content or ""),
+                "generated_chars": len(content or ""),
                 **draft_metrics,
             },
         )
         db.commit()
 
         if do_consistency_check:
+            # 延迟到异步任务执行，不阻塞批量流水线
             try:
-                content = llm.check_and_fix_chapter_sync(
-                    n, no, title_hint, mem, continuity, raw_content, db=db
+                from app.tasks.novel_tasks import novel_deferred_consistency_check
+
+                novel_deferred_consistency_check.delay(
+                    novel_id=novel_id,
+                    chapter_no=no,
+                    chapter_title=effective_title_hint,
+                    memory_json=mem,
+                    continuity=continuity,
+                    chapter_content=content,
                 )
-                fixed_metrics = chapter_content_metrics(content)
                 append_generation_log(
                     db,
                     novel_id=novel_id,
                     batch_id=batch_id,
-                    event="chapter_consistency_done",
+                    event="chapter_consistency_deferred",
                     chapter_no=no,
-                    message=f"第 {no} 章一致性修订完成（正文约 {fixed_metrics['body_chars']} 字）",
-                    meta={
-                        "fixed_chars": len(content or ""),
-                        **fixed_metrics,
-                    },
+                    message=f"第 {no} 章一致性修订已提交异步任务",
                 )
                 db.commit()
             except Exception:
                 logger.exception(
-                    "generate_chapters step consistency failed, fallback raw | novel_id=%s chapter_no=%s",
+                    "generate_chapters step consistency deferred failed | novel_id=%s chapter_no=%s",
                     novel_id,
                     no,
                 )
-                append_generation_log(
-                    db,
-                    novel_id=novel_id,
-                    batch_id=batch_id,
-                    event="chapter_consistency_failed",
-                    chapter_no=no,
-                    level="error",
-                    message=f"第 {no} 章一致性修订失败，已回退初稿",
-                )
-                db.commit()
-                content = raw_content
 
         normalized_title, normalized_content = ensure_chapter_heading(
             no, content, title_hint=effective_title_hint
@@ -717,6 +750,39 @@ def run_generate_chapters_batch_sync(
                 },
             )
             db.commit()
+
+            # ── 周期性记忆校准 ──────────────────────────────────────────
+            if (
+                auto_approve
+                and settings.novel_memory_calibration_interval > 0
+                and no % settings.novel_memory_calibration_interval == 0
+            ):
+                try:
+                    cal_result = llm.calibrate_memory_from_chapters_sync(
+                        db,
+                        n,
+                        chapter_window=settings.novel_memory_calibration_interval,
+                    )
+                    append_generation_log(
+                        db,
+                        novel_id=novel_id,
+                        batch_id=batch_id,
+                        event="memory_calibration",
+                        chapter_no=no,
+                        message=(
+                            f"第 {no} 章触发周期性记忆校准"
+                            + (f"，修正 {cal_result.get('changes', 0)} 处" if cal_result.get("ok") else "，校准失败")
+                        ),
+                        meta=cal_result,
+                    )
+                    db.commit()
+                except Exception:
+                    db.rollback()
+                    logger.exception(
+                        "memory calibration failed | novel_id=%s chapter_no=%s",
+                        novel_id, no,
+                    )
+
             if settings.novel_judge_enabled:
                 try:
                     workflow_run = get_workflow_run_by_batch_id(db, batch_id=batch_id)

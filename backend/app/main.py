@@ -19,6 +19,7 @@ from app.core.db_migrate import (
     ensure_novel_target_chapters,
     ensure_user_config_columns,
     ensure_user_email_column,
+    ensure_novel_generation_log_indexes,
     ensure_user_isolation_columns,
     ensure_user_status_columns,
     ensure_volume_outline_columns,
@@ -50,6 +51,8 @@ from slowapi.middleware import SlowAPIMiddleware
 from app.routers import agents, auth, billing, llm, media, novel, volume, websocket, workflow, admin_dashboard, tasks, writing_style
 
 logger = logging.getLogger(__name__)
+# 关闭 uvicorn 默认 access log，避免刷屏输出「GET ... HTTP/1.1 200 OK」
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 logging.getLogger("vocalflow.request").setLevel(logging.INFO)
 logging.getLogger("app.routers.novel").setLevel(logging.INFO)
 logging.getLogger("app.routers.volume").setLevel(logging.INFO)
@@ -124,6 +127,7 @@ def on_startup() -> None:
     ensure_story_bible_columns(engine)
     ensure_item_skill_lifecycle_columns(engine)
     ensure_novel_entity_state_machine_columns(engine)
+    ensure_novel_generation_log_indexes(engine)
     ensure_volume_outline_columns(engine)
     relax_novel_memory_norm_columns(engine)
     ensure_model_price_split_columns(engine)

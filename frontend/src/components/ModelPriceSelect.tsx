@@ -156,7 +156,7 @@ export function ModelPriceSelect({ value, onChange, models, disabled }: Props) {
     return (
       <div
         className={cn(
-          "flex w-full items-center gap-2 rounded-xl border border-border/50 bg-muted/20 px-3 py-2.5",
+          "flex w-full items-center gap-2 rounded-xl border border-border/50 bg-muted px-3 py-2.5",
           "text-muted-foreground"
         )}
       >
@@ -187,7 +187,7 @@ export function ModelPriceSelect({ value, onChange, models, disabled }: Props) {
         }}
         className={cn(
           "overflow-y-auto overflow-x-hidden overscroll-contain touch-pan-y",
-          "rounded-xl border border-border/60 bg-card/95 shadow-[0_16px_40px_-12px_rgba(0,0,0,0.35)] backdrop-blur-md",
+          "rounded-xl border border-border bg-card/95 shadow-[0_16px_40px_-12px_rgba(0,0,0,0.35)] backdrop-blur-md",
           "animate-in fade-in-0 zoom-in-95 duration-150",
           "[scrollbar-width:thin] [scrollbar-color:hsl(var(--muted-foreground)/0.35)_transparent]"
         )}
@@ -249,8 +249,8 @@ export function ModelPriceSelect({ value, onChange, models, disabled }: Props) {
           });
         }}
         className={cn(
-          "flex w-full items-stretch gap-2 rounded-xl border border-border/60 bg-background/50 px-3 py-2.5 text-left shadow-sm",
-          "backdrop-blur-sm transition-[border-color,box-shadow] hover:border-primary/25 hover:bg-background/70",
+          "flex w-full items-stretch gap-2 rounded-xl border border-border bg-background/50 px-3 py-2.5 text-left shadow-sm",
+          "backdrop-blur-sm transition-[border-color,box-shadow] hover:border-primary/25 hover:bg-background",
           "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/30",
           open && "border-primary/35 ring-1 ring-primary/15"
         )}

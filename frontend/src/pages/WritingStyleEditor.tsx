@@ -299,7 +299,7 @@ export function WritingStyleEditor() {
                 <CardContent className="space-y-4">
                   <div className="space-y-2">
                     <Label className="text-xs font-bold text-muted-foreground">词汇标签</Label>
-                    <div className="flex flex-wrap gap-1.5 min-h-[32px] p-2 rounded-lg bg-muted/30 border border-dashed">
+                    <div className="flex flex-wrap gap-1.5 min-h-[32px] p-2 rounded-lg bg-muted border border-dashed">
                       {formData.lexicon?.tags?.map((t, i) => (
                         <Badge key={i} variant="secondary" className="gap-1 px-2 py-0.5 text-[10px] font-bold">
                           {t}
@@ -462,7 +462,7 @@ export function WritingStyleEditor() {
                 <CardContent className="space-y-4">
                   <div className="space-y-2">
                     <Label className="text-xs font-bold text-muted-foreground">主要语气</Label>
-                    <div className="flex flex-wrap gap-1.5 min-h-[32px] p-2 rounded-lg bg-muted/30 border border-dashed">
+                    <div className="flex flex-wrap gap-1.5 min-h-[32px] p-2 rounded-lg bg-muted border border-dashed">
                       {formData.tone?.primary?.map((t, i) => (
                         <Badge key={i} variant="outline" className="gap-1 px-2 py-0.5 text-[10px] font-bold border-primary/30 text-primary">
                           {t}
@@ -500,7 +500,7 @@ export function WritingStyleEditor() {
                       value={formData.tone?.description || ""} 
                       onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setFormData(prev => ({ ...prev, tone: { ...prev.tone!, description: e.target.value } }))}
                       placeholder="对整体语气的详细描述..."
-                      className="text-xs leading-relaxed min-h-[80px] bg-muted/10"
+                      className="text-xs leading-relaxed min-h-[80px] bg-muted"
                     />
                   </div>
                   <div className="space-y-2">
@@ -559,7 +559,7 @@ export function WritingStyleEditor() {
                 <CardContent className="space-y-4">
                   <div className="grid grid-cols-2 gap-2">
                     {Object.entries(formData.rhetoric?.types || {}).map(([type, freq]) => (
-                      <div key={type} className="flex items-center justify-between rounded bg-muted/30 px-2 py-1 text-[10px] group">
+                      <div key={type} className="flex items-center justify-between rounded bg-muted px-2 py-1 text-[10px] group">
                         <span className="font-bold">{type}</span>
                         <div className="flex items-center gap-1">
                           <span className={cn(
@@ -781,7 +781,7 @@ export function WritingStyleEditor() {
                       <Label className="text-xs font-bold">从选段分析文风</Label>
                       <Textarea 
                         placeholder="在此粘贴一段具有代表性的文字（至少50字）..." 
-                        className="min-h-[150px] text-xs resize-none bg-muted/20"
+                        className="min-h-[150px] text-xs resize-none bg-muted"
                         value={analysisText}
                         onChange={(e: React.ChangeEvent<HTMLTextAreaElement>) => setAnalyzeText(e.target.value)}
                       />
@@ -807,7 +807,7 @@ export function WritingStyleEditor() {
                       {authorResults.map((author, idx) => (
                         <div 
                           key={idx} 
-                          className="p-3 rounded-lg border bg-muted/20 hover:border-primary/50 cursor-pointer transition-colors group"
+                          className="p-3 rounded-lg border bg-muted hover:border-primary/50 cursor-pointer transition-colors group"
                           onClick={() => handleSelectAuthor(author)}
                         >
                           <div className="flex items-center justify-between mb-1">
@@ -843,7 +843,7 @@ export function WritingStyleEditor() {
                           key={idx} 
                           className={cn(
                             "flex items-center justify-between p-2 rounded border cursor-pointer transition-colors",
-                            selectedWorks.includes(work) ? "bg-primary/5 border-primary/30" : "bg-muted/10 border-transparent"
+                            selectedWorks.includes(work) ? "bg-primary/5 border-primary/30" : "bg-muted border-transparent"
                           )}
                           onClick={() => {
                             if (selectedWorks.includes(work)) {
@@ -911,7 +911,7 @@ export function WritingStyleEditor() {
                               next[idx] = e.target.value;
                               setFetchedSnippets(next);
                             }}
-                            className="text-[10px] min-h-[100px] bg-muted/10"
+                            className="text-[10px] min-h-[100px] bg-muted"
                           />
                           <Button 
                             size="icon" 

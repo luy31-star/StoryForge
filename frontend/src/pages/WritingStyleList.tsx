@@ -69,7 +69,7 @@ export function WritingStyleList() {
         {loading ? (
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             {[1, 2, 3].map((i) => (
-              <Card key={i} className="animate-pulse bg-muted/20">
+              <Card key={i} className="animate-pulse bg-muted">
                 <div className="h-48" />
               </Card>
             ))}
@@ -119,7 +119,7 @@ export function WritingStyleList() {
                 <CardContent className="space-y-4">
                   <div className="flex flex-wrap gap-1.5">
                     {s.lexicon.tags.slice(0, 4).map((t) => (
-                      <span key={t} className="rounded-full border border-border/50 bg-muted/30 px-2 py-0.5 text-[10px] font-bold text-muted-foreground">
+                      <span key={t} className="rounded-full border border-border/50 bg-muted px-2 py-0.5 text-[10px] font-bold text-muted-foreground">
                         {t}
                       </span>
                     ))}

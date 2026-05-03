@@ -205,7 +205,7 @@ export function NovelNew() {
             </div>
             <Button
               type="button"
-              variant="glass"
+              variant="secondary"
               className="w-full gap-2 sm:w-auto sm:min-w-[200px] font-bold"
               onClick={() => setInspireOpen(true)}
             >
@@ -232,7 +232,7 @@ export function NovelNew() {
                 。可多轮追问，再把内容填入下方表单。
               </DialogDescription>
             </DialogHeader>
-            <div className="soft-scroll flex max-h-[48vh] flex-col gap-3 overflow-y-auto rounded-[1.4rem] border border-border/70 bg-muted/30 p-3 text-sm">
+            <div className="soft-scroll flex max-h-[48vh] flex-col gap-3 overflow-y-auto rounded-lg border border-border bg-muted p-3 text-sm">
               {inspireTurns.length === 0 ? (
                 <p className="text-foreground/50 dark:text-muted-foreground italic font-medium">
                   例如：「帮我查一下 2025 年流行的无限流设定，给一个适合新人作者的梗概方向」
@@ -243,8 +243,8 @@ export function NovelNew() {
                   key={`${i}-${t.role}`}
                   className={
                     t.role === "user"
-                      ? "ml-8 rounded-[1.25rem] border border-primary/20 bg-primary/10 px-3.5 py-3 shadow-sm"
-                      : "mr-4 rounded-[1.25rem] border border-border/60 bg-background/80 px-3.5 py-3 shadow-sm"
+                      ? "ml-8 rounded-lg border border-primary/20 bg-primary/10 px-3.5 py-3 shadow-sm"
+                      : "mr-4 rounded-lg border border-border bg-background px-3.5 py-3 shadow-sm"
                   }
                 >
                   <span className={`text-xs font-bold ${t.role === 'user' ? 'text-primary' : 'text-foreground/70 dark:text-muted-foreground'}`}>
@@ -254,7 +254,7 @@ export function NovelNew() {
                 </div>
               ))}
               {inspireThinking ? (
-                <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
                   <div className="flex items-center justify-between gap-2">
                     <p className="font-medium text-amber-700 dark:text-amber-300">Think</p>
                     {thinkTooLong ? (
@@ -492,7 +492,7 @@ export function NovelNew() {
                 ) : null}
               </div>
               {err ? (
-                <div className="rounded-[1.1rem] border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+                <div className="rounded-lg border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
                   {err}
                 </div>
               ) : null}
@@ -507,7 +507,7 @@ export function NovelNew() {
             </div>
           </div>
 
-          <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
+          <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] md:hidden">
             <div className="novel-container space-y-2 px-4">
               <p className="text-[11px] font-medium text-foreground/60">
                 {err

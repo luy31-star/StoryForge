@@ -102,6 +102,7 @@ from app.services.novel_generation_common import (
     has_pending_memory_refresh_batch,
     memory_refresh_confirmation_token,
     recover_stale_chapter_generation_batches,
+    recover_stale_framework_generate_batches,
     recover_stale_volume_plan_batches,
 )
 from app.services.novel_text_formatter import format_novel_text
@@ -122,6 +123,8 @@ from app.tasks.novel_tasks import (
 
 router = APIRouter(prefix="/api/novels", tags=["novels"])
 logger = logging.getLogger(__name__)
+_RECOVER_STALE_MIN_INTERVAL_SECONDS = 20
+_LAST_RECOVER_STALE_AT_BY_NOVEL: dict[str, float] = {}
 
 
 def _novel_llm(user: User) -> NovelLLMService:
@@ -132,12 +135,26 @@ def _snapshot_novel_prompt_view(novel: Novel, db: Session | None = None) -> Any:
     """章节助手快照：framework_json 为合并 arcs 后的有效 JSON（兼容旧库内嵌 arcs）。"""
     fw_md, _ = coerce_novel_outline_base_fields(novel.framework_markdown, novel.framework_json)
     fw_j = effective_framework_json_for_prompt(db, novel) if db is not None else effective_framework_json_for_prompt(None, novel)
+    writing_style = getattr(novel, "writing_style", None)
+    style_snapshot = None
+    if writing_style is not None:
+        style_snapshot = SimpleNamespace(
+            lexicon=getattr(writing_style, "lexicon", None),
+            structure=getattr(writing_style, "structure", None),
+            tone=getattr(writing_style, "tone", None),
+            rhetoric=getattr(writing_style, "rhetoric", None),
+            negative_prompts=list(getattr(writing_style, "negative_prompts", None) or []),
+            snippets=list(getattr(writing_style, "snippets", None) or []),
+        )
     return SimpleNamespace(
         id=str(novel.id),
         title=str(novel.title or ""),
         framework_markdown=fw_md,
         background=str(novel.background or ""),
         framework_json=fw_j,
+        chapter_model=str(getattr(novel, "chapter_model", "") or ""),
+        chapter_target_words=int(getattr(novel, "chapter_target_words", 3000) or 3000),
+        writing_style=style_snapshot,
     )
 
 
@@ -224,12 +241,39 @@ class AiCreateAndStartBody(BaseModel):
     auto_style_polish: bool = False
     auto_expressive_enhance: bool = False
     writing_style_id: str | None = Field(default=None, max_length=36)
-    
+    # 抽卡阶段用户已选择的具体设定（可选）
+    selected_world: dict[str, Any] | None = Field(default=None)
+    selected_protagonist: dict[str, Any] | None = Field(default=None)
+    selected_cheat: dict[str, Any] | None = Field(default=None)
+
+
+class DrawWorldOptionsBody(BaseModel):
+    styles: list[str] = Field(default_factory=list, max_length=20)
+    subjects: list[str] = Field(default_factory=list, max_length=10)
+    backgrounds: list[str] = Field(default_factory=list, max_length=10)
+    moods: list[str] = Field(default_factory=list, max_length=10)
+
+
+class DrawProtagonistOptionsBody(BaseModel):
+    styles: list[str] = Field(default_factory=list, max_length=20)
+    subjects: list[str] = Field(default_factory=list, max_length=10)
+    protagonist_count: int = Field(default=2, ge=1, le=5)
+    selected_world: dict[str, Any] | None = None
+
+
+class DrawCheatOptionsBody(BaseModel):
+    styles: list[str] = Field(default_factory=list, max_length=20)
+    subjects: list[str] = Field(default_factory=list, max_length=10)
+    plot_type: str = Field(default="", max_length=40)
+    selected_world: dict[str, Any] | None = None
+    selected_protagonist: dict[str, Any] | None = None
+
+
 class NovelCreate(BaseModel):
     title: str
     intro: str = ""
     background: str = ""
-    style: str = Field(default="", max_length=255)
+    style: str = ""
     writing_style_id: str | None = Field(default=None, max_length=36)
     target_chapters: int = Field(default=300, ge=1, le=20000)
     daily_auto_chapters: int = Field(default=0, ge=0, le=20)
@@ -240,12 +284,15 @@ class NovelCreate(BaseModel):
     auto_plan_guard_fix: bool = False
     auto_style_polish: bool = False
     auto_expressive_enhance: bool = False
+    framework_model: str = Field(default="", max_length=128)
+    plan_model: str = Field(default="", max_length=128)
+    chapter_model: str = Field(default="", max_length=128)
 
 class NovelPatch(BaseModel):
     title: str | None = None
     intro: str | None = None
     background: str | None = None
-    style: str | None = Field(default=None, max_length=255)
+    style: str | None = None
     writing_style_id: str | None = Field(default=None, max_length=36)
     target_chapters: int | None = None
     daily_auto_chapters: int | None = None
@@ -259,6 +306,9 @@ class NovelPatch(BaseModel):
     rag_enabled: bool | None = None
     story_bible_enabled: bool | None = None
     status: str | None = None
+    framework_model: str | None = Field(default=None, max_length=128)
+    plan_model: str | None = Field(default=None, max_length=128)
+    chapter_model: str | None = Field(default=None, max_length=128)
 
 
 class ConfirmFrameworkBody(BaseModel):
@@ -300,7 +350,7 @@ class ChapterFeedbackBody(BaseModel):
 class GenerateChapterBody(BaseModel):
     title_hint: str = ""
     count: int = Field(default=1, ge=1, le=5)
-    use_cold_recall: bool = False
+    use_cold_recall: bool | None = None
     cold_recall_items: int = Field(default=5, ge=1, le=12)
     auto_consistency_check: bool | None = None
     auto_plan_guard_check: bool | None = None
@@ -828,6 +878,9 @@ def ai_create_and_start(
             "length_type": body.length_type,
             "target_chapters": body.target_chapters,
             "target_generate_chapters": body.target_generate_chapters,
+            "selected_world": body.selected_world,
+            "selected_protagonist": body.selected_protagonist,
+            "selected_cheat": body.selected_cheat,
         },
     )
     db.commit()
@@ -835,14 +888,13 @@ def ai_create_and_start(
     try:
         from app.tasks.novel_tasks import novel_ai_create_and_start_task
         task = novel_ai_create_and_start_task.delay(
-            n.id, 
-            str(user.id), 
-            batch_id, 
+            n.id,
+            str(user.id),
+            batch_id,
             tags,
             body.notes,
-            body.length_type, 
-            body.target_generate_chapters,
-            body.target_chapters,
+            body.length_type,
+            body.model_dump(),
         )
         task_id = getattr(task, "id", None)
     except Exception as e:
@@ -892,6 +944,91 @@ def ai_create_and_start(
     }
 
 
+@router.post("/draw-world-options")
+def draw_world_options(
+    body: DrawWorldOptionsBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    抽卡·世界观设定选项：给定基础标签，AI 生成 3 个风格各异的完整世界观选项供用户选择。
+    每个选项包含：world_type（社会结构/科技水平/文明形态）、main_conflict（核心矛盾）、
+    social_structure（社会阶层/势力分布）、cultural_features（文化/宗教/风俗特点）、
+    unique_rules（这个世界的特殊规则/限制）。
+    """
+    billing_user_id = str(user.id)
+    from app.services.novel_llm_service import NovelLLMService
+    llm = NovelLLMService(billing_user_id=billing_user_id)
+    try:
+        result = llm.draw_world_options_sync(
+            styles=body.styles,
+            subjects=body.subjects,
+            backgrounds=body.backgrounds,
+            moods=body.moods,
+        )
+        return result
+    except Exception as e:
+        logger.exception("draw_world_options failed")
+        raise HTTPException(500, f"生成世界观选项失败：{e}") from e
+
+
+@router.post("/draw-protagonist-options")
+def draw_protagonist_options(
+    body: DrawProtagonistOptionsBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    抽卡·主角设定选项：给定基础标签，AI 生成 3 个主角设定选项供用户选择。
+    每个选项包含：name、role_identity（主角身份+处境）、core_desire（核心欲望/目标）、
+    personality_traits（3-4个性格关键词）、starting_ability（初始能力/资源）、
+    backstory_hint（背景故事暗示）。
+    """
+    billing_user_id = str(user.id)
+    from app.services.novel_llm_service import NovelLLMService
+    llm = NovelLLMService(billing_user_id=billing_user_id)
+    try:
+        result = llm.draw_protagonist_options_sync(
+            styles=body.styles,
+            subjects=body.subjects,
+            protagonist_count=body.protagonist_count,
+            selected_world=body.selected_world,
+        )
+        return result
+    except Exception as e:
+        logger.exception("draw_protagonist_options failed")
+        raise HTTPException(500, f"生成主角选项失败：{e}") from e
+
+
+@router.post("/draw-cheat-options")
+def draw_cheat_options(
+    body: DrawCheatOptionsBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    """
+    抽卡·金手指/外挂设定选项：给定基础标签，AI 生成 3 个金手指设定选项供用户选择。
+    每个选项包含：cheat_name、cheat_type（系统/异能/传承/道具/其他）、
+    power_level（强弱定位）、core_mechanic（核心机制描述）、
+    growth_limit（成长限制/代价）、initial_benefit（初始收益）。
+    """
+    billing_user_id = str(user.id)
+    from app.services.novel_llm_service import NovelLLMService
+    llm = NovelLLMService(billing_user_id=billing_user_id)
+    try:
+        result = llm.draw_cheat_options_sync(
+            styles=body.styles,
+            subjects=body.subjects,
+            plot_type=body.plot_type,
+            selected_world=body.selected_world,
+            selected_protagonist=body.selected_protagonist,
+        )
+        return result
+    except Exception as e:
+        logger.exception("draw_cheat_options failed")
+        raise HTTPException(500, f"生成金手指选项失败：{e}") from e
+
+
 @router.get("/queue-status")
 def get_novel_queue_status(
     db: Session = Depends(get_db),
@@ -932,6 +1069,9 @@ def create_novel(
         auto_plan_guard_fix=body.auto_plan_guard_fix,
         auto_style_polish=body.auto_style_polish,
         auto_expressive_enhance=body.auto_expressive_enhance,
+        framework_model=body.framework_model,
+        plan_model=body.plan_model,
+        chapter_model=body.chapter_model,
         rag_enabled=settings.novel_rag_enabled,
         story_bible_enabled=settings.novel_story_bible_enabled,
         user_id=user.id,
@@ -968,6 +1108,9 @@ def get_novel(
         "auto_plan_guard_fix": bool(getattr(n, "auto_plan_guard_fix", False)),
         "auto_style_polish": bool(getattr(n, "auto_style_polish", False)),
         "auto_expressive_enhance": bool(getattr(n, "auto_expressive_enhance", False)),
+        "framework_model": str(getattr(n, "framework_model", "")),
+        "plan_model": str(getattr(n, "plan_model", "")),
+        "chapter_model": str(getattr(n, "chapter_model", "")),
         "rag_enabled": bool(getattr(n, "rag_enabled", False)),
         "story_bible_enabled": bool(getattr(n, "story_bible_enabled", False)),
         "length_tag": _get_length_tag(n.target_chapters),
@@ -1492,6 +1635,34 @@ def update_framework(
     }
 
 
+class CreateChapterBody(BaseModel):
+    chapter_no: int = Field(ge=1, le=20000)
+    title: str = ""
+    content: str = ""
+
+@router.post("/{novel_id}/chapters")
+def create_chapter(
+    novel_id: str,
+    body: CreateChapterBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    n = require_novel_access(db, novel_id, user)
+    existing = db.query(Chapter).filter(Chapter.novel_id == novel_id, Chapter.chapter_no == body.chapter_no).first()
+    if existing:
+        return {"id": existing.id}
+    ch = Chapter(
+        novel_id=novel_id,
+        chapter_no=body.chapter_no,
+        title=body.title,
+        content=body.content,
+        status="draft",
+        source="manual",
+    )
+    db.add(ch)
+    db.commit()
+    return {"id": ch.id}
+
 @router.get("/{novel_id}/chapters")
 def list_chapters(
     novel_id: str,
@@ -1568,6 +1739,90 @@ def export_chapters(
 
     return {"full_text": full_text.strip()}
 
+
+class GenerateChapterStreamBody(BaseModel):
+    chapter_no: int = Field(ge=1, le=20000)
+
+@router.post("/{novel_id}/chapters/generate-stream")
+async def generate_chapter_stream_endpoint(
+    novel_id: str,
+    body: GenerateChapterStreamBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    n = require_novel_access(db, novel_id, user)
+    if not n.framework_confirmed:
+        raise HTTPException(400, "请先确认小说框架，再使用专注模式单章生成")
+    recover_stale_auto_pipeline_state(db, novel_id)
+    recover_stale_chapter_generation_batches(db, novel_id)
+    if has_pending_auto_pipeline_batch(db, novel_id):
+        raise HTTPException(
+            409,
+            "当前存在非专注模式下的 AI 一键续写任务，请先结束后台任务，再进入专注模式单章生成",
+        )
+    if has_pending_chapter_generation_batch(db, novel_id):
+        raise HTTPException(
+            409,
+            "当前已有章节生成任务进行中，请先等待结束或取消后，再使用专注模式单章流式生成",
+        )
+    
+    plan = (
+        db.query(NovelChapterPlan)
+        .filter(
+            NovelChapterPlan.novel_id == novel_id,
+            NovelChapterPlan.chapter_no == body.chapter_no,
+        )
+        .first()
+    )
+    if not plan:
+        raise HTTPException(
+            400,
+            f"第{body.chapter_no}章还没有章节卡，请先在非专注模式准备执行卡后再进入专注模式生成",
+        )
+    plan_hint = ""
+    title_hint = ""
+    if plan:
+        title_hint = plan.chapter_title or ""
+        try:
+            import json
+            beats = json.loads(plan.beats_json or "{}")
+            plan_hint = json.dumps(beats, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    from app.services.novel_llm_stream_utils import stream_chapter_text
+    from app.services.novel_repo import format_continuity_excerpts
+    llm = _novel_llm(user)
+    novel_prompt_view = _snapshot_novel_prompt_view(n, db)
+    mem = latest_memory_json(db, novel_id)
+    continuity = format_continuity_excerpts(db, novel_id, approved_only=True)
+
+    async def event_iter():
+        try:
+            async for evt in stream_chapter_text(
+                llm,
+                novel=novel_prompt_view,
+                chapter_no=body.chapter_no,
+                chapter_title_hint=title_hint,
+                memory_json=mem,
+                continuity_excerpt=continuity,
+                chapter_plan_hint=plan_hint,
+                db=db,
+            ):
+                et = evt.get("type", "text")
+                delta = evt.get("delta", "")
+                if not isinstance(delta, str) or not delta:
+                    continue
+                if et == "think":
+                    yield _sse("think", {"delta": delta})
+                else:
+                    yield _sse("text", {"delta": delta})
+            yield _sse("done", {"ok": True})
+        except Exception as e:
+            logger.exception("chapter-text stream failed")
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(event_iter(), media_type="text/event-stream")
 
 @router.post("/{novel_id}/chapters/generate")
 async def generate_chapters(
@@ -1915,12 +2170,17 @@ def list_generation_logs(
     limit: int = 200,
 ) -> dict[str, Any]:
     require_novel_access(db, novel_id, user)
-    try:
-        recover_stale_auto_pipeline_state(db, novel_id)
-        recover_stale_chapter_generation_batches(db, novel_id)
-        recover_stale_volume_plan_batches(db, novel_id)
-    except Exception:
-        logger.exception("recover stale novel batch state failed | novel_id=%s", novel_id)
+    now_ts = time.time()
+    last_ts = float(_LAST_RECOVER_STALE_AT_BY_NOVEL.get(novel_id, 0.0))
+    if now_ts - last_ts >= _RECOVER_STALE_MIN_INTERVAL_SECONDS:
+        try:
+            recover_stale_auto_pipeline_state(db, novel_id)
+            recover_stale_chapter_generation_batches(db, novel_id)
+            recover_stale_framework_generate_batches(db, novel_id)
+            recover_stale_volume_plan_batches(db, novel_id)
+            _LAST_RECOVER_STALE_AT_BY_NOVEL[novel_id] = now_ts
+        except Exception:
+            logger.exception("recover stale novel batch state failed | novel_id=%s", novel_id)
     lim = max(1, min(limit, 500))
     q = db.query(NovelGenerationLog).filter(NovelGenerationLog.novel_id == novel_id)
     if batch_id:

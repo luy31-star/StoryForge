@@ -119,7 +119,7 @@ export function Register() {
 
   return (
     <div className="min-h-screen bg-background flex items-center justify-center p-6">
-      <Card className="w-full max-w-md border-border/60 bg-card/80">
+      <Card className="w-full max-w-md border-border bg-card">
         <CardHeader>
           <CardTitle className="text-2xl">注册 StoryForge</CardTitle>
         </CardHeader>

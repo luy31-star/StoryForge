@@ -105,6 +105,22 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         text("ALTER TABLE novels ADD COLUMN auto_style_polish BOOLEAN DEFAULT 0")
                     )
                     logger.info("db migrate: added novels.auto_style_polish (sqlite)")
+                if _has_column_sqlite(conn, "novels", "framework_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN framework_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.framework_model (sqlite)")
+                if _has_column_sqlite(conn, "novels", "plan_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN plan_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.plan_model (sqlite)")
+                if _has_column_sqlite(conn, "novels", "chapter_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN chapter_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.chapter_model (sqlite)")
+
                 if _has_column_sqlite(conn, "novels", "base_framework_confirmed"):
                     pass
                 else:
@@ -324,6 +340,28 @@ def ensure_novel_target_chapters(engine: Engine) -> None:
                         )
                     )
                     logger.info("db migrate: added novels.auto_style_polish (mysql)")
+                if _has_column_mysql(conn, "novels", "framework_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN framework_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.framework_model (mysql)")
+                if _has_column_mysql(conn, "novels", "plan_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN plan_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.plan_model (mysql)")
+                if _has_column_mysql(conn, "novels", "chapter_model"):
+                    pass
+                else:
+                    conn.execute(text("ALTER TABLE novels ADD COLUMN chapter_model VARCHAR(128) DEFAULT ''"))
+                    logger.info("db migrate: added novels.chapter_model (mysql)")
+                
+                try:
+                    conn.execute(text("ALTER TABLE novels MODIFY COLUMN style LONGTEXT"))
+                    logger.info("db migrate: modified novels.style to LONGTEXT (mysql)")
+                except Exception as e:
+                    logger.warning(f"Failed to modify novels.style to LONGTEXT: {e}")
+
                 if _has_column_mysql(conn, "novels", "base_framework_confirmed"):
                     pass
                 else:
@@ -1075,3 +1113,54 @@ def ensure_novel_entity_state_machine_columns(engine: Engine) -> None:
                 logger.info("db migrate: added %s.%s (%s)", table, col, dialect)
     except Exception:
         logger.exception("db migrate: ensure_novel_entity_state_machine_columns failed")
+
+
+def ensure_novel_generation_log_indexes(engine: Engine) -> None:
+    """
+    为高频 generation-logs 查询补齐复合索引，降低轮询延迟。
+    """
+    indexes = [
+        (
+            "idx_ngl_novel_created",
+            "CREATE INDEX idx_ngl_novel_created ON novel_generation_logs (novel_id, created_at)",
+        ),
+        (
+            "idx_ngl_novel_batch_created",
+            "CREATE INDEX idx_ngl_novel_batch_created ON novel_generation_logs (novel_id, batch_id, created_at)",
+        ),
+        (
+            "idx_ngl_novel_event_created",
+            "CREATE INDEX idx_ngl_novel_event_created ON novel_generation_logs (novel_id, event, created_at)",
+        ),
+    ]
+    try:
+        with engine.begin() as conn:
+            dialect = engine.dialect.name
+            if dialect == "sqlite":
+                rows = conn.execute(text("PRAGMA index_list(novel_generation_logs)")).fetchall()
+                existing = {str(r[1]) for r in rows if len(r) > 1}
+            elif dialect in ("postgresql", "postgres"):
+                rows = conn.execute(
+                    text(
+                        "SELECT indexname FROM pg_indexes WHERE tablename = 'novel_generation_logs'"
+                    )
+                ).fetchall()
+                existing = {str(r[0]) for r in rows if r and r[0]}
+            elif dialect == "mysql":
+                rows = conn.execute(text("SHOW INDEX FROM novel_generation_logs")).fetchall()
+                # SHOW INDEX 第3列为 Key_name
+                existing = {str(r[2]) for r in rows if len(r) > 2}
+            else:
+                logger.warning(
+                    "db migrate: ensure_novel_generation_log_indexes unsupported dialect=%s",
+                    dialect,
+                )
+                return
+
+            for name, ddl in indexes:
+                if name in existing:
+                    continue
+                conn.execute(text(ddl))
+                logger.info("db migrate: created index %s (%s)", name, dialect)
+    except Exception:
+        logger.exception("db migrate: ensure_novel_generation_log_indexes failed")

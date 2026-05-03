@@ -1,31 +1,16 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
-  BookOpen,
   Brain,
-  ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   GitBranch,
   Sparkles,
   X,
 } from "lucide-react";
 import { LlmActionConfirmDialog } from "@/components/LlmActionConfirmDialog";
-import { NovelIntelPanel } from "@/components/NovelIntelPanel";
 import { FrameworkWizardDialog } from "@/components/FrameworkWizardDialog";
 import { WritingStyleSelect } from "@/components/WritingStyleSelect";
 import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   addChapterFeedback,
@@ -80,7 +65,6 @@ import {
   type NovelWorkflowLatest,
   listVolumeChapterPlan,
   listVolumes,
-  type NovelVolumeListItem,
   manualFixMemory,
   getNovel,
   listChapters,
@@ -111,6 +95,23 @@ import {
   waitForVolumePlanBatch,
 } from "@/services/novelApi";
 import { ensureLlmReady } from "@/services/llmReady";
+// Extracted workspace components
+import { NovelSettingsDialog } from "@/components/workspace/NovelSettingsDialog";
+import { MemoryEditorDialog } from "@/components/workspace/MemoryEditorDialog";
+import { NormDetailDialog } from "@/components/workspace/NormDetailDialog";
+import { PlanEditorDialog } from "@/components/workspace/PlanEditorDialog";
+import { GenerationLogsDialog } from "@/components/workspace/GenerationLogsDialog";
+import { ChapterChatDialog } from "@/components/workspace/ChapterChatDialog";
+import { HistoryDialog } from "@/components/workspace/HistoryDialog";
+import { RefreshRangeDialog } from "@/components/workspace/RefreshRangeDialog";
+import { ExportDialog } from "@/components/workspace/ExportDialog";
+import { WorkspaceHeader } from "@/components/workspace/WorkspaceHeader";
+import { StudioToolbar } from "@/components/workspace/StudioToolbar";
+import { ChapterTreeSidebar } from "@/components/workspace/ChapterTreeSidebar";
+import { FocusMode } from "@/components/workspace/FocusMode";
+import { OutlineDrawerDialog } from "@/components/workspace/OutlineDrawerDialog";
+import { VolumePlanSection } from "@/components/workspace/VolumePlanSection";
+import { ChapterContentSection } from "@/components/workspace/ChapterContentSection";
 
 const STRUCTURED_LIST_PAGE = 8;
 /** 剧情承接与微调区：每类行列表分页，避免单屏过长 */
@@ -198,235 +199,10 @@ function memoryRunStatusTone(status?: string): string {
     case "queued":
       return "border-sky-500/25 bg-sky-500/10 text-sky-700 dark:text-sky-300";
     default:
-      return "border-border/70 bg-background/60 text-foreground/60";
+      return "border-border bg-background text-foreground/60";
   }
 }
 
-type VolumeArcRow = {
-  title?: string;
-  name?: string;
-  from_chapter?: number;
-  to_chapter?: number;
-  summary?: string;
-  description?: string;
-  hook?: string;
-  must_not?: string[] | string;
-  progress_allowed?: string[] | string;
-};
-
-function parseVolumeOutlineJson(
-  raw?: string
-): { volume_no?: number; arcs: VolumeArcRow[] } | null {
-  if (!raw || raw.trim() === "" || raw === "{}") return null;
-  try {
-    const o = JSON.parse(raw) as { volume_no?: number; arcs?: unknown };
-    if (!o || !Array.isArray(o.arcs) || o.arcs.length === 0) return null;
-    return {
-      volume_no: o.volume_no,
-      arcs: o.arcs.filter(
-        (a): a is VolumeArcRow => a != null && typeof a === "object"
-      ),
-    };
-  } catch {
-    return null;
-  }
-}
-
-function stringListField(v: string | string[] | undefined): string[] {
-  if (v == null) return [];
-  if (Array.isArray(v))
-    return v.map((x) => String(x).trim()).filter(Boolean);
-  return String(v).trim() ? [String(v).trim()] : [];
-}
-
-function VolumeArcStack({
-  volume,
-  compact,
-  roomy,
-}: {
-  volume: NovelVolumeListItem;
-  compact?: boolean;
-  /** 大纲抽屉主预览：更大字号与留白，适合阅读 */
-  roomy?: boolean;
-}) {
-  const parsed = parseVolumeOutlineJson(volume.outline_json);
-  const md = (volume.outline_markdown || "").trim();
-  if (parsed && parsed.arcs.length > 0) {
-    return (
-      <div
-        className={
-          compact
-            ? "space-y-1.5"
-            : roomy
-              ? "space-y-3.5"
-              : "space-y-2"
-        }
-      >
-        {parsed.arcs.map((arc, idx) => {
-          const title = (arc.title || arc.name || `第${idx + 1}段`).trim();
-          const lo = arc.from_chapter;
-          const hi = arc.to_chapter;
-          const range =
-            typeof lo === "number" && typeof hi === "number"
-              ? `约第${lo}—${hi}章`
-              : "";
-          const summary = (arc.summary || arc.description || "").trim();
-          const hook = (arc.hook || "").trim();
-          const must = stringListField(arc.must_not);
-          const allow = stringListField(arc.progress_allowed);
-          return (
-            <details
-              key={`${volume.id}-arc-${idx}`}
-              className={
-                roomy
-                  ? "group rounded-2xl border-2 border-border/80 bg-card/80 open:border-primary/30 open:shadow-sm"
-                  : "group rounded-xl border border-border/70 bg-background/50 open:border-primary/20 open:bg-muted/25"
-              }
-            >
-              <summary
-                className={`flex cursor-pointer list-none items-start gap-2 text-left [&::-webkit-details-marker]:hidden ${
-                  roomy
-                    ? "p-4 pr-5 text-base"
-                    : "p-2.5"
-                }`}
-              >
-                <ChevronRight
-                  className={
-                    roomy
-                      ? "mt-0.5 size-[1.1rem] shrink-0 text-foreground/50 transition group-open:rotate-90"
-                      : "mt-0.5 size-3.5 shrink-0 text-foreground/45 transition group-open:rotate-90"
-                  }
-                />
-                <div className="min-w-0 flex-1">
-                  <p
-                    className={`font-bold text-foreground ${
-                      compact
-                        ? "text-[11px] leading-snug"
-                        : roomy
-                          ? "text-base leading-snug"
-                          : "text-sm"
-                    }`}
-                  >
-                    {title}
-                    {range ? (
-                      <span
-                        className={
-                          roomy
-                            ? "ml-2 text-sm font-normal text-foreground/50"
-                            : "ml-1.5 font-normal text-foreground/45"
-                        }
-                      >
-                        {range}
-                      </span>
-                    ) : null}
-                  </p>
-                </div>
-              </summary>
-              <div
-                className={`space-y-2 border-t border-border/40 text-foreground/85 ${
-                  compact
-                    ? "px-2.5 pb-2.5 pt-2 text-[10px] leading-relaxed"
-                    : roomy
-                      ? "space-y-3 px-4 pb-4 pt-3 text-sm leading-[1.65] sm:px-5"
-                      : "px-2.5 pb-2.5 pt-2 text-xs leading-relaxed"
-                }`}
-              >
-                {summary ? (
-                  <p
-                    className={
-                      roomy ? "whitespace-pre-wrap text-[15px] text-foreground/90" : "whitespace-pre-wrap text-foreground/90"
-                    }
-                  >
-                    {summary}
-                  </p>
-                ) : (
-                  <p className="text-foreground/50">
-                    （本段无剧情摘要。重新生成分卷剧情后将显示摘要与约束。）
-                  </p>
-                )}
-                {hook ? (
-                  <div
-                    className={
-                      roomy
-                        ? "rounded-xl border border-amber-500/30 bg-amber-500/10 px-3.5 py-2.5"
-                        : "rounded-lg border border-amber-500/25 bg-amber-500/10 px-2 py-1.5"
-                    }
-                  >
-                    <p className="font-bold text-amber-800 dark:text-amber-200">
-                      钩子
-                    </p>
-                    <p className="mt-0.5 text-foreground/90">{hook}</p>
-                  </div>
-                ) : null}
-                {must.length > 0 ? (
-                  <div
-                    className={
-                      roomy
-                        ? "rounded-xl border border-rose-500/25 bg-rose-500/10 px-3.5 py-2.5"
-                        : "rounded-lg border border-rose-500/20 bg-rose-500/5 px-2 py-1.5"
-                    }
-                  >
-                    <p className="font-bold text-rose-800 dark:text-rose-200">
-                      禁止推进
-                    </p>
-                    <ul className="mt-1 list-disc pl-4">
-                      {must.map((x) => (
-                        <li key={x}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-                {allow.length > 0 ? (
-                  <div
-                    className={
-                      roomy
-                        ? "rounded-xl border border-emerald-500/25 bg-emerald-500/10 px-3.5 py-2.5"
-                        : "rounded-lg border border-emerald-500/20 bg-emerald-500/5 px-2 py-1.5"
-                    }
-                  >
-                    <p className="font-bold text-emerald-800 dark:text-emerald-200">
-                      允许推进
-                    </p>
-                    <ul className="mt-1 list-disc pl-4">
-                      {allow.map((x) => (
-                        <li key={x}>{x}</li>
-                      ))}
-                    </ul>
-                  </div>
-                ) : null}
-              </div>
-            </details>
-          );
-        })}
-      </div>
-    );
-  }
-  if (md) {
-    return (
-      <details className="rounded-xl border border-border/70 bg-muted/20 open:rounded-2xl">
-        <summary
-          className={
-            roomy
-              ? "cursor-pointer list-none p-4 text-left text-sm font-bold text-foreground [&::-webkit-details-marker]:hidden"
-              : "cursor-pointer list-none p-2.5 text-left text-xs font-bold text-foreground [&::-webkit-details-marker]:hidden"
-          }
-        >
-          查看分卷剧情（仅文本，建议重新生成以带结构化约束）
-        </summary>
-        <pre
-          className={
-            roomy
-              ? "max-h-[min(68dvh,800px)] overflow-auto whitespace-pre-wrap break-words p-4 font-sans text-sm leading-[1.65] text-foreground sm:p-5"
-              : "max-h-[min(50vh,480px)] overflow-auto whitespace-pre-wrap break-words p-3 font-sans text-xs text-foreground sm:text-sm"
-          }
-        >
-          {md}
-        </pre>
-      </details>
-    );
-  }
-  return <p className="text-xs text-foreground/50">暂无分卷剧情。</p>;
-}
 
 function clamp01(value: number) {
   if (Number.isNaN(value)) return 0;
@@ -908,6 +684,7 @@ export function NovelWorkspace() {
   const [outlineDrawerOpen, setOutlineDrawerOpen] = useState(false);
   /** 左侧结构树整条侧栏收起，给主区更多空间 */
   const [studioTreeSidebarCollapsed, setStudioTreeSidebarCollapsed] = useState(false);
+  const [focusModeOpen, setFocusModeOpen] = useState(false);
   /** 卷下章节树是否展开 */
   const [expandedVolumeIds, setExpandedVolumeIds] = useState<Record<string, boolean>>({});
   /** 结构树内：展开查看某卷剧情（与章节列表独立） */
@@ -935,7 +712,6 @@ export function NovelWorkspace() {
     );
   }, [navigate]);
   const [busy, setBusy] = useState(false);
-  const [generateTrace, setGenerateTrace] = useState<string>("");
   const [queueStatus, setQueueStatus] = useState<{
     active_auto_pipeline_count: number;
     max_active_auto_pipeline: number;
@@ -945,8 +721,8 @@ export function NovelWorkspace() {
   const [queueStatusLoading, setQueueStatusLoading] = useState(false);
   const [generateCount, setGenerateCount] = useState(1);
   const [generateCountTouched, setGenerateCountTouched] = useState(false);
-  const [useColdRecall, setUseColdRecall] = useState(false);
-  const [coldRecallItems, setColdRecallItems] = useState(5);
+  const [useColdRecall] = useState<boolean | null>(null);
+  const [coldRecallItems] = useState(5);
   const [selectedChapterId, setSelectedChapterId] = useState<string>("");
   const [editTitle, setEditTitle] = useState("");
   const [editContent, setEditContent] = useState("");
@@ -1097,6 +873,9 @@ export function NovelWorkspace() {
     auto_style_polish: false,
     style: "",
     writing_style_id: "",
+    framework_model: "",
+    plan_model: "",
+    chapter_model: "",
   });
   const [novelSettingsBusy, setNovelSettingsBusy] = useState(false);
 
@@ -1160,6 +939,9 @@ export function NovelWorkspace() {
       auto_style_polish: Boolean(novel.auto_style_polish),
       style: String(novel.style || ""),
       writing_style_id: String(novel.writing_style_id || ""),
+      framework_model: String(novel.framework_model || ""),
+      plan_model: String(novel.plan_model || ""),
+      chapter_model: String(novel.chapter_model || ""),
     });
     setNovelSettingsOpen(true);
   }
@@ -1430,11 +1212,6 @@ export function NovelWorkspace() {
     ? editContent.trim().replace(/\s+/g, "").length
     : 0;
   const frameworkConfirmed = Boolean(novel?.framework_confirmed);
-  const generateDisabledReason = busy
-    ? "当前有任务执行中，请稍候"
-    : !frameworkConfirmed
-      ? "请先在向导或流程中确认框架"
-      : "";
   const queueActiveCount = queueStatus?.active_auto_pipeline_count ?? 0;
   const queueMaxActive = queueStatus?.max_active_auto_pipeline ?? 0;
   const queueSlots = queueStatus?.available_auto_pipeline_slots ?? 0;
@@ -1985,7 +1762,7 @@ export function NovelWorkspace() {
         {helper ? <p className="text-[11px] leading-5 text-muted-foreground">{helper}</p> : null}
         <div className="space-y-2">
           {lines.length === 0 ? (
-            <div className="rounded-2xl border border-dashed border-border/80 px-3 py-3 text-xs text-muted-foreground">
+            <div className="rounded-2xl border border-dashed border-border px-3 py-3 text-xs text-muted-foreground">
               暂无条目，点击“新增”开始填写
             </div>
           ) : null}
@@ -2023,7 +1800,7 @@ export function NovelWorkspace() {
           })}
         </div>
         {pageKey && lines.length > pageSize ? (
-          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border/60 pt-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2">
             <span className="text-[11px] text-muted-foreground">
               本类共 {lines.length} 行，分页展示
             </span>
@@ -2911,23 +2688,16 @@ export function NovelWorkspace() {
     setErr(null);
     setNotice(null);
     setBusy(true);
-    setGenerateTrace(
-      `正在发起 AI 一键续写请求...（目标：${targetCount}章）`
-    );
     try {
       await reloadQueueStatus();
       const resp = await autoGenerateChapters(id, targetCount);
       if (resp.status !== "queued" || !resp.batch_id) {
         const message = resp.message || "生成请求未成功启动，请查看生成日志或稍后重试";
         setErr(message);
-        setGenerateTrace(`生成请求未成功启动：${message}`);
         await reloadGenerationLogs();
         await reload();
         return;
       }
-      setGenerateTrace(
-        `已入队：将按需补全分卷剧情 → 章计划 → 正文；已有计划与剧情会优先复用。`
-      );
       setRefreshBatchId(resp.batch_id);
       await reload(); // 清除失败横幅
       if (logViewMode === "batch") {
@@ -2941,9 +2711,6 @@ export function NovelWorkspace() {
       await reload(); // 获取最新小说状态，消除失败横幅
     } catch (e: unknown) {
       setErr(e instanceof Error ? e.message : "全自动生成失败");
-      setGenerateTrace(
-        `生成请求失败：${e instanceof Error ? e.message : "未知错误"}`
-      );
       await reloadQueueStatus();
     } finally {
       setBusy(false);
@@ -3610,9 +3377,11 @@ export function NovelWorkspace() {
           "须已存在该章的章计划；若计划缺失会提示你先补计划。",
           "生成完成后建议先人工审定；只有审定通过后，才会走后续记忆写入或其它衍生流程。",
           "这条链路与 AI 一键续写不同：AI 一键续写默认每章生成后直接审定，并尝试更新工作记忆。",
-          useColdRecall
+          useColdRecall === true
             ? `当前已开启冷层召回，最多附带 ${coldRecallItems} 条历史记忆。`
-            : "当前未开启冷层召回，会以热层记忆为主生成正文。",
+            : useColdRecall === false
+              ? "当前未开启冷层召回，会以热层记忆为主生成正文。"
+              : "冷层召回为自动模式：章节数 ≥30 时自动开启。",
         ],
       },
       async () => {
@@ -3636,9 +3405,11 @@ export function NovelWorkspace() {
           "顺序：缺卷剧情则补卷剧情 → 缺章计划则补章计划 → 生成正文；已有内容会尽量复用。",
           "提交后任务在后台执行，关闭或离开本页不会中断生成。",
           "批量生成更省操作，但建议在关键转折前控制批次数，便于及时校正走向。",
-          useColdRecall
+          useColdRecall === true
             ? `当前已开启冷层召回，最多附带 ${coldRecallItems} 条历史记忆。`
-            : "当前仅使用热层记忆；如果章节跨度较大，可考虑开启冷层召回。",
+            : useColdRecall === false
+              ? "当前仅使用热层记忆；如果章节跨度较大，可考虑开启冷层召回。"
+              : "冷层召回为自动模式：章节数 ≥30 时自动开启。",
         ],
       },
       async () => {
@@ -3803,103 +3574,28 @@ export function NovelWorkspace() {
   return (
     <div className="novel-shell transition-colors duration-300">
       <div className="novel-container space-y-5">
-        <section className="glass-panel overflow-hidden p-5 md:p-7">
-          <div className="flex flex-col gap-6">
-            <div className="flex flex-wrap items-start justify-between gap-4">
-              <div className="max-w-3xl space-y-3">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="glass-chip font-bold text-foreground/80">
-                    <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse" />
-                    {workspaceStageLabel}
-                  </span>
-                  <span className="glass-chip text-foreground/80 font-medium">
-                    预期篇幅
-                    <span className="ml-1 font-bold text-primary">
-                      {novel?.length_tag ? `【${novel.length_tag}】` : ""}
-                    </span>
-                    <span className="ml-1 font-bold text-foreground">
-                      已设置目标 {Number(novel?.target_chapters || 300)} 章
-                    </span>
-                  </span>
-                </div>
-                <div className="space-y-3">
-                  <input
-                    value={titleDraft}
-                    onChange={(e) => setTitleDraft(e.target.value)}
-                    className="h-12 w-full max-w-2xl rounded-2xl border border-border/70 bg-background/70 px-4 text-2xl font-bold tracking-tight text-foreground shadow-[inset_0_1px_0_rgba(255,255,255,0.35)] backdrop-blur-xl transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 placeholder:text-foreground/30"
-                    placeholder="请输入书名"
-                    disabled={busy || titleBusy}
-                  />
-                  <p className="max-w-2xl text-sm leading-6 text-foreground/70 dark:text-muted-foreground font-medium">
-                    以框架、章节、记忆三条主线来推进一本书。把高频操作留在首屏，把详细日志和原始数据收进分区，减少创作中断。
-                  </p>
-                </div>
-                <div className="flex flex-wrap gap-3">
-                  <Button
-                    type="button"
-                    variant="glass"
-                    className="font-bold"
-                    disabled={busy || titleBusy || !titleDraft.trim()}
-                    onClick={() => void runSaveTitle()}
-                  >
-                    保存书名
-                  </Button>
-                  <Button variant="outline" asChild className="font-semibold">
-                    <Link to="/novels">返回书架</Link>
-                  </Button>
-                  <Button variant="outline" asChild className="font-semibold">
-                    <Link to={`/novels/${id}/metrics`}>查看指标</Link>
-                  </Button>
-                  <Button variant="outline" onClick={openNovelSettings} className="font-semibold">
-                    小说设置
-                  </Button>
-                  <Button
-                    type="button"
-                    variant="outline"
-                    className="font-semibold"
-                    onClick={() => {
-                      setLogDialogOpen(true);
-                      void reloadGenerationLogs(logBatchId || undefined);
-                    }}
-                  >
-                    查看生成日志
-                  </Button>
-                </div>
-              </div>
-
-            </div>
-
-            <div className="grid gap-3 md:grid-cols-4">
-              {[
-                ["已写章节", `${chapters.length}`, latestChapterNo ? `最新至第 ${latestChapterNo} 章` : "尚未开始"],
-                ["已审定", `${approvedChapterCount}`, approvedChapterCount ? "可用于记忆刷新" : "尚无已审定章节"],
-                ["待处理草稿", `${draftChapterCount}`, draftChapterCount ? "建议优先审定" : "当前较为清爽"],
-                ["活跃待收束线", `${activeMemoryLines}`, activeMemoryLines ? "需要持续关注" : "记忆区尚未积累"],
-              ].map(([label, value, hint]) => (
-                <div key={label} className="glass-panel-subtle p-4">
-                  <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">{label}</p>
-                  <p className="mt-2 text-2xl font-bold tracking-tight text-foreground">
-                    {value}
-                  </p>
-                  <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">{hint}</p>
-                </div>
-              ))}
-            </div>
-          </div>
-        </section>
-
-        {err ? (
-          <div className="glass-panel-subtle flex items-center gap-2 border-destructive/30 px-4 py-3 text-sm text-destructive">
-            <div className="h-1.5 w-1.5 rounded-full bg-destructive" />
-            {err}
-          </div>
-        ) : null}
-        {notice ? (
-          <div className="glass-panel-subtle flex items-center gap-2 border-emerald-500/30 px-4 py-3 text-sm text-emerald-600 dark:text-emerald-300">
-            <div className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
-            {notice}
-          </div>
-        ) : null}
+        <WorkspaceHeader
+          novelId={id}
+          novel={novel as Record<string, unknown> | null}
+          titleDraft={titleDraft}
+          onTitleDraftChange={setTitleDraft}
+          busy={busy}
+          titleBusy={titleBusy}
+          err={err}
+          notice={notice}
+          workspaceStageLabel={workspaceStageLabel}
+          chaptersCount={chapters.length}
+          latestChapterNo={latestChapterNo}
+          approvedChapterCount={approvedChapterCount}
+          draftChapterCount={draftChapterCount}
+          activeMemoryLines={activeMemoryLines}
+          onSaveTitle={() => void runSaveTitle()}
+          onOpenSettings={openNovelSettings}
+          onOpenLogs={() => {
+            setLogDialogOpen(true);
+            void reloadGenerationLogs(logBatchId || undefined);
+          }}
+        />
 
         <LlmActionConfirmDialog
           open={Boolean(llmConfirm)}
@@ -4012,1406 +3708,160 @@ export function NovelWorkspace() {
           </TabsList>
 
           <TabsContent value="studio" className="mt-4 border-0 bg-transparent p-0 shadow-none">
-            <div className="sticky top-0 z-20 border-b border-border/70 bg-background/92 px-3 py-2 backdrop-blur-xl sm:px-4 md:px-6">
-              <div className="novel-container flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-3">
-                <div className="min-w-0 flex flex-1 flex-col gap-0.5 sm:flex-row sm:items-center sm:gap-2">
-                  <p className="truncate text-xs font-bold text-foreground/80 sm:text-sm">
-                    <span className="text-foreground/45">创作</span>
-                    {workspaceRootBook || !selectedVolumeId ? (
-                      <span className="ml-1.5">· 全书</span>
-                    ) : selectedChapter ? (
-                      <span className="ml-1.5">
-                        · 第{selectedVolume?.volume_no ?? "?"}卷 · 第{selectedChapter.chapter_no}章
-                      </span>
-                    ) : (
-                      <span className="ml-1.5">· 第{selectedVolume?.volume_no ?? "?"}卷</span>
-                    )}
-                  </p>
-                  <p className="truncate text-[10px] text-foreground/50 sm:text-xs">
-                    {titleDraft.trim() || String(novel?.title || "未命名")}
-                  </p>
-                </div>
-                <div className="flex flex-wrap items-center gap-1.5 sm:ml-auto">
-                  <div
-                    className={`rounded-full border px-3 py-1 text-[11px] font-bold ${
-                      queueBusy
-                        ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                        : "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                    }`}
-                    title={queueHint}
-                  >
-                    {queueLabel}
-                  </div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="h-8 rounded-full px-3 text-xs font-bold"
-                    onClick={() => setOutlineDrawerOpen(true)}
-                  >
-                    大纲抽屉
-                  </Button>
-                  <div className="inline-flex h-8 items-center overflow-hidden rounded-full border border-border/70 bg-background/70">
-                    <span className="pl-3 pr-1 text-[11px] font-bold text-foreground/58">
-                      续写
-                    </span>
-                    <input
-                      type="number"
-                      min={1}
-                      max={maxGenerateCount}
-                      value={generateCount}
-                      onChange={(e) => updateGenerateCountInput(e.target.value)}
-                      className="h-full w-16 bg-transparent px-1 text-center text-xs font-black text-foreground outline-none"
-                      aria-label="一键续写章节数量"
-                    />
-                    <span className="pl-1 pr-3 text-[11px] font-bold text-foreground/58">
-                      章
-                    </span>
-                  </div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="h-8 gap-1 rounded-full px-3 text-xs font-bold"
-                    disabled={busy || !frameworkConfirmed}
-                    onClick={() => confirmGenerateChapters()}
-                    title={!frameworkConfirmed ? "请先确认框架，再开始 AI 续写" : `续写 ${generateCount} 章`}
-                  >
-                    <Sparkles className="size-3.5 shrink-0 opacity-90" />
-                    AI 一键续写
-                  </Button>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8 rounded-full px-3 text-xs font-bold"
-                    onClick={() => setFrameworkWizardOpen(true)}
-                  >
-                    完整向导
-                  </Button>
-                </div>
-              </div>
-            </div>
+            <StudioToolbar
+              workspaceRootBook={workspaceRootBook}
+              selectedVolumeId={selectedVolumeId}
+              selectedVolume={selectedVolume}
+              selectedChapter={selectedChapter}
+              titleDraft={titleDraft}
+              novelTitle={String(novel?.title || "未命名")}
+              queueBusy={queueBusy}
+              queueLabel={queueLabel}
+              queueHint={queueHint}
+              generateCount={generateCount}
+              maxGenerateCount={maxGenerateCount}
+              onGenerateCountChange={updateGenerateCountInput}
+              busy={busy}
+              frameworkConfirmed={frameworkConfirmed}
+              focusMode={focusModeOpen}
+              onFocusModeToggle={() => setFocusModeOpen((f) => !f)}
+              onOpenOutlineDrawer={() => setOutlineDrawerOpen(true)}
+              onGenerateChapters={() => confirmGenerateChapters()}
+            />
 
             <div className="novel-container py-4 md:py-5">
-              <div className="flex max-h-[min(85dvh,920px)] min-h-[min(52dvh,420px)] flex-col overflow-hidden rounded-2xl border border-border/60 bg-background/25 shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]">
+              <div className="flex max-h-[min(85dvh,920px)] min-h-[min(52dvh,420px)] flex-col overflow-hidden rounded-2xl border border-border bg-background/25">
                 <div className="flex min-h-0 flex-1 flex-col lg:flex-row">
-                  <aside
-                    className={`shrink-0 border-border/60 bg-muted/15 transition-[width,max-height] duration-200 ease-out ${
-                      studioTreeSidebarCollapsed
-                        ? "flex w-full max-h-11 flex-row items-stretch border-b lg:max-h-none lg:min-h-0 lg:w-11 lg:flex-col lg:self-stretch lg:border-b-0 lg:border-r"
-                        : "flex max-h-[34vh] w-full min-h-0 flex-col border-b lg:max-h-none lg:min-h-0 lg:w-[min(18rem,92vw)] lg:self-stretch lg:border-b-0 lg:border-r"
-                    }`}
-                  >
-                    {studioTreeSidebarCollapsed ? (
-                      <button
-                        type="button"
-                        className="flex w-full items-center justify-center gap-2 text-foreground/70 transition-colors hover:bg-muted/45 lg:flex-1 lg:flex-col lg:gap-1.5 lg:py-4"
-                        aria-label="展开结构树"
-                        title="展开结构树"
-                        onClick={() => setStudioTreeSidebarCollapsed(false)}
-                      >
-                        <ChevronRight className="size-5 shrink-0 lg:size-4" />
-                        <span className="text-[11px] font-bold lg:hidden">结构树</span>
-                      </button>
-                    ) : (
-                      <>
-                        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-border/45 px-3 py-2 sm:px-4">
-                          <p className="text-[10px] font-bold uppercase tracking-wide text-foreground/45">
-                            结构树
-                          </p>
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            className="h-8 w-8 shrink-0 text-foreground/60 hover:text-foreground"
-                            aria-label="收起结构树"
-                            title="收起结构树"
-                            onClick={() => setStudioTreeSidebarCollapsed(true)}
-                          >
-                            <ChevronLeft className="size-4" />
-                          </Button>
-                        </div>
-                    <div className="soft-scroll min-h-0 flex-1 space-y-3 overflow-y-auto p-3 sm:p-4">
-                      <div
-                        className={`flex items-center gap-2 rounded-xl border px-2.5 py-2 ${
-                          workspaceRootBook || !selectedVolumeId
-                            ? "border-primary/35 bg-primary/10"
-                            : "border-border/60 bg-background/50"
-                        }`}
-                      >
-                        <button
-                          type="button"
-                          className="flex min-w-0 flex-1 items-center gap-2 text-left"
-                          onClick={() => {
-                            setWorkspaceRootBook(true);
-                            setSelectedVolumeId("");
-                            setSelectedChapterId("");
-                            setChapterVolumeId("");
-                          }}
-                        >
-                          <BookOpen className="size-4 shrink-0 text-primary" />
-                          <span className="truncate text-xs font-bold text-foreground">
-                            {titleDraft.trim() || String(novel?.title || "本书")}
-                          </span>
-                        </button>
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="outline"
-                          className="h-7 shrink-0 px-2 text-[10px] font-bold"
-                          onClick={() => setOutlineDrawerOpen(true)}
-                        >
-                          大纲
-                        </Button>
-                      </div>
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        className="h-8 w-full justify-start px-2 text-[11px] font-bold text-foreground/70 hover:text-foreground"
-                        onClick={() => {
-                          setExportContent("");
-                          setExportOpen(true);
-                        }}
-                      >
-                        导出正文…
-                      </Button>
-                      <div className="space-y-2 pt-1">
-                        {volumes.length === 0 ? (
-                          <p className="text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
-                            暂无分卷。请在大纲抽屉里生成分卷剧情，系统会同步卷占位。
-                          </p>
-                        ) : (
-                          volumes
-                            .slice()
-                            .sort((a, b) => a.volume_no - b.volume_no)
-                            .map((v) => {
-                              const volChapters = chapters
-                                .filter(
-                                  (c) =>
-                                    c.chapter_no >= v.from_chapter &&
-                                    c.chapter_no <= v.to_chapter
-                                )
-                                .sort((a, b) => a.chapter_no - b.chapter_no);
-                              const expanded = Boolean(expandedVolumeIds[v.id]);
-                              const volHasPlot =
-                                Boolean(
-                                  parseVolumeOutlineJson(v.outline_json)?.arcs
-                                    ?.length
-                                ) || (v.outline_markdown || "").trim().length > 0;
-                              return (
-                                <div key={v.id} className="space-y-1">
-                                  <div className="flex items-stretch gap-0.5">
-                                    <button
-                                      type="button"
-                                      aria-label={expanded ? "收起本卷章节" : "展开本卷章节"}
-                                      className="flex w-8 shrink-0 items-center justify-center rounded-lg border border-transparent text-foreground/55 hover:bg-muted/45"
-                                      onClick={() =>
-                                        setExpandedVolumeIds((m) => ({
-                                          ...m,
-                                          [v.id]: !expanded,
-                                        }))
-                                      }
-                                    >
-                                      {expanded ? (
-                                        <ChevronDown className="size-4" />
-                                      ) : (
-                                        <ChevronRight className="size-4" />
-                                      )}
-                                    </button>
-                                    <button
-                                      type="button"
-                                      onClick={() => {
-                                        setWorkspaceRootBook(false);
-                                        setSelectedVolumeId(v.id);
-                                        setChapterVolumeId(v.id);
-                                        setSelectedChapterId("");
-                                      }}
-                                      className={`min-w-0 flex-1 rounded-xl border px-2.5 py-2 text-left text-xs transition-all ${
-                                        selectedVolumeId === v.id
-                                          ? "border-primary/35 bg-primary/10 shadow-[0_10px_24px_hsl(var(--primary)/0.12)]"
-                                          : "border-border/60 bg-background/45 hover:bg-muted/35"
-                                      }`}
-                                    >
-                                      <div className="flex items-center justify-between gap-1 font-bold text-foreground">
-                                        <span className="truncate">第{v.volume_no}卷</span>
-                                        <span className="shrink-0 text-[10px] text-foreground/50">
-                                          {v.chapter_plan_count} 计划
-                                        </span>
-                                      </div>
-                                      <p className="mt-0.5 truncate text-[10px] text-foreground/55">
-                                        {v.title || "未命名"}
-                                      </p>
-                                    </button>
-                                  </div>
-                                  {volHasPlot ? (
-                                    <div className="ml-8 flex flex-wrap items-center gap-2">
-                                      <button
-                                        type="button"
-                                        className={`text-[10px] font-bold ${
-                                          treeVolumePlotOpenId === v.id
-                                            ? "text-primary underline"
-                                            : "text-foreground/50 hover:text-foreground"
-                                        }`}
-                                        onClick={() =>
-                                          setTreeVolumePlotOpenId((p) =>
-                                            p === v.id ? null : v.id
-                                          )
-                                        }
-                                      >
-                                        {treeVolumePlotOpenId === v.id
-                                          ? "收起卷剧情"
-                                          : "卷剧情"}
-                                      </button>
-                                      <button
-                                        type="button"
-                                        className="text-[10px] text-foreground/40 hover:text-foreground/70"
-                                        onClick={() => {
-                                          setOutlineDrawerOpen(true);
-                                        }}
-                                      >
-                                        在大纲抽屉编辑
-                                      </button>
-                                    </div>
-                                  ) : null}
-                                  {treeVolumePlotOpenId === v.id && volHasPlot ? (
-                                    <div className="ml-8 max-h-56 overflow-y-auto rounded-xl border border-border/60 bg-muted/15 p-2">
-                                      <VolumeArcStack volume={v} compact />
-                                    </div>
-                                  ) : null}
-                                  {expanded ? (
-                                    <div className="ml-9 max-h-[min(42dvh,360px)] space-y-1 overflow-y-auto border-l border-border/35 pl-2 pr-0.5">
-                                      {volChapters.length === 0 ? (
-                                        <p className="py-2 text-[10px] text-foreground/45">
-                                          本卷尚无章节
-                                        </p>
-                                      ) : (
-                                        volChapters.map((ch) => (
-                                          <button
-                                            key={ch.id}
-                                            type="button"
-                                            onClick={() => {
-                                              setWorkspaceRootBook(false);
-                                              setSelectedVolumeId(v.id);
-                                              setChapterVolumeId(v.id);
-                                              setSelectedChapterId(ch.id);
-                                            }}
-                                            className={`flex w-full flex-col rounded-lg border px-2 py-1.5 text-left text-[11px] transition-colors ${
-                                              selectedChapterId === ch.id
-                                                ? "border-primary/40 bg-primary/12 font-bold text-foreground"
-                                                : "border-transparent bg-background/30 text-foreground/80 hover:bg-muted/40"
-                                            }`}
-                                          >
-                                            <span className="truncate">
-                                              第{ch.chapter_no}章 {ch.title}
-                                            </span>
-                                            {ch.pending_content ? (
-                                              <span className="mt-0.5 text-[9px] font-bold text-amber-600">
-                                                待确认修订
-                                              </span>
-                                            ) : null}
-                                          </button>
-                                        ))
-                                      )}
-                                    </div>
-                                  ) : null}
-                                </div>
-                              );
-                            })
-                        )}
-                      </div>
-                    </div>
-                      </>
-                    )}
-                  </aside>
-                  <div className="min-h-0 flex-1 overflow-y-auto soft-scroll p-4 md:p-5">
-            <Dialog open={outlineDrawerOpen} onOpenChange={setOutlineDrawerOpen}>
-              <DialogContent className="!fixed !inset-y-2 !right-2 !left-auto !top-2 !flex !h-[min(94dvh,940px)] !max-h-[94dvh] !w-[calc(100vw-1rem)] !max-w-[min(46rem,calc(100vw-1rem))] !translate-x-0 !translate-y-0 flex-col gap-0 overflow-hidden !rounded-2xl !border-2 !border-border !bg-card !p-0 !text-card-foreground !backdrop-blur-none shadow-[0_24px_64px_-12px_rgba(15,23,42,0.22)] dark:shadow-[0_24px_64px_-8px_rgba(0,0,0,0.5)] data-[state=open]:zoom-in-100 sm:!inset-y-3 sm:!right-3 sm:!max-w-[min(46rem,calc(100vw-1.5rem))] sm:!w-[min(46rem,calc(100vw-1.5rem))]">
-                <DialogHeader className="shrink-0 space-y-2 border-b-2 border-border bg-muted px-5 py-4 text-left sm:flex-row sm:items-center sm:justify-between sm:space-y-0 sm:px-6">
-                  <div className="min-w-0 space-y-1 pr-8 sm:pr-0">
-                    <DialogTitle className="text-left text-lg">大纲抽屉</DialogTitle>
-                    <DialogDescription className="text-left text-xs text-muted-foreground sm:max-w-xl">
-                      查看全书大纲与各卷剧情线；关闭抽屉后，用左侧目录切换卷和章节。
-                    </DialogDescription>
-                  </div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="mt-2 w-full shrink-0 font-bold sm:mt-0 sm:w-auto"
-                    disabled={busy}
-                    onClick={() => setFrameworkWizardOpen(true)}
-                  >
-                    修改向导
-                  </Button>
-                </DialogHeader>
-                <div className="min-h-0 flex-1 space-y-8 overflow-y-auto bg-background px-5 py-5 soft-scroll sm:px-6 sm:py-6">
-            <div
-              id="studio-outline-drawer"
-              className="space-y-6"
-            >
-            <div className="space-y-1">
-                <p className="section-heading text-foreground font-bold">小说概览与创作基线</p>
-                <p className="text-sm text-foreground/80 dark:text-muted-foreground font-medium">
-                  与左侧目录配合：这里管全书大纲和各卷剧情，中间主区写当前卷、当前章。
-                </p>
-              </div>
-            <div className="grid gap-3 sm:grid-cols-3">
-              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
-                <p className="text-xs font-bold text-muted-foreground">框架状态</p>
-                <p className="mt-2 text-base font-bold text-foreground">
-                  {frameworkConfirmed ? "已确认" : "待确认"}
-                </p>
-              </div>
-              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
-                <p className="text-xs font-bold text-muted-foreground">当前章节</p>
-                <p className="mt-2 text-base font-bold text-foreground">
-                  {latestChapterNo ? `第 ${latestChapterNo} 章` : "未开始"}
-                </p>
-              </div>
-              <div className="rounded-xl border border-border bg-muted p-4 shadow-sm">
-                <p className="text-xs font-bold text-muted-foreground">建议下一步</p>
-                <p className="mt-2 text-sm font-bold text-foreground">
-                  {frameworkConfirmed
-                    ? "在左侧树选卷或章节，主区即切换"
-                    : novel?.status === "failed"
-                      ? "AI 构思似乎失败了，请尝试重试"
-                      : !fwMd && novel?.status === "draft"
-                        ? "AI 正在飞速构思，请稍候片刻"
-                        : "进入“修改向导”确认大纲"}
-                </p>
-              </div>
-            </div>
-            <>
-            <div className="relative">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                一、基础大纲（世界观 / 人物 / 主线）
-              </Label>
-              <p className="mt-1 text-xs text-foreground/55 dark:text-muted-foreground">
-                这里是全书层面的设定与主线；按卷写的剧情弧线在下方「分卷剧情」。
-              </p>
-              {!fwMd && (novel?.status === "draft" || novel?.status === "failed") ? (
-                <div className="mt-2 flex min-h-[260px] w-full flex-col items-center justify-center gap-3 rounded-2xl border border-dashed border-primary/30 bg-primary/5 p-4 text-sm text-primary/70 animate-pulse text-center">
-                  {novel?.status === "failed" ? (
-                    <>
-                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-destructive/10">
-                        <div className="h-4 w-4 rounded-full bg-destructive" />
-                      </div>
-                      <p className="font-bold text-base text-destructive">AI 构思似乎失败了</p>
-                      <p className="text-xs opacity-60 max-w-xs mb-2">若当前还没有草案，会重试首版生成；若已有草案，则会按当前版本重写。</p>
-                      <Button 
-                        size="sm" 
-                        variant="default" 
-                        className="font-bold"
-                        onClick={() => void runRetryFrameworkGeneration()}
-                        disabled={busy}
-                      >
-                        {busy ? "重试中..." : "重新生成首版大纲 / 重写当前大纲"}
-                      </Button>
-                      <Button 
-                        size="sm" 
-                        variant="outline" 
-                        className="font-bold border-destructive/30 text-destructive hover:bg-destructive/5"
-                        onClick={() => setFrameworkWizardOpen(true)}
-                      >
-                        进入修改向导
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      <div className="flex h-10 w-10 items-center justify-center rounded-full bg-primary/10">
-                        <div className="h-4 w-4 rounded-full border-2 border-primary border-t-transparent animate-spin" />
-                      </div>
-                      <p className="font-bold">AI 正在飞速构思全书大纲，请稍候片刻...</p>
-                      <p className="text-xs opacity-60">构思完成后大纲将自动出现</p>
-                    </>
-                  )}
-                </div>
-              ) : (
-                <textarea
-                  value={fwMd}
-                  onChange={(e) => setFwMd(e.target.value)}
-                  className="mt-2 min-h-[280px] w-full rounded-2xl border-2 border-border bg-card p-4 font-mono text-sm text-foreground shadow-sm dark:shadow-[inset_0_1px_0_rgba(255,255,255,0.06)]"
-                  placeholder="暂无大纲。进入“修改向导”或等待 AI 生成。"
-                />
-              )}
-            </div>
-            </>
-            <div className="space-y-3 border-t-2 border-border pt-8">
-              <div className="space-y-1">
-                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                  分卷剧情（概览与生成）
-                </Label>
-                <p className="text-xs text-foreground/70 dark:text-muted-foreground">
-                  下方点选卷号后，这里只显示该卷。各段默认折叠，展开后可读「剧情 / 钩子 / 禁止推进 / 允许推进」。续写与章计划会参考此处。
-                </p>
-              </div>
-              {volumes.length === 0 ? (
-                <div className="rounded-2xl border-2 border-dashed border-border bg-muted p-6 text-sm text-muted-foreground">
-                  还没有分卷占位。请先在下方选择卷号并生成分卷剧情，系统会同步卷信息。
-                </div>
-              ) : (
-                (() => {
-                  const v = volumes.find(
-                    (x) => x.volume_no === arcsPanelVolumeNo
-                  );
-                  const om = (v?.outline_markdown || "").trim();
-                  const po = v ? parseVolumeOutlineJson(v.outline_json) : null;
-                  const hasArc =
-                    Boolean(po && po.arcs.length > 0) || om.length > 0;
-                  const segN =
-                    po && po.arcs.length > 0
-                      ? po.arcs.length
-                      : (om.match(/^### /gm) || []).length;
-                  if (!v) {
-                    return (
-                      <div className="rounded-2xl border-2 border-dashed border-border bg-muted/30 p-6 sm:p-8">
-                        <p className="text-sm font-bold text-foreground">
-                          第 {arcsPanelVolumeNo} 卷
-                        </p>
-                        <p className="mt-2 text-sm leading-relaxed text-foreground/70">
-                          该卷尚未在书中落库。请在下方保持选中该卷号，点击「生成第{" "}
-                          {arcsPanelVolumeNo} 卷剧情」后会自动创建本卷并写入剧情。
-                        </p>
-                      </div>
-                    );
-                  }
-                  return (
-                    <div className="w-full max-w-full rounded-2xl border-2 border-border bg-card p-4 shadow-sm sm:p-6">
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <p className="text-xs font-bold uppercase tracking-wide text-foreground/50">
-                            第 {v.volume_no} 卷
-                          </p>
-                          <p className="mt-1 text-lg font-bold text-foreground sm:text-xl">
-                            {v.title || "（未命名）"}
-                          </p>
-                        </div>
-                        <span
-                          className={`shrink-0 rounded-full px-2.5 py-0.5 text-[10px] font-bold ${
-                            hasArc
-                              ? "bg-emerald-500/15 text-emerald-700 dark:text-emerald-300"
-                              : "bg-muted text-muted-foreground"
-                          }`}
-                        >
-                          {hasArc ? "已有剧情" : "未生成"}
-                        </span>
-                      </div>
-                      {v.summary ? (
-                        <p className="mt-3 text-sm text-foreground/70 line-clamp-4">
-                          {v.summary}
-                        </p>
-                      ) : null}
-                      {hasArc ? (
-                        <details className="group mt-4 rounded-2xl border-2 border-border/80 bg-muted/10 open:border-primary/25 open:bg-muted/20">
-                          <summary className="flex cursor-pointer list-none items-center gap-2 p-3.5 text-left text-sm font-bold text-foreground sm:p-4 [&::-webkit-details-marker]:hidden">
-                            <ChevronRight className="size-4 shrink-0 text-foreground/45 transition group-open:rotate-90" />
-                            <span>展开本卷剧情</span>
-                            {segN > 0 ? (
-                              <span className="text-sm font-normal text-foreground/45">
-                                （{segN} 段）
-                              </span>
-                            ) : null}
-                          </summary>
-                          <div className="min-h-0 max-h-[min(72dvh,820px)] overflow-y-auto border-t border-border/50 p-3 sm:p-4">
-                            <VolumeArcStack volume={v} roomy />
-                          </div>
-                        </details>
-                      ) : (
-                        <p className="mt-4 text-sm leading-relaxed text-foreground/55">
-                          本卷还没有分卷剧情。保持下方当前卷号选中，点击「生成第{" "}
-                          {arcsPanelVolumeNo} 卷剧情」即可；同一卷再次生成会覆盖旧内容。
-                        </p>
-                      )}
-                    </div>
-                  );
-                })()
-              )}
-
-              <div className="space-y-3 border-t-2 border-border pt-8">
-                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                  生成或覆盖分卷剧情
-                </Label>
-                <p className="text-xs text-foreground/55 dark:text-muted-foreground">
-                  需先确认基础大纲。生成需要一点时间；同一卷再次生成会覆盖该卷已有内容。
-                </p>
-                {!novel?.base_framework_confirmed ? (
-                  <p className="text-xs font-bold text-amber-600 dark:text-amber-400">
-                    请先在向导中确认基础大纲，或使用确认按钮。
-                  </p>
-                ) : null}
-                <div className="flex flex-wrap gap-2">
-                  {Array.from({ length: totalStudioVolumes }, (_, i) => i + 1).map((volNo) => {
-                    const hasOutline = volumes.some(
-                      (vv) =>
-                        vv.volume_no === volNo &&
-                        ((vv.outline_markdown || "").trim().length > 0 ||
-                          Boolean(
-                            parseVolumeOutlineJson(vv.outline_json)?.arcs?.length
-                          ))
-                    );
-                    const selected = arcsPanelVolumeNo === volNo;
-                    return (
-                      <button
-                        key={`arc-vol-${volNo}`}
-                        type="button"
-                        disabled={arcsBusy || busy}
-                        onClick={() => setArcsPanelVolumeNo(volNo)}
-                        className={`rounded-xl border px-3 py-1.5 text-xs font-bold transition-colors ${
-                          selected
-                            ? "border-primary bg-primary text-primary-foreground"
-                            : hasOutline
-                              ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-800 dark:text-emerald-200"
-                              : "border-border/70 bg-background/70 text-foreground/80 hover:bg-muted/40"
-                        }`}
-                      >
-                        第{volNo}卷{hasOutline ? " ✓" : ""}
-                      </button>
-                    );
-                  })}
-                </div>
-                <Input
-                  value={arcsInstruction}
-                  onChange={(e) => setArcsInstruction(e.target.value)}
-                  placeholder="可选：如「第二卷加强感情线」「第三卷节奏加快」"
-                  className="mt-1"
-                  disabled={arcsBusy}
-                />
-                <div className="mt-2 flex flex-wrap gap-2">
-                  <Button
-                    type="button"
-                    size="sm"
-                    className="font-bold"
-                    disabled={arcsBusy || busy || !novel?.base_framework_confirmed}
-                    onClick={() => void runInlineGenerateArcs()}
-                  >
-                    {arcsBusy
-                      ? "生成中…"
-                      : `生成第 ${arcsPanelVolumeNo} 卷剧情`}
-                  </Button>
-                </div>
-              </div>
-            </div>
-            </div>
-                </div>
-              </DialogContent>
-            </Dialog>
-            {studioRight === "volume" ? (
-            <section
-              id="studio-volumes"
-              className="glass-panel space-y-4 p-5 md:p-6"
-            >
-            <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-              <div className="space-y-1">
-                <p className="section-heading text-foreground font-bold">卷与章计划</p>
-                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  卷在「大纲抽屉」里随分卷剧情落库后，可在此生成本卷章计划 → 在左侧树选章后在主区续写与编辑正文。需清空本卷计划时可用「一键清除」后重跑下一批。
-                </p>
-              </div>
-              <div className="glass-chip font-bold text-foreground/80">{selectedVolumeId ? "已选择卷，适合继续铺排" : "请先选择或生成一卷"}</div>
-            </div>
-            <div className="glass-panel-subtle flex flex-wrap gap-2 p-3">
-              <div className="flex items-center gap-2 rounded-xl border border-border/70 bg-background/60 px-3 py-1.5 text-xs">
-                <span className="text-foreground/60 dark:text-muted-foreground font-bold">每次生成</span>
-                <select
-                  value={volumePlanBatchSize}
-                  onChange={(e) => setVolumePlanBatchSize(Number(e.target.value))}
-                  className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-xs text-foreground font-bold"
-                  disabled={busy || volumeBusy}
-                >
-                  {[4, 5, 6, 7, 8, 9, 10].map((n) => (
-                    <option key={n} value={n}>
-                      {n} 章
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <Button
-                type="button"
-                size="sm"
-                variant="secondary"
-                className="font-bold"
-                disabled={busy || volumeBusy || !selectedVolumeId}
-                onClick={() => confirmGenerateVolumePlan()}
-              >
-                生成本卷章计划（下一批）
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="destructive"
-                className="font-bold"
-                disabled={busy || volumeBusy || !selectedVolumeId}
-                onClick={() => void runClearVolumePlans()}
-              >
-                一键清除本卷计划
-              </Button>
-            </div>
-
-            <div>
-              <section className="glass-panel-subtle p-5">
-                {!selectedVolumeId ? (
-                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请在左侧栏选择一卷。</p>
-                ) : (
-                  <div className="space-y-3">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <p className="text-sm font-bold text-foreground">本卷章计划</p>
-                      <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">
-                        {volumeBusy
-                          ? "加载中…"
-                          : `共 ${volumePlan.length} 章 · 当前展示 ${volumePlanView.visible.length} 章`}
-                      </p>
-                    </div>
-                    {volumePlan.length > 0 ? (
-                      <label className="flex cursor-pointer flex-wrap items-center gap-2 text-xs text-foreground/70 dark:text-muted-foreground font-bold">
-                        <input
-                          type="checkbox"
-                          className="rounded border-input"
-                          checked={showVolumePlanWithBody}
-                          onChange={(e) =>
-                            setShowVolumePlanWithBody(e.target.checked)
-                          }
-                        />
-                        <span>
-                          显示已含正文的章节（默认关闭：已生成正文的章会隐藏，便于往下写）
-                          {!showVolumePlanWithBody &&
-                          volumePlanView.withBodyCount > 0 ? (
-                            <span className="ml-1 text-amber-600 font-bold">
-                              · 已隐藏 {volumePlanView.withBodyCount} 章
-                            </span>
-                          ) : null}
-                        </span>
-                      </label>
-                    ) : null}
-                    {(() => {
-                      const v = volumes.find((x) => x.id === selectedVolumeId);
-                      if (!v) return null;
-                      const total = v.to_chapter - v.from_chapter + 1;
-                      const done = volumePlan.length >= total;
-                      const last = volumePlanLastRun;
-                      return (
-                        <div className="glass-panel-subtle p-3 text-xs text-foreground/70 dark:text-muted-foreground font-medium">
-                          <div className="flex flex-wrap items-center justify-between gap-2">
-                            <span>
-                              进度：已生成 {volumePlan.length}/{total} 章（第{v.from_chapter}—{v.to_chapter}章）
-                            </span>
-                            <span className="font-bold">{done ? "已完成" : "未完成"}</span>
-                          </div>
-                          {last?.batch ? (
-                            <div className="mt-1">
-                              最近一次：第{last.batch.from_chapter}—{last.batch.to_chapter}章（批次 {last.batch.size} 章）；
-                              {last.done
-                                ? "本卷已完成。"
-                                : `下一批建议从第${last.next_from_chapter ?? "?"}章开始。`}
-                            </div>
-                          ) : null}
-                        </div>
-                      );
-                    })()}
-                    <div className="soft-scroll max-h-[70vh] overflow-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-2.5">
-                      {volumePlan.length === 0 ? (
-                        <p className="p-2 text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
-                          暂无章计划。点击“生成本卷章计划（下一批）”开始生成。
-                        </p>
-                      ) : volumePlanView.visible.length === 0 ? (
-                        <p className="p-2 text-xs text-foreground/50 dark:text-muted-foreground italic font-medium">
-                          当前视图下没有待写章节（本卷计划均已含正文）。
-                          请勾选上方「显示已含正文的章节」以查看与操作已生成章节。
-                        </p>
-                      ) : (
-                        <div className="space-y-2">
-                          {volumePlanView.visible.map((p) => (
-                            (() => {
-                              const normalized = normalizePlanBeats(p.beats);
-                              return (
-                            <div
-                              key={p.id}
-                              className="list-card overflow-hidden p-0 text-xs"
-                            >
-                              <div className="relative border-b border-border/50 px-4 py-4">
-                                <div className="pointer-events-none absolute inset-0 bg-gradient-to-r from-primary/10 via-accent/6 to-transparent" />
-                                <div className="relative flex flex-wrap items-start justify-between gap-3">
-                                  <div className="space-y-2">
-                                    <div className="flex flex-wrap items-center gap-2 font-bold text-foreground">
-                                      第{p.chapter_no}章 · {p.chapter_title}
-                                      {normalized.meta?.edited_by_user ? (
-                                        <span className="rounded-full border border-amber-500/40 bg-amber-500/10 px-2 py-0.5 text-[10px] font-bold text-amber-700 dark:text-amber-300">
-                                          已手动编辑
-                                        </span>
-                                      ) : null}
-                                      <span className="rounded-full border border-border/70 bg-background/70 px-2 py-0.5 text-[10px] font-semibold text-foreground/55">
-                                        {p.status === "locked" ? "Locked" : "Editable"}
-                                      </span>
-                                    </div>
-                                    <div className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
-                                      {p.status === "locked"
-                                        ? "当前计划已锁定，适合直接生成正文或复盘节拍。"
-                                        : "执行卡可继续微调，也可以直接把这一章推进为正文。"}
-                                    </div>
-                                  </div>
-                                  <div className="flex flex-wrap gap-2">
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      variant="secondary"
-                                      className="font-semibold"
-                                      disabled={busy || volumeBusy || p.status === "locked"}
-                                      onClick={() => openPlanEditor(p)}
-                                    >
-                                      编辑执行卡
-                                    </Button>
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      variant="outline"
-                                      className="font-semibold"
-                                      disabled={busy || p.status === "locked"}
-                                      onClick={() => confirmRegenerateChapterPlan(p.chapter_no)}
-                                    >
-                                      重生成计划
-                                    </Button>
-                                    <Button
-                                      type="button"
-                                      size="sm"
-                                      className="font-bold"
-                                      disabled={busy}
-                                      onClick={() => confirmGenerateChapterFromPlan(p.chapter_no)}
-                                    >
-                                      生成正文
-                                    </Button>
-                                  </div>
-                                </div>
-                              </div>
-
-                              <div className="grid gap-4 p-4 xl:grid-cols-[1.12fr_0.88fr]">
-                                <div className="space-y-3">
-                                  <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
-                                    <div className="flex flex-wrap items-center justify-between gap-2">
-                                      <div className="flex items-center gap-2">
-                                        <BookOpen className="size-4 text-primary" />
-                                        <p className="text-sm font-semibold text-foreground">执行摘要</p>
-                                      </div>
-                                      {normalized.display_summary.stage_position ? (
-                                        <span className="rounded-full border border-border/70 bg-background/74 px-3 py-1 text-[11px] font-semibold text-foreground/58">
-                                          {normalized.display_summary.stage_position}
-                                        </span>
-                                      ) : (
-                                        <span className="text-[11px] text-foreground/52">
-                                          完整版本见线性摘要
-                                        </span>
-                                      )}
-                                    </div>
-                                    <div className="mt-4 space-y-3">
-                                      {[
-                                        ["本章目标", normalized.execution_card.chapter_goal || "待补充目标"],
-                                        ["核心冲突", normalized.execution_card.core_conflict || "待补充冲突"],
-                                        ["关键转折", normalized.execution_card.key_turn || "待补充转折"],
-                                      ].map(([label, value]) => (
-                                        <div
-                                          key={`${p.id}-${label}`}
-                                          className="grid gap-2 rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3 md:grid-cols-[92px_1fr]"
-                                        >
-                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                            {label}
-                                          </p>
-                                          <p
-                                            className="text-sm leading-6 text-foreground/82 line-clamp-3"
-                                            title={String(value)}
-                                          >
-                                            {shortenText(String(value), 78)}
-                                          </p>
-                                        </div>
-                                      ))}
-                                    </div>
-
-                                    <div className="mt-4 rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
-                                      <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                        剧情推进
-                                      </p>
-                                      <p
-                                        className="mt-2 text-sm leading-6 text-foreground/72 line-clamp-4"
-                                        title={normalized.display_summary.plot_summary || "暂未生成剧情摘要。"}
-                                      >
-                                        {normalized.display_summary.plot_summary || "暂未生成剧情摘要。"}
-                                      </p>
-                                      {normalized.display_summary.pacing_justification ? (
-                                        <p
-                                          className="mt-2 text-[12px] leading-6 text-foreground/58 line-clamp-3"
-                                          title={normalized.display_summary.pacing_justification}
-                                        >
-                                          {normalized.display_summary.pacing_justification}
-                                        </p>
-                                      ) : null}
-                                    </div>
-
-                                    {normalized.display_summary.pacing_justification ? (
-                                      <div className="mt-3 flex flex-wrap gap-2 text-xs text-foreground/60">
-                                        <span className="status-badge">已压缩长文本</span>
-                                        <span className="status-badge">优先看目标 / 冲突 / 转折</span>
-                                      </div>
-                                    ) : null}
-                                  </div>
-
-                                  {[
-                                    ["必须发生", normalized.execution_card.must_happen],
-                                    ["必须承接", normalized.execution_card.required_callbacks],
-                                    ["允许推进", normalized.execution_card.allowed_progress],
-                                  ].map(([label, items]) => {
-                                    if (!Array.isArray(items) || items.length === 0) return null;
-                                    return (
-                                      <div
-                                        key={`${p.id}-${label}`}
-                                        className="rounded-[1.3rem] border border-border/60 bg-background/55 p-4"
-                                      >
-                                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                          {label}
-                                        </p>
-                                        <div className="mt-3 flex flex-wrap gap-2">
-                                          {items.map((item, index) => (
-                                            <span
-                                              key={`${p.id}-${label}-${index}`}
-                                              className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
-                                            >
-                                              {item}
-                                            </span>
-                                          ))}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-
-                                <div className="space-y-3">
-                                  <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
-                                    <div className="flex flex-wrap items-center justify-between gap-2">
-                                      <div className="flex items-center gap-2">
-                                        <Sparkles className="size-4 text-primary" />
-                                        <p className="text-sm font-semibold text-foreground">章末与护栏</p>
-                                      </div>
-                                      {normalized.execution_card.scene_cards.length > 0 ? (
-                                        <span className="status-badge">
-                                          Scene {normalized.execution_card.scene_cards.length}
-                                        </span>
-                                      ) : null}
-                                    </div>
-                                    <div className="mt-3 space-y-3">
-                                      <div className="rounded-[1rem] border border-primary/15 bg-primary/6 px-3 py-3">
-                                        <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                          Ending Hook
-                                        </p>
-                                        <p className="mt-2 text-sm leading-6 text-foreground/82">
-                                          {normalized.execution_card.ending_hook || "暂无章末钩子。"}
-                                        </p>
-                                      </div>
-
-                                      {normalized.execution_card.style_guardrails.length > 0 ? (
-                                        <div>
-                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                            风格护栏
-                                          </p>
-                                          <div className="mt-2 flex flex-wrap gap-2">
-                                            {normalized.execution_card.style_guardrails.map((item, index) => (
-                                              <span
-                                                key={`${p.id}-guardrail-${index}`}
-                                                className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
-                                              >
-                                                {item}
-                                              </span>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      ) : null}
-
-                                      {normalized.execution_card.scene_cards.length > 0 ? (
-                                        <div>
-                                          <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                            场景锚点
-                                          </p>
-                                          <div className="mt-2 flex flex-wrap gap-2">
-                                            {normalized.execution_card.scene_cards.slice(0, 3).map((scene, index) => (
-                                              <span
-                                                key={`${p.id}-scene-chip-${index}`}
-                                                className="rounded-full border border-border/70 bg-background/72 px-3 py-1 text-[11px] font-medium text-foreground/74"
-                                              >
-                                                {scene.label || scene.goal || `Scene ${index + 1}`}
-                                              </span>
-                                            ))}
-                                          </div>
-                                        </div>
-                                      ) : null}
-
-                                      {normalized.execution_card.reserved_for_later.length > 0 ||
-                                      normalized.execution_card.must_not.length > 0 ? (
-                                        <details className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
-                                          <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/52">
-                                            更多约束
-                                          </summary>
-                                          <div className="mt-3 space-y-3">
-                                            {normalized.execution_card.reserved_for_later.length > 0 ? (
-                                              <div>
-                                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                                  延后解锁
-                                                </p>
-                                                <div className="mt-2 grid gap-2">
-                                                  {normalized.execution_card.reserved_for_later.map((item, index) => (
-                                                    <div
-                                                      key={`${p.id}-reserved-${index}`}
-                                                      className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-2 text-sm text-foreground/72"
-                                                    >
-                                                      <span className="font-semibold text-foreground/84">
-                                                        {item.item}
-                                                      </span>
-                                                      {item.not_before_chapter != null ? (
-                                                        <span className="ml-2 text-foreground/56">
-                                                          第 {item.not_before_chapter} 章后
-                                                        </span>
-                                                      ) : null}
-                                                      {item.reason ? (
-                                                        <p className="mt-1 text-sm leading-6 text-foreground/62">
-                                                          {item.reason}
-                                                        </p>
-                                                      ) : null}
-                                                    </div>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            ) : null}
-
-                                            {normalized.execution_card.must_not.length > 0 ? (
-                                              <div>
-                                                <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
-                                                  禁止项
-                                                </p>
-                                                <div className="mt-2 flex flex-wrap gap-2">
-                                                  {normalized.execution_card.must_not.map((item, index) => (
-                                                    <span
-                                                      key={`${p.id}-must-not-${index}`}
-                                                      className="rounded-full border border-rose-500/25 bg-rose-500/10 px-3 py-1 text-[11px] font-medium text-rose-700 dark:text-rose-300"
-                                                    >
-                                                      {item}
-                                                    </span>
-                                                  ))}
-                                                </div>
-                                              </div>
-                                            ) : null}
-                                          </div>
-                                        </details>
-                                      ) : null}
-
-                                      <details className="rounded-[1rem] border border-border/55 bg-background/68 px-3 py-3">
-                                        <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/52">
-                                          线性摘要
-                                        </summary>
-                                        <pre className="mt-3 whitespace-pre-wrap text-[11px] leading-6 text-foreground/64">
-                                          {formatVolumePlanBeatsText(p.beats)}
-                                        </pre>
-                                      </details>
-                                    </div>
-                                  </div>
-                                </div>
-                              </div>
-                            </div>
-                              );
-                            })()
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </section>
-            </div>
-            </section>
-            ) : studioRight === "chapter" ? (
-            <section
-              id="studio-chapters"
-              className="glass-panel space-y-4 p-5 md:p-6"
-            >
-            <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
-              <div className="space-y-1">
-                <p className="section-heading text-foreground font-bold">章节创作</p>
-                <p className="text-sm text-foreground/70 dark:text-muted-foreground font-medium">
-                  续写、审定、章节助手与单章编辑；章计划里也可点「生成正文」打开对应章节。
-                </p>
-              </div>
-              <div className="glass-chip font-bold text-foreground/80">
-                {frameworkConfirmed ? "框架已确认，可直接进入批量续写" : "请先确认框架，再开始续写"}
-              </div>
-            </div>
-            <div className="grid gap-3 md:grid-cols-3">
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">章节总数</p>
-                <p className="mt-2 text-xl font-bold text-foreground">{chapters.length}</p>
-                <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">包含草稿与已审定章节</p>
-              </div>
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">已审定</p>
-                <p className="mt-2 text-xl font-bold text-foreground">{approvedChapterCount}</p>
-                <p className="mt-1 text-xs text-foreground/50 dark:text-muted-foreground font-medium">可参与记忆和后续衔接</p>
-              </div>
-              <div className="glass-panel-subtle p-4">
-                <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前建议</p>
-                <p className="mt-2 text-sm font-bold text-foreground">
-                  {draftChapterCount ? "优先审定草稿，避免记忆滞后" : "可继续续写或做一致性修订"}
-                </p>
-              </div>
-            </div>
-            <div className="glass-panel-subtle space-y-3 p-4">
-              <div className="flex flex-wrap items-center gap-2">
-                <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">一次生成</Label>
-                <input
-                  type="number"
-                  min={1}
-                  max={maxGenerateCount}
-                  value={generateCount}
-                  onChange={(e) => updateGenerateCountInput(e.target.value)}
-                  className="h-8 w-24 rounded-xl border border-border/70 bg-background px-2.5 text-sm text-foreground font-bold"
-                />
-                <Button
-                  type="button"
-                  size="sm"
-                  className="font-bold"
-                  disabled={busy || !frameworkConfirmed}
-                  onClick={() => confirmGenerateChapters()}
-                >
-                  自动续写 {generateCount} 章
-                </Button>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="secondary"
-                  className="font-bold"
-                  onClick={() => setChapterChatOpen(true)}
-                >
-                  章节助手对话
-                </Button>
-              </div>
-              <div className="flex flex-wrap items-center gap-3 text-xs text-foreground/70 dark:text-muted-foreground font-bold">
-                <span
-                  className={`rounded-full border px-3 py-1 ${
-                    queueBusy
-                      ? "border-amber-500/35 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-                      : "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                  }`}
-                  title={queueHint}
-                >
-                  {queueLabel}
-                  {queueStatus ? ` · ${queueHint}` : ""}
-                </span>
-                {generateDisabledReason ? (
-                  <span className="font-bold text-amber-600">{generateDisabledReason}</span>
-                ) : null}
-                <label className="inline-flex items-center gap-2 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={useColdRecall}
-                    onChange={(e) => setUseColdRecall(e.target.checked)}
+                  <ChapterTreeSidebar
+                    collapsed={studioTreeSidebarCollapsed}
+                    onCollapsedChange={setStudioTreeSidebarCollapsed}
+                    selectedVolumeId={selectedVolumeId}
+                    onSelectVolume={(volumeId) => {
+                      setWorkspaceRootBook(false);
+                      setSelectedVolumeId(volumeId);
+                      setChapterVolumeId(volumeId);
+                      setSelectedChapterId("");
+                    }}
+                    selectedChapterId={selectedChapterId}
+                    onSelectChapter={(chapterId, volumeId) => {
+                      setWorkspaceRootBook(false);
+                      setSelectedVolumeId(volumeId);
+                      setChapterVolumeId(volumeId);
+                      setSelectedChapterId(chapterId);
+                    }}
+                    workspaceRootBook={workspaceRootBook}
+                    onRootBookClick={() => {
+                      setWorkspaceRootBook(true);
+                      setSelectedVolumeId("");
+                      setSelectedChapterId("");
+                      setChapterVolumeId("");
+                    }}
+                    expandedVolumeIds={expandedVolumeIds}
+                    onToggleVolumeExpand={(volumeId) =>
+                      setExpandedVolumeIds((m) => ({
+                        ...m,
+                        [volumeId]: !m[volumeId],
+                      }))
+                    }
+                    treeVolumePlotOpenId={treeVolumePlotOpenId}
+                    onToggleVolumePlot={(id) => setTreeVolumePlotOpenId(id)}
+                    onOpenOutlineDrawer={() => setOutlineDrawerOpen(true)}
+                    onOpenExport={() => {
+                      setExportContent("");
+                      setExportOpen(true);
+                    }}
+                    volumes={volumes}
+                    chapters={chapters}
+                    titleDraft={titleDraft}
+                    novelTitle={String(novel?.title || "")}
                   />
-                  按需召回冷层
-                </label>
-                {useColdRecall ? (
-                  <div className="inline-flex items-center gap-2">
-                    <span>召回条数</span>
-                    <select
-                      value={coldRecallItems}
-                      onChange={(e) => setColdRecallItems(Number(e.target.value))}
-                      className="h-8 rounded-xl border border-border/70 bg-background px-2.5 text-xs text-foreground font-bold"
-                    >
-                      {[3, 5, 8, 10, 12].map((n) => (
-                        <option key={n} value={n}>
-                          {n}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                ) : null}
-              </div>
-            </div>
-            {generateTrace ? (
-              <p className="rounded-2xl border border-border/50 bg-muted/30 p-3 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">{generateTrace}</p>
-            ) : null}
-            
-            <div>
-              <section className="glass-panel-subtle p-5">
-                {!selectedChapter ? (
-                  <p className="text-sm text-foreground/50 dark:text-muted-foreground italic font-medium">请在左侧栏选择一章。</p>
-                ) : (
-                  <div className="space-y-4">
-                    <div className="flex flex-wrap items-center justify-between gap-3 text-sm">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <span className="font-bold text-foreground">
-                          第{selectedChapter.chapter_no}章
-                        </span>
-                        <span className="status-badge font-bold">
-                          {selectedChapter.status}
-                        </span>
-                        <span className="status-badge font-bold">
-                          来源：{selectedChapter.source}
-                        </span>
-                      </div>
-                      <div className="glass-chip font-bold text-foreground/80">
-                        正文约 {selectedChapterWordCount} 字
-                      </div>
-                    </div>
-                    <div className="grid gap-3 sm:grid-cols-3">
-                      <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">当前状态</p>
-                        <p className="mt-2 text-sm font-bold text-foreground">
-                          {selectedChapter.status}
-                        </p>
-                        <p className="mt-1 text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
-                          {selectedChapter.pending_content ? "存在待确认修订稿" : "正在编辑正式稿"}
-                        </p>
-                      </div>
-                      <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">来源</p>
-                        <p className="mt-2 text-sm font-bold text-foreground">
-                          {selectedChapter.source}
-                        </p>
-                        <p className="mt-1 text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
-                          用于区分自动生成、人工编辑或修订稿来源
-                        </p>
-                      </div>
-                      <div className="glass-panel-subtle p-4">
-                        <p className="text-xs text-foreground/60 dark:text-muted-foreground font-bold">建议操作</p>
-                        <p className="mt-2 text-sm font-bold text-foreground">
-                          {selectedChapter.pending_content ? "先确认或放弃修订稿" : "保存后做审定或一致性修订"}
-                        </p>
-                      </div>
-                    </div>
-                    <NovelIntelPanel
-                      selectedChapter={{
-                        chapter_no: selectedChapter.chapter_no,
-                        title: selectedChapter.title,
-                      }}
-                      workflow={latestWorkflow}
-                      judge={chapterJudge}
-                      retrievalLogs={retrievalLogs}
-                      memoryRuns={memoryUpdateRuns}
-                      evaluation={coreEvaluation}
-                      workflowLoading={intelWorkflowLoading}
-                      judgeLoading={intelJudgeLoading}
-                      retrievalLoading={intelRetrievalLoading}
-                    />
-                    <div className="glass-panel-subtle space-y-4 p-4">
-                      <div className="space-y-2">
-                        <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">章节标题</Label>
-                        <input
-                          value={editTitle}
-                          onChange={(e) => setEditTitle(e.target.value)}
-                          className="field-shell w-full text-foreground font-bold"
-                        />
-                      </div>
-                      <div className="space-y-2">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">正式稿（可直接编辑）</Label>
-                          <span className="text-xs text-foreground/60 dark:text-muted-foreground font-medium italic">
-                            适合直接精修正文、补对话和调整节奏
-                          </span>
-                        </div>
-                        <textarea
-                          value={editContent}
-                          onChange={(e) => setEditContent(e.target.value)}
-                          className="field-shell-textarea min-h-[300px] text-foreground text-sm font-medium leading-relaxed"
-                        />
-                        <div className="flex flex-wrap gap-2">
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="secondary"
-                            className="font-bold text-foreground/80"
-                            disabled={busy || !editContent.trim()}
-                            onClick={() => void runFormatSelectedChapter()}
-                            title="纯规则格式化：自动拆段、对白单独成段、场景切换换段，不调用大模型"
-                          >
-                            一键格式化段落
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            className="font-bold"
-                            disabled={busy || !editContent.trim()}
-                            onClick={() => void runSaveSelectedChapter()}
-                          >
-                            保存章节修改
-                          </Button>
-                          <Button
-                            type="button"
-                            size="sm"
-                            variant="outline"
-                            className="text-destructive font-bold hover:border-destructive/40 hover:bg-destructive/10"
-                            disabled={busy}
-                            onClick={() =>
-                              void runDeleteChapter({
-                                id: selectedChapter.id,
-                                chapter_no: selectedChapter.chapter_no,
-                                title: selectedChapter.title,
-                                status: selectedChapter.status,
-                              })
-                            }
-                        >
-                          删除本章
-                        </Button>
-                        </div>
-                      </div>
-                    </div>
-
-                    <div className="grid gap-4 xl:grid-cols-[1.1fr_0.9fr]">
-                      <div className="glass-panel-subtle space-y-3 p-4">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <div>
-                            <p className="text-sm font-bold text-foreground">修订与审定</p>
-                            <p className="mt-1 text-xs text-foreground/70 dark:text-muted-foreground font-medium italic">
-                              把一致性修订、反馈记录和最终审定收拢在一起，减少来回找按钮。
-                            </p>
-                          </div>
-                          <span className="status-badge font-bold">高频操作区</span>
-                        </div>
-                        {selectedChapter.pending_content ? (
-                          <div className="rounded-[1.4rem] border border-amber-500/40 bg-amber-500/5 p-4">
-                            <p className="mb-1 text-xs font-bold text-amber-800 dark:text-amber-200">
-                              待确认修订稿
-                            </p>
-                            <pre className="mb-3 max-h-64 overflow-auto whitespace-pre-wrap rounded-2xl border border-amber-500/20 bg-background/50 p-3 text-xs text-foreground font-medium leading-relaxed">
-                              {selectedChapter.pending_content}
-                            </pre>
-                            <div className="flex flex-wrap gap-2">
-                              <Button
-                                type="button"
-                                size="sm"
-                                className="font-bold"
-                                disabled={busy}
-                                onClick={() => run(() => applyChapterRevision(selectedChapter.id))}
-                              >
-                                确认覆盖正式稿
-                              </Button>
-                              <Button
-                                type="button"
-                                size="sm"
-                                variant="outline"
-                                className="font-bold"
-                                disabled={busy}
-                                onClick={() => run(() => discardChapterRevision(selectedChapter.id))}
-                              >
-                                放弃修订
-                              </Button>
-                            </div>
-                          </div>
-                        ) : null}
-
-                        <div className="space-y-2">
-                          <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">改进意见（可多条，会并入改稿模型）</Label>
-                          <textarea
-                            value={fbDraft[selectedChapter.id] ?? ""}
-                            onChange={(e) =>
-                              setFbDraft((d) => ({ ...d, [selectedChapter.id]: e.target.value }))
-                            }
-                            className="field-shell-textarea min-h-[104px] text-sm text-foreground font-medium"
-                          />
-                          <div className="flex flex-wrap gap-2">
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              className="font-bold text-foreground/80"
-                              disabled={busy || !selectedChapter.content?.trim()}
-                              onClick={() => confirmConsistencyFix(selectedChapter.id)}
-                            >
-                              生成一致性修订稿
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              className="font-bold text-foreground/80"
-                              disabled={busy || !(selectedChapter.content || selectedChapter.pending_content)?.trim()}
-                              onClick={() => confirmPolishChapter(selectedChapter.id)}
-                              title="去除正文中的 AI 味，压缩废话，优化表达，保持剧情不变"
-                            >
-                              去AI味
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="secondary"
-                              className="font-bold text-foreground/80"
-                              disabled={busy || !(fbDraft[selectedChapter.id]?.trim())}
-                              onClick={() =>
-                                run(async () => {
-                                  await addChapterFeedback(
-                                    selectedChapter.id,
-                                    fbDraft[selectedChapter.id].trim()
-                                  );
-                                  setFbDraft((d) => ({ ...d, [selectedChapter.id]: "" }));
-                                })
-                              }
-                            >
-                              记录反馈
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              className="font-bold"
-                              disabled={busy}
-                              onClick={() => confirmApproveChapter(selectedChapter.id)}
-                            >
-                              审定通过
-                            </Button>
-                            <Button
-                              type="button"
-                              size="sm"
-                              variant="outline"
-                              className="font-semibold"
-                              disabled={busy || !selectedChapter.content?.trim()}
-                              onClick={() => void runRetryChapterMemory(selectedChapter.id)}
-                              title="即使已审定，也重新提取本章增量记忆并写入记忆账本"
-                            >
-                              重试记忆写入
-                            </Button>
-                          </div>
-                        </div>
-                      </div>
-
-                      <div className="glass-panel-subtle space-y-3 p-4">
-                        <div>
-                          <p className="text-sm font-bold text-foreground">按指令改稿</p>
-                          <p className="mt-1 text-xs text-foreground/70 dark:text-muted-foreground font-medium italic">
-                            给模型明确修改方向，适合做局部风格强化、节奏压缩或结尾重写。
-                          </p>
-                        </div>
-                        <textarea
-                          value={revisePrompt[selectedChapter.id] ?? ""}
-                          onChange={(e) =>
-                            setRevisePrompt((d) => ({
-                              ...d,
-                              [selectedChapter.id]: e.target.value,
-                            }))
-                          }
-                          className="field-shell-textarea min-h-[180px] text-sm text-foreground font-medium"
-                          placeholder="例如：加强对话张力、压缩环境描写、按第三条反馈改结尾……"
-                        />
-                        <Button
-                          type="button"
-                          size="sm"
-                          variant="secondary"
-                          className="font-bold text-foreground/80"
-                          disabled={busy || !(revisePrompt[selectedChapter.id]?.trim())}
-                          onClick={() =>
-                            confirmReviseChapter(
-                              selectedChapter.id,
-                              revisePrompt[selectedChapter.id] ?? ""
-                            )
-                          }
-                        >
-                          生成修订稿
-                        </Button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-              </section>
-            </div>
-            </section>
+                  <div className="min-h-0 flex-1 overflow-y-auto soft-scroll p-4 md:p-5">
+            <OutlineDrawerDialog
+              open={outlineDrawerOpen}
+              onOpenChange={setOutlineDrawerOpen}
+              busy={busy}
+              frameworkConfirmed={frameworkConfirmed}
+              latestChapterNo={latestChapterNo}
+              novel={novel}
+              fwMd={fwMd}
+              onFwMdChange={setFwMd}
+              onRetryFramework={() => void runRetryFrameworkGeneration()}
+              onOpenFrameworkWizard={() => setFrameworkWizardOpen(true)}
+              volumes={volumes}
+              arcsPanelVolumeNo={arcsPanelVolumeNo}
+              onArcsPanelVolumeNoChange={setArcsPanelVolumeNo}
+              totalStudioVolumes={totalStudioVolumes}
+              arcsBusy={arcsBusy}
+              arcsInstruction={arcsInstruction}
+              onArcsInstructionChange={setArcsInstruction}
+              onGenerateArcs={() => void runInlineGenerateArcs()}
+            />
+            {studioRight === "volume" ? (
+            <VolumePlanSection
+              selectedVolumeId={selectedVolumeId}
+              busy={busy}
+              volumeBusy={volumeBusy}
+              volumePlanBatchSize={volumePlanBatchSize}
+              onVolumePlanBatchSizeChange={setVolumePlanBatchSize}
+              onGeneratePlan={() => confirmGenerateVolumePlan()}
+              onClearPlans={() => void runClearVolumePlans()}
+              volumePlan={volumePlan}
+              volumePlanView={volumePlanView}
+              showVolumePlanWithBody={showVolumePlanWithBody}
+              onShowVolumePlanWithBodyChange={setShowVolumePlanWithBody}
+              volumes={volumes}
+              volumePlanLastRun={volumePlanLastRun}
+              onOpenPlanEditor={openPlanEditor}
+              onRegeneratePlan={confirmRegenerateChapterPlan}
+              onGenerateChapter={confirmGenerateChapterFromPlan}
+              normalizePlanBeats={normalizePlanBeats}
+              shortenText={shortenText}
+              formatVolumePlanBeatsText={formatVolumePlanBeatsText}
+            />
+            ) : studioRight === "chapter" ? (
+            <ChapterContentSection
+              selectedChapter={selectedChapter}
+              selectedChapterWordCount={selectedChapterWordCount}
+              busy={busy}
+              editTitle={editTitle}
+              onEditTitleChange={setEditTitle}
+              editContent={editContent}
+              onEditContentChange={setEditContent}
+              fbDraft={fbDraft}
+              onFbDraftChange={setFbDraft}
+              revisePrompt={revisePrompt}
+              onRevisePromptChange={setRevisePrompt}
+              latestWorkflow={latestWorkflow}
+              chapterJudge={chapterJudge}
+              retrievalLogs={retrievalLogs}
+              memoryUpdateRuns={memoryUpdateRuns}
+              coreEvaluation={coreEvaluation}
+              intelWorkflowLoading={intelWorkflowLoading}
+              intelJudgeLoading={intelJudgeLoading}
+              intelRetrievalLoading={intelRetrievalLoading}
+              onOpenChapterChat={() => setChapterChatOpen(true)}
+              onSaveChapter={() => void runSaveSelectedChapter()}
+              onFormatChapter={() => void runFormatSelectedChapter()}
+              onDeleteChapter={() => void runDeleteChapter({
+                id: selectedChapter?.id ?? "",
+                chapter_no: selectedChapter?.chapter_no ?? 0,
+                title: selectedChapter?.title ?? "",
+                status: selectedChapter?.status ?? "",
+              })}
+              onApplyRevision={() => run(() => applyChapterRevision(selectedChapter?.id ?? ""))}
+              onDiscardRevision={() => run(() => discardChapterRevision(selectedChapter?.id ?? ""))}
+              onConsistencyFix={() => confirmConsistencyFix(selectedChapter?.id ?? "")}
+              onPolishChapter={() => confirmPolishChapter(selectedChapter?.id ?? "")}
+              onRecordFeedback={() => {
+                if (selectedChapter && fbDraft[selectedChapter.id]?.trim()) {
+                  void addChapterFeedback(selectedChapter.id, fbDraft[selectedChapter.id].trim());
+                  setFbDraft((d) => ({ ...d, [selectedChapter.id]: "" }));
+                }
+              }}
+              onApproveChapter={() => confirmApproveChapter(selectedChapter?.id ?? "")}
+              onRetryMemory={() => void runRetryChapterMemory(selectedChapter?.id ?? "")}
+              onReviseChapter={(chapterId, prompt) => confirmReviseChapter(chapterId, prompt)}
+            />
             ) : (
             <section className="glass-panel space-y-5 p-5 md:p-6">
               <div className="space-y-1">
@@ -5421,18 +3871,18 @@ export function NovelWorkspace() {
                 </p>
               </div>
               {!frameworkConfirmed ? (
-                <div className="relative overflow-hidden rounded-[1.75rem] border border-amber-500/35 bg-amber-500/10 p-4 shadow-[0_18px_50px_rgba(245,158,11,0.10)] md:p-5">
+                <div className="relative overflow-hidden rounded-lg border border-amber-500/35 bg-amber-500/10 p-4 shadow-[0_18px_50px_rgba(245,158,11,0.10)] md:p-5">
                   <div className="pointer-events-none absolute -right-16 -top-20 h-44 w-44 rounded-full bg-amber-300/25 blur-3xl" />
                   <div className="relative flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                     <div className="space-y-2">
-                      <div className="inline-flex rounded-full border border-amber-500/35 bg-background/65 px-3 py-1 text-[11px] font-bold text-amber-700 dark:text-amber-300">
+                      <div className="inline-flex rounded-full border border-amber-500/35 bg-background px-3 py-1 text-[11px] font-bold text-amber-700 dark:text-amber-300">
                         下一步：确认框架
                       </div>
                       <div>
                         <p className="text-lg font-black text-foreground">
                           大纲已生成，但还没有确认，暂时不能开始 AI 续写
                         </p>
-                        <p className="mt-1 max-w-2xl text-sm leading-6 text-foreground/68 dark:text-muted-foreground">
+                        <p className="mt-1 max-w-2xl text-sm leading-6 text-foreground/70 dark:text-muted-foreground">
                           确认框架后，系统才会把世界观、人物和主线当成正式约束，并继续生成分卷剧情、章计划和正文。
                           {fwMd.trim()
                             ? "建议先快速扫一遍大纲，再进入向导确认。"
@@ -5483,7 +3933,7 @@ export function NovelWorkspace() {
                 </div>
               </div>
               {frameworkConfirmed ? (
-                <p className="rounded-2xl border border-border/55 bg-muted/25 p-3 text-xs font-semibold text-foreground/58 dark:text-muted-foreground">
+                <p className="rounded-2xl border border-border bg-muted p-3 text-xs font-semibold text-foreground/60 dark:text-muted-foreground">
                   可使用顶部工具条的「AI 一键续写」继续生成；默认目标为剩余 {remainingGenerateCount} 章，不超过全书目标 {maxGenerateCount} 章。
                 </p>
               ) : null}
@@ -5607,11 +4057,11 @@ export function NovelWorkspace() {
                       <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                         先看整体局势，再决定是否深入调整记忆。
                       </h3>
-                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
+                      <p className="max-w-2xl text-sm leading-7 text-foreground/70">
                         {shortenText(memoryStoryView.mainNarrative, 120)}
                       </p>
                     </div>
-                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
+                    <div className="rounded-lg border border-border bg-background px-4 py-3 text-right">
                       <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
                         最近变化
                       </p>
@@ -5625,7 +4075,7 @@ export function NovelWorkspace() {
                   </div>
 
                   <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_0.9fr]">
-                    <div className="rounded-[1.5rem] border border-border/60 bg-background/60 p-4">
+                    <div className="rounded-lg border border-border bg-background p-4">
                       <div className="space-y-3">
                         <div>
                           <p className="text-sm font-semibold text-foreground">进度条</p>
@@ -5639,7 +4089,7 @@ export function NovelWorkspace() {
                               <span>已审定章节覆盖</span>
                               <span>{Math.round(memoryStoryView.freshnessRatio * 100)}%</span>
                             </div>
-                            <div className="h-2 rounded-full bg-background/75">
+                            <div className="h-2 rounded-full bg-background">
                               <div
                                 className="h-full rounded-full bg-gradient-to-r from-primary via-accent to-cyan-300"
                                 style={{ width: `${Math.max(8, Math.round(memoryStoryView.freshnessRatio * 100))}%` }}
@@ -5651,7 +4101,7 @@ export function NovelWorkspace() {
                               <span>正文审定进度</span>
                               <span>{Math.round(memoryStoryView.draftPressureRatio * 100)}%</span>
                             </div>
-                            <div className="h-2 rounded-full bg-background/75">
+                            <div className="h-2 rounded-full bg-background">
                               <div
                                 className="h-full rounded-full bg-gradient-to-r from-emerald-400 via-primary to-sky-400"
                                 style={{ width: `${Math.max(8, Math.round(memoryStoryView.draftPressureRatio * 100))}%` }}
@@ -5662,21 +4112,21 @@ export function NovelWorkspace() {
                       </div>
 
                       <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                        <div className="rounded-[1.1rem] border border-border/55 bg-background/68 p-3">
+                        <div className="rounded-lg border border-border bg-background p-3">
                           <p className="text-[11px] uppercase tracking-[0.16em] text-foreground/45">
                             当前建议
                           </p>
-                          <ul className="mt-2 space-y-2 text-sm text-foreground/72">
+                          <ul className="mt-2 space-y-2 text-sm text-foreground/70">
                             {memoryStoryView.nextActions.map((item, index) => (
                               <li key={`memory-next-${index}`}>- {item}</li>
                             ))}
                           </ul>
                         </div>
-                        <div className="rounded-[1.1rem] border border-border/55 bg-background/68 p-3">
+                        <div className="rounded-lg border border-border bg-background p-3">
                           <p className="text-[11px] uppercase tracking-[0.16em] text-foreground/45">
                             最近章节摘要
                           </p>
-                          <p className="mt-2 text-sm leading-6 text-foreground/72">
+                          <p className="mt-2 text-sm leading-6 text-foreground/70">
                             {memoryStoryView.latestFacts
                               ? shortenText(
                                   memoryStoryView.latestFacts.key_facts[0] ||
@@ -5691,7 +4141,7 @@ export function NovelWorkspace() {
                       </div>
                     </div>
 
-                    <div className="rounded-[1.5rem] border border-border/60 bg-background/60 p-4">
+                    <div className="rounded-lg border border-border bg-background p-4">
                       <div className="flex items-center justify-between gap-2">
                         <div>
                           <p className="text-sm font-semibold text-foreground">最近 8 章走势</p>
@@ -5721,7 +4171,7 @@ export function NovelWorkspace() {
                                 className="w-full rounded-t-2xl bg-gradient-to-t from-primary via-accent to-cyan-300/85"
                                 style={{ height }}
                               />
-                              <div className="text-center text-[10px] text-foreground/55">
+                              <div className="text-center text-[10px] text-foreground/50">
                                 <div>第{chapter.chapter_no}章</div>
                                 <div>
                                   +{chapter.open_plots_added.length} / -{chapter.open_plots_resolved.length}
@@ -5751,7 +4201,7 @@ export function NovelWorkspace() {
                     {memoryStoryView.plotBuckets.map((bucket) => (
                       <div
                         key={`plot-bucket-${bucket.key}`}
-                        className="rounded-[1.25rem] border border-border/60 bg-background/60 p-4"
+                        className="rounded-lg border border-border bg-background p-4"
                       >
                         <div className="flex items-center justify-between gap-2">
                           <div>
@@ -5762,7 +4212,7 @@ export function NovelWorkspace() {
                               {bucket.hint}
                             </p>
                           </div>
-                          <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                          <span className="rounded-full border border-border bg-background px-2.5 py-1 text-[11px] text-foreground/60">
                             {bucket.items.length}
                           </span>
                         </div>
@@ -5771,24 +4221,24 @@ export function NovelWorkspace() {
                             {bucket.items.map((plot) => (
                               <div
                                 key={`plot-card-${bucket.key}-${plot.body}`}
-                                className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                                className="rounded-[1rem] border border-border bg-background p-3"
                               >
                                 <div className="flex flex-wrap items-center justify-between gap-2">
                                   <span className="rounded-full border border-primary/20 bg-primary/10 px-2.5 py-1 text-[11px] font-semibold text-primary">
                                     {plot.plot_type || "线索"}
                                   </span>
-                                  <span className="text-[11px] text-foreground/55">
+                                  <span className="text-[11px] text-foreground/50">
                                     优先级 {plot.priority ?? 0}
                                   </span>
                                 </div>
-                                <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                <p className="mt-2 text-sm leading-6 text-foreground/70">
                                   {shortenText(formatMemoryPlotLine(plot), 84)}
                                 </p>
                               </div>
                             ))}
                           </div>
                         ) : (
-                          <p className="mt-3 text-sm text-foreground/55">当前没有这一类线索。</p>
+                          <p className="mt-3 text-sm text-foreground/50">当前没有这一类线索。</p>
                         )}
                       </div>
                     ))}
@@ -5822,14 +4272,14 @@ export function NovelWorkspace() {
                         return (
                           <div
                             key={`skill-group-${key}`}
-                            className="rounded-[1.2rem] border border-border/60 bg-background/62 p-4"
+                            className="rounded-lg border border-border bg-background p-4"
                           >
                             <div className="flex items-center justify-between gap-2">
                               <div>
                                 <p className="text-sm font-semibold text-foreground">{title}</p>
                                 <p className="text-[11px] text-muted-foreground">{hint}</p>
                               </div>
-                              <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                              <span className="rounded-full border border-border bg-background px-2.5 py-1 text-[11px] text-foreground/60">
                                 {items.length}
                               </span>
                             </div>
@@ -5844,17 +4294,17 @@ export function NovelWorkspace() {
                                   return (
                                     <div
                                       key={`skill-card-${key}-${skill.id || skill.name}`}
-                                      className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                                      className="rounded-[1rem] border border-border bg-background p-3"
                                     >
                                       <div className="flex flex-wrap items-center justify-between gap-2">
                                         <p className="text-sm font-semibold text-foreground">
                                           {skill.name}
                                         </p>
-                                        <span className="text-[11px] text-foreground/55">
+                                        <span className="text-[11px] text-foreground/50">
                                           热度 {skill.influence_score ?? 0}
                                         </span>
                                       </div>
-                                      <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                      <p className="mt-2 text-sm leading-6 text-foreground/70">
                                         {summary || "已入账，但暂时没有更多可展示的说明。"}
                                       </p>
                                       <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
@@ -5868,7 +4318,7 @@ export function NovelWorkspace() {
                                 })}
                               </div>
                             ) : (
-                              <p className="mt-3 text-sm text-foreground/55">当前没有落在这一类的技能。</p>
+                              <p className="mt-3 text-sm text-foreground/50">当前没有落在这一类的技能。</p>
                             )}
                           </div>
                         );
@@ -5904,14 +4354,14 @@ export function NovelWorkspace() {
                         return (
                           <div
                             key={`item-group-${key}`}
-                            className="rounded-[1.2rem] border border-border/60 bg-background/62 p-4"
+                            className="rounded-lg border border-border bg-background p-4"
                           >
                             <div className="flex items-center justify-between gap-2">
                               <div>
                                 <p className="text-sm font-semibold text-foreground">{title}</p>
                                 <p className="text-[11px] text-muted-foreground">{hint}</p>
                               </div>
-                              <span className="rounded-full border border-border/60 bg-background/72 px-2.5 py-1 text-[11px] text-foreground/60">
+                              <span className="rounded-full border border-border bg-background px-2.5 py-1 text-[11px] text-foreground/60">
                                 {items.length}
                               </span>
                             </div>
@@ -5926,17 +4376,17 @@ export function NovelWorkspace() {
                                   return (
                                     <div
                                       key={`inventory-card-${key}-${item.id || item.label}`}
-                                      className="rounded-[1rem] border border-border/55 bg-background/70 p-3"
+                                      className="rounded-[1rem] border border-border bg-background p-3"
                                     >
                                       <div className="flex flex-wrap items-center justify-between gap-2">
                                         <p className="text-sm font-semibold text-foreground">
                                           {item.label}
                                         </p>
-                                        <span className="text-[11px] text-foreground/55">
+                                        <span className="text-[11px] text-foreground/50">
                                           重要度 {item.influence_score ?? 0}
                                         </span>
                                       </div>
-                                      <p className="mt-2 text-sm leading-6 text-foreground/72">
+                                      <p className="mt-2 text-sm leading-6 text-foreground/70">
                                         {summary || "已登记为关键物品，后续剧情可能继续调用。"}
                                       </p>
                                       <div className="mt-2 flex flex-wrap gap-2 text-[11px] text-foreground/56">
@@ -5950,7 +4400,7 @@ export function NovelWorkspace() {
                                 })}
                               </div>
                             ) : (
-                              <p className="mt-3 text-sm text-foreground/55">当前没有落在这一类的道具。</p>
+                              <p className="mt-3 text-sm text-foreground/50">当前没有落在这一类的道具。</p>
                             )}
                           </div>
                         );
@@ -5964,7 +4414,7 @@ export function NovelWorkspace() {
               </>
             ) : null}
 
-            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+            <details className="rounded-lg border border-border bg-background/35 p-4">
               <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
                 高级视图：更新审计与结构化差异
                 <span className="ml-2 text-[11px] font-normal text-muted-foreground">
@@ -5991,7 +4441,7 @@ export function NovelWorkspace() {
                     {memoryUpdateRuns.slice(0, 6).map((run) => (
                       <div
                         key={run.id}
-                        className="rounded-[1.2rem] border border-border/60 bg-background/60 p-3"
+                        className="rounded-lg border border-border bg-background p-3"
                       >
                         <div className="flex flex-wrap items-center justify-between gap-2">
                           <div className="flex flex-wrap items-center gap-2">
@@ -6019,7 +4469,7 @@ export function NovelWorkspace() {
                           ].map(([label, value]) => (
                             <div
                               key={`${run.id}-${label}`}
-                              className="rounded-xl border border-border/50 bg-background/65 px-2.5 py-2"
+                              className="rounded-xl border border-border/50 bg-background px-2.5 py-2"
                             >
                               <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/45">
                                 {label}
@@ -6109,7 +4559,7 @@ export function NovelWorkspace() {
                       return (
                         <div
                           key={`diff-${label}`}
-                          className="rounded-[1.1rem] border border-border/60 bg-background/60 p-3"
+                          className="rounded-lg border border-border bg-background p-3"
                         >
                           <div className="flex items-center justify-between gap-2">
                             <p className="text-xs font-semibold text-foreground/80">{label}</p>
@@ -6179,7 +4629,7 @@ export function NovelWorkspace() {
                     .map((chapter) => (
                       <div
                         key={`timeline-${chapter.chapter_no}`}
-                        className="rounded-[1.25rem] border border-border/60 bg-background/60 p-4"
+                        className="rounded-lg border border-border bg-background p-4"
                       >
                         <div className="flex items-center justify-between gap-2">
                           <p className="text-sm font-semibold text-foreground">
@@ -6216,7 +4666,7 @@ export function NovelWorkspace() {
               </div>
             ) : null}
 
-            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+            <details className="rounded-lg border border-border bg-background/35 p-4">
               <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
                 高级视图：Story Bible 与 RAG 派生层
                 <span className="ml-2 text-[11px] font-normal text-muted-foreground">
@@ -6244,7 +4694,7 @@ export function NovelWorkspace() {
                       {Object.entries(storyBibleSnapshot.stats || {}).slice(0, 3).map(([key, value]) => (
                         <div
                           key={`story-bible-stat-${key}`}
-                          className="rounded-xl border border-border/50 bg-background/65 p-3"
+                          className="rounded-xl border border-border/50 bg-background p-3"
                         >
                           <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/45">
                             {key}
@@ -6257,7 +4707,7 @@ export function NovelWorkspace() {
                       {(storyBibleSnapshot.entities || []).slice(0, 6).map((entity, index) => (
                         <div
                           key={`story-entity-${index}`}
-                          className="rounded-[1.1rem] border border-border/55 bg-background/60 p-3"
+                          className="rounded-lg border border-border bg-background p-3"
                         >
                           <p className="text-xs font-semibold text-foreground">
                             {String(entity.canonical_name || "未命名实体")}
@@ -6291,7 +4741,7 @@ export function NovelWorkspace() {
                     {retrievalIndexDocs.slice(0, 6).map((doc) => (
                       <div
                         key={doc.id}
-                        className="rounded-[1.1rem] border border-border/55 bg-background/60 p-3"
+                        className="rounded-lg border border-border bg-background p-3"
                       >
                         <div className="flex items-center justify-between gap-2">
                           <p className="text-xs font-semibold text-foreground">
@@ -6329,11 +4779,11 @@ export function NovelWorkspace() {
                       <h3 className="text-2xl font-semibold tracking-tight text-foreground">
                         把人物关系直接画出来，而不是堆成一排列表。
                       </h3>
-                      <p className="max-w-2xl text-sm leading-7 text-foreground/68">
+                      <p className="max-w-2xl text-sm leading-7 text-foreground/70">
                         谁最活跃、谁和谁绑定最深、当前故事重心落在哪几个人身上，这里一眼就能看懂。
                       </p>
                     </div>
-                    <div className="rounded-[1.3rem] border border-border/60 bg-background/70 px-4 py-3 text-right backdrop-blur-xl">
+                    <div className="rounded-lg border border-border bg-background px-4 py-3 text-right">
                       <p className="text-[11px] font-semibold uppercase tracking-[0.18em] text-foreground/50">
                         实体总览
                       </p>
@@ -6347,7 +4797,7 @@ export function NovelWorkspace() {
                   </div>
 
                   <div className="mt-5 grid gap-4 lg:grid-cols-[0.98fr_1.02fr]">
-                    <div className="relative min-h-[320px] rounded-[1.7rem] border border-border/60 bg-background/58 p-4">
+                    <div className="relative min-h-[320px] rounded-lg border border-border bg-background p-4">
                       <svg
                         viewBox="0 0 100 100"
                         className="pointer-events-none absolute inset-0 h-full w-full"
@@ -6393,7 +4843,7 @@ export function NovelWorkspace() {
                         <circle cx="50" cy="50" r="18" fill="none" stroke="hsl(var(--accent) / 0.15)" />
                       </svg>
 
-                      <div className="absolute left-1/2 top-1/2 flex h-24 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-primary/20 bg-background/80 text-center shadow-[0_18px_40px_rgba(15,23,42,0.12)] backdrop-blur-xl">
+                      <div className="absolute left-1/2 top-1/2 flex h-24 w-24 -translate-x-1/2 -translate-y-1/2 items-center justify-center rounded-full border border-primary/20 bg-background text-center shadow-[0_18px_40px_rgba(15,23,42,0.12)]">
                         <div className="px-3">
                           <p className="text-[10px] uppercase tracking-[0.16em] text-foreground/40">
                             故事核心
@@ -6415,7 +4865,7 @@ export function NovelWorkspace() {
                         return (
                           <div
                             key={`atlas-character-${character.name}-${index}`}
-                            className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-border/60 bg-background/82 shadow-[0_18px_40px_rgba(15,23,42,0.14)] backdrop-blur-xl"
+                            className="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-border bg-background/82 shadow-[0_18px_40px_rgba(15,23,42,0.14)]"
                             style={{
                               left: point.left,
                               top: point.top,
@@ -6427,7 +4877,7 @@ export function NovelWorkspace() {
                               <p className="text-xs font-semibold text-foreground">
                                 {shortenText(character.name, 9)}
                               </p>
-                              <p className="mt-1 text-[10px] text-foreground/58">
+                              <p className="mt-1 text-[10px] text-foreground/60">
                                 影响力 {character.influence_score}
                               </p>
                             </div>
@@ -6435,7 +4885,7 @@ export function NovelWorkspace() {
                         );
                       })}
 
-                      <div className="absolute bottom-4 left-4 rounded-[1.1rem] border border-border/60 bg-background/76 px-3 py-2 text-xs text-foreground/62 backdrop-blur-xl">
+                      <div className="absolute bottom-4 left-4 rounded-lg border border-border bg-background px-3 py-2 text-xs text-foreground/60">
                         活跃人物 {memoryVisuals.activeCharacters} · 活跃物品 {memoryVisuals.activeInventory}
                       </div>
                     </div>
@@ -6447,7 +4897,7 @@ export function NovelWorkspace() {
                           ["关系", `${memoryNorm.relations.length}`, memoryVisuals.topRelations.length > 0 ? "已提炼人物脉络" : "等待关系沉淀"],
                           ["故事重压", `${memoryVisuals.staleCount + memoryVisuals.overdueCount}`, `${memoryVisuals.staleCount} 条停滞 / ${memoryVisuals.overdueCount} 条紧急`],
                         ].map(([label, value, hint]) => (
-                          <div key={label} className="rounded-[1.2rem] border border-border/60 bg-background/64 px-4 py-3">
+                          <div key={label} className="rounded-lg border border-border bg-background px-4 py-3">
                             <p className="text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/50">
                               {label}
                             </p>
@@ -6457,7 +4907,7 @@ export function NovelWorkspace() {
                         ))}
                       </div>
 
-                      <div className="rounded-[1.4rem] border border-border/60 bg-background/58 p-4">
+                      <div className="rounded-lg border border-border bg-background p-4">
                         <div className="flex items-center gap-2">
                           <GitBranch className="size-4 text-primary" />
                           <p className="text-sm font-semibold text-foreground">关系脉络</p>
@@ -6467,7 +4917,7 @@ export function NovelWorkspace() {
                             {memoryVisuals.topRelations.map((relation, index) => (
                               <div
                                 key={`relation-atlas-${index}-${relation.from}-${relation.to}`}
-                                className="rounded-[1.1rem] border border-border/55 bg-background/68 px-3 py-3"
+                                className="rounded-lg border border-border bg-background px-3 py-3"
                               >
                                 <div className="flex items-center gap-3">
                                   <span className="min-w-0 shrink text-sm font-semibold text-foreground/84">
@@ -6478,7 +4928,7 @@ export function NovelWorkspace() {
                                     {relation.to}
                                   </span>
                                 </div>
-                                <p className="mt-2 text-sm text-foreground/62">{relation.relation}</p>
+                                <p className="mt-2 text-sm text-foreground/60">{relation.relation}</p>
                               </div>
                             ))}
                           </div>
@@ -6505,22 +4955,22 @@ export function NovelWorkspace() {
                           return (
                             <div
                               key={`character-heat-${index}-${character.name}`}
-                              className="rounded-[1.3rem] border border-border/60 bg-background/62 p-4"
+                              className="rounded-lg border border-border bg-background p-4"
                             >
                               <div className="flex flex-wrap items-center justify-between gap-2">
-                                <span className="rounded-full border border-border/70 bg-background/74 px-3 py-1 text-[11px] font-semibold text-foreground/58">
+                                <span className="rounded-full border border-border bg-background px-3 py-1 text-[11px] font-semibold text-foreground/60">
                                   {character.role || "角色"}
                                 </span>
                                 <span className="text-[11px] font-semibold text-foreground/56">
                                   热度 {character.influence_score}
                                 </span>
                               </div>
-                              <p className="mt-3 text-sm leading-7 text-foreground/72">
+                              <p className="mt-3 text-sm leading-7 text-foreground/70">
                                 {character.status
                                   ? `${character.name} · ${shortenText(character.status, 48)}`
                                   : character.name}
                               </p>
-                              <div className="mt-3 h-2 rounded-full bg-background/70">
+                              <div className="mt-3 h-2 rounded-full bg-background">
                                 <div
                                   className="h-full rounded-full bg-gradient-to-r from-primary via-accent to-cyan-300"
                                   style={{ width: `${Math.max(14, Math.round(progress * 100))}%` }}
@@ -6548,7 +4998,7 @@ export function NovelWorkspace() {
               </div>
             ) : null}
 
-            <details className="rounded-[1.6rem] border border-border/60 bg-background/35 p-4">
+            <details className="rounded-lg border border-border bg-background/35 p-4">
               <summary className="cursor-pointer list-none text-sm font-semibold text-foreground">
                 高级视图：结构化记忆真源与人工精修
                 <span className="ml-2 text-[11px] font-normal text-muted-foreground">
@@ -6578,8 +5028,8 @@ export function NovelWorkspace() {
                     </span>
                   </p>
                   {memorySchemaGuide ? (
-                    <details className="rounded-[1.4rem] border border-sky-500/30 bg-sky-500/5 p-4">
-                      <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/62">
+                    <details className="rounded-lg border border-sky-500/30 bg-sky-500/5 p-4">
+                      <summary className="cursor-pointer text-[11px] font-semibold uppercase tracking-[0.16em] text-foreground/60">
                         结构化记忆录入规范
                       </summary>
                       <div className="mt-3 grid gap-3 md:grid-cols-2">
@@ -6625,7 +5075,7 @@ export function NovelWorkspace() {
                     </details>
                   ) : null}
                   {memoryHealth ? (
-                    <div className="space-y-3 rounded-[1.4rem] border border-amber-500/30 bg-amber-500/5 p-4">
+                    <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
                       <div className="flex flex-wrap items-center justify-between gap-2">
                         <p className="font-medium text-foreground">记忆健康检查</p>
                         <span className="text-[11px] text-muted-foreground">
@@ -7180,7 +5630,7 @@ export function NovelWorkspace() {
               </div>
             </details>
             {memoryRefreshPreview ? (
-              <div className="space-y-3 rounded-[1.4rem] border border-amber-500/30 bg-amber-500/5 p-4">
+              <div className="space-y-3 rounded-lg border border-amber-500/30 bg-amber-500/5 p-4">
                 <div className="space-y-1">
                   <p className="text-sm font-medium text-amber-400">
                     {memoryRefreshPreview.tier === "blocked"
@@ -7211,7 +5661,7 @@ export function NovelWorkspace() {
                         </span>
                       ))}
                       {diffChapterNos(memoryRefreshPreview.diffSummary).length > 0 ? (
-                        <span className="rounded-full border border-border/60 bg-background/60 px-2 py-1 text-[11px] text-muted-foreground">
+                        <span className="rounded-full border border-border bg-background px-2 py-1 text-[11px] text-muted-foreground">
                           来源章：{diffChapterNos(memoryRefreshPreview.diffSummary).join(" / ")}
                         </span>
                       ) : null}
@@ -7295,7 +5745,7 @@ export function NovelWorkspace() {
                 <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
                   全局禁止触碰的设定底线；续写与审定时请对照。
                 </p>
-                <ul className="max-h-[min(40vh,320px)] space-y-1.5 overflow-y-auto soft-scroll rounded-xl border border-border/60 bg-muted/20 p-3 text-xs text-foreground/70 dark:text-muted-foreground font-medium leading-relaxed">
+                <ul className="max-h-[min(40vh,320px)] space-y-1.5 overflow-y-auto soft-scroll rounded-xl border border-border bg-muted p-3 text-xs text-foreground/70 dark:text-muted-foreground font-medium leading-relaxed">
                   {slicePage(
                     memoryNorm.outline.forbidden_constraints,
                     structuredPages.forbidden_fc ?? 0,
@@ -7437,7 +5887,7 @@ export function NovelWorkspace() {
                 </Button>
               </div>
               {memoryFixHints.length > 0 ? (
-                <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3">
+                <div className="rounded-lg border border-amber-500/40 bg-amber-500/5 p-3">
                   <p className="text-xs font-medium text-amber-300">保存前提醒</p>
                   <ul className="mt-1 list-disc space-y-1 pl-5 text-xs text-amber-200/90">
                     {memoryFixHints.map((h, i) => (
@@ -7451,7 +5901,7 @@ export function NovelWorkspace() {
         </Tabs>
       </div>
 
-      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border/70 bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] backdrop-blur-xl md:hidden">
+      <div className="fixed inset-x-0 bottom-0 z-30 border-t border-border bg-background/92 pb-[calc(env(safe-area-inset-bottom)+0.75rem)] pt-3 shadow-[0_-12px_30px_rgba(15,23,42,0.08)] md:hidden">
         <div className="novel-container space-y-2 px-4">
           <p className="text-[11px] font-medium text-foreground/60">
             {activeTab === "studio"
@@ -7571,1060 +6021,186 @@ export function NovelWorkspace() {
         </div>
       </div>
 
-      <Dialog open={logDialogOpen} onOpenChange={setLogDialogOpen}>
-              <DialogContent className="max-h-[85vh] max-w-4xl overflow-hidden">
-                <DialogHeader>
-                  <div className="flex items-center justify-between gap-4 mr-8">
-                    <div className="min-w-0 flex-1">
-                      <DialogTitle className="text-xl font-bold">章节生成日志</DialogTitle>
-                      <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
-                        支持按任务批次过滤，避免页面被日志持续撑长。
-                      </DialogDescription>
-                    </div>
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      onClick={runClearGenerationLogs}
-                      className="text-destructive font-bold hover:bg-destructive/10 hover:text-destructive shrink-0"
-                    >
-                      清空日志
-                    </Button>
-                  </div>
-                </DialogHeader>
-                <div className="space-y-3">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <div className="inline-flex overflow-hidden rounded-2xl border border-border/70 bg-background/60 p-1">
-                      <button
-                        type="button"
-                        className={`rounded-xl px-3 py-1.5 text-xs transition-all font-bold ${
-                          logViewMode === "all" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-foreground/60 dark:text-muted-foreground"
-                        }`}
-                        onClick={() => setLogViewMode("all")}
-                      >
-                        全部
-                      </button>
-                      <button
-                        type="button"
-                        className={`rounded-xl px-3 py-1.5 text-xs transition-all font-bold ${
-                          logViewMode === "batch" ? "bg-primary/15 text-foreground shadow-sm" : "bg-transparent text-foreground/60 dark:text-muted-foreground"
-                        }`}
-                        onClick={() => {
-                          setLogViewMode("batch");
-                          if (!logBatchId && (refreshBatchId || latestLogBatchId)) {
-                            setLogBatchId(refreshBatchId || latestLogBatchId);
-                          }
-                        }}
-                      >
-                        当前批次
-                      </button>
-                    </div>
-                    <input
-                      value={logBatchId}
-                      onChange={(e) => setLogBatchId(e.target.value)}
-                      placeholder="可填批次编号手动过滤"
-                      className="field-shell h-10 w-full md:w-80 text-foreground font-bold placeholder:text-foreground/30"
-                      disabled={logViewMode !== "batch"}
-                    />
-                    <label className="inline-flex items-center gap-2 text-xs text-foreground/70 dark:text-muted-foreground font-bold cursor-pointer">
-                      <input
-                        type="checkbox"
-                        checked={logOnlyError}
-                        onChange={(e) => setLogOnlyError(e.target.checked)}
-                      />
-                      仅看错误
-                    </label>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      className="font-bold"
-                      disabled={logBusy}
-                      onClick={() =>
-                        void reloadGenerationLogs(
-                          logViewMode === "batch" ? logBatchId || undefined : undefined
-                        )
-                      }
-                    >
-                      {logBusy ? "刷新中…" : "刷新日志"}
-                    </Button>
-                  </div>
-                  <div className="glass-panel-subtle p-3">
-                    <div className="mb-1 flex items-center justify-between text-xs font-bold text-foreground/80">
-                      <span>
-                        记忆刷新进度：{refreshStatus === "queued"
-                          ? "已入队"
-                          : refreshStatus === "started"
-                            ? "执行中"
-                            : refreshStatus === "done"
-                              ? "已完成"
-                              : refreshStatus === "failed"
-                                ? "失败"
-                                : "空闲"}
-                      </span>
-                      <span>{refreshProgress}%</span>
-                    </div>
-                    <div className="h-2.5 w-full rounded-full bg-muted/80">
-                      <div
-                        className={`h-2.5 rounded-full transition-all duration-500 ${
-                          refreshStatus === "failed" ? "bg-destructive" : "bg-primary"
-                        }`}
-                        style={{ width: `${Math.max(0, Math.min(100, refreshProgress))}%` }}
-                      />
-                    </div>
-                    <p className="mt-1 text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
-                      任务批次：{refreshBatchId || "-"} · 开始：{formatUtc8(refreshStartedAt)} · 更新时间：
-                      {formatUtc8(refreshUpdatedAt)}
-                    </p>
-                    <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium">
-                      已运行时长：{formatDuration(refreshElapsedSeconds)} · 最近成功版本：
-                      {latestRefreshVersion == null ? "-" : `v${latestRefreshVersion}`}
-                    </p>
-                    {refreshLastMessage ? (
-                      <p className="text-[11px] text-foreground/70 dark:text-muted-foreground font-bold italic">{refreshLastMessage}</p>
-                    ) : null}
-                  </div>
-                  <div className="soft-scroll max-h-[55vh] overflow-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-3 font-mono text-xs">
-                    {genLogs.length === 0 ? (
-                      <p className="text-foreground/50 dark:text-muted-foreground italic">
-                        暂无日志。点击“自动续写”或“审定通过”后可在此查看过程细节。
-                      </p>
-                    ) : (
-                      genLogs.map((l) => {
-                        const metaView = summarizeLogMeta(l.event, l.meta || {});
-                        return (
-                          <div
-                            key={l.id}
-                            className="border-b border-border/50 py-3 last:border-b-0"
-                          >
-                            <div className="font-medium">
-                              <span className="text-foreground/50 dark:text-muted-foreground">
-                                [{formatUtc8(l.created_at)}] [{l.level === 'error' ? '错误' : l.level === 'warning' ? '警告' : '信息'}]
-                              </span>{" "}
-                              <span className="text-foreground/90 dark:text-inherit">
-                                {l.chapter_no ? `第${l.chapter_no}章` : "-"} · {l.message}
-                              </span>
-                            </div>
-                            {metaView.summary.length ? (
-                              <div className="mt-2 rounded-2xl border border-border/60 bg-background/60 px-3 py-2 text-[11px] text-foreground/90 font-medium">
-                                {metaView.summary.map((item, idx) => (
-                                  <p key={`${l.id}-summary-${idx}`}>{item}</p>
-                                ))}
-                              </div>
-                            ) : null}
-                            {metaView.detail ? (
-                              <details className="mt-2 rounded-2xl border border-border/60 bg-background/40 px-3 py-2">
-                                <summary className="cursor-pointer text-[11px] text-foreground/60 dark:text-muted-foreground font-bold">
-                                  查看技术详情
-                                </summary>
-                                <pre className="mt-2 whitespace-pre-wrap text-[11px] text-foreground/70 dark:text-muted-foreground">
-                                  {metaView.detail}
-                                </pre>
-                              </details>
-                            ) : null}
-                          </div>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              </DialogContent>
-            </Dialog>
+      <GenerationLogsDialog
+        open={logDialogOpen}
+        onOpenChange={setLogDialogOpen}
+        logs={genLogs}
+        logBusy={logBusy}
+        logViewMode={logViewMode}
+        onViewModeChange={(mode) => {
+          setLogViewMode(mode);
+          if (mode === "batch" && !logBatchId && (refreshBatchId || latestLogBatchId)) {
+            setLogBatchId(refreshBatchId || latestLogBatchId);
+          }
+        }}
+        logBatchId={logBatchId}
+        onBatchIdChange={setLogBatchId}
+        logOnlyError={logOnlyError}
+        onOnlyErrorChange={setLogOnlyError}
+        onRefresh={() => void reloadGenerationLogs(logViewMode === "batch" ? logBatchId || undefined : undefined)}
+        onClear={runClearGenerationLogs}
+        refreshStatus={refreshStatus}
+        refreshProgress={refreshProgress}
+        refreshBatchId={refreshBatchId}
+        refreshStartedAt={refreshStartedAt}
+        refreshUpdatedAt={refreshUpdatedAt}
+        refreshElapsedSeconds={refreshElapsedSeconds}
+        latestRefreshVersion={latestRefreshVersion}
+        refreshLastMessage={refreshLastMessage}
+        formatUtc8={formatUtc8}
+        formatDuration={formatDuration}
+        summarizeLogMeta={summarizeLogMeta}
+      />
 
       {/* 小说设置弹窗 */}
-      <Dialog open={novelSettingsOpen} onOpenChange={setNovelSettingsOpen}>
-        <DialogContent className="max-h-[85vh] max-w-md overflow-hidden">
-          <DialogHeader>
-            <DialogTitle className="text-xl font-bold">小说设置</DialogTitle>
-            <DialogDescription className="text-foreground/80 dark:text-muted-foreground font-medium">
-              配置当前小说的总章节数和每日自动撰写计划。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="max-h-[calc(85vh-9rem)] space-y-4 overflow-y-auto py-4 pr-2">
-            <div className="space-y-2">
-              <Label htmlFor="target_chapters" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">目标总章节数</Label>
-              <Input
-                id="target_chapters"
-                type="number"
-                min={1}
-                max={20000}
-                value={novelSettingsDraft.target_chapters}
-                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, target_chapters: Number(e.target.value) })}
-                className="field-shell text-foreground font-bold"
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">该小说的预计总章节数。</p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="daily_auto_chapters" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写章数</Label>
-              <Input
-                id="daily_auto_chapters"
-                type="number"
-                min={0}
-                max={50}
-                value={novelSettingsDraft.daily_auto_chapters}
-                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, daily_auto_chapters: Number(e.target.value) })}
-                className="field-shell text-foreground font-bold"
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">设定为 0 表示不开启每日自动撰写。如果不为 0，系统将在指定时间自动在后台为你续写小说。</p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="daily_auto_time" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每日自动撰写时间（北京时间）</Label>
-              <Input
-                id="daily_auto_time"
-                type="time"
-                value={novelSettingsDraft.daily_auto_time}
-                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, daily_auto_time: e.target.value })}
-                className="field-shell text-foreground font-bold"
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">由后台系统自动执行。</p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="chapter_target_words" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">每章期望字数（汉字）</Label>
-              <Input
-                id="chapter_target_words"
-                type="number"
-                min={300}
-                max={10000}
-                step={1}
-                value={novelSettingsDraft.chapter_target_words}
-                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, chapter_target_words: Number(e.target.value) })}
-                className="field-shell text-foreground font-bold"
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">提示词会强力要求正文紧贴目标字数，只允许轻微浮动。当前默认规则为上下约 5%，至少 30 字、最多 150 字。</p>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="auto_consistency_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                生成前一致性修订
-              </Label>
-              <label
-                htmlFor="auto_consistency_check"
-                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
-              >
-                <input
-                  id="auto_consistency_check"
-                  type="checkbox"
-                  checked={novelSettingsDraft.auto_consistency_check}
-                  onChange={(e) =>
-                    setNovelSettingsDraft({
-                      ...novelSettingsDraft,
-                      auto_consistency_check: e.target.checked,
-                    })
-                  }
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">生成正文后，追加一次一致性修订</p>
-                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
-                    默认关闭。开启后会多一次 LLM 调用，速度更慢，但会先做一轮通顺性与设定衔接修订。
-                  </p>
-                </div>
-              </label>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="auto_plan_guard_check" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                执行卡硬校验
-              </Label>
-              <label
-                htmlFor="auto_plan_guard_check"
-                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
-              >
-                <input
-                  id="auto_plan_guard_check"
-                  type="checkbox"
-                  checked={novelSettingsDraft.auto_plan_guard_check}
-                  onChange={(e) =>
-                    setNovelSettingsDraft({
-                      ...novelSettingsDraft,
-                      auto_plan_guard_check: e.target.checked,
-                      auto_plan_guard_fix: e.target.checked
-                        ? novelSettingsDraft.auto_plan_guard_fix
-                        : false,
-                    })
-                  }
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">生成正文初稿后，按执行卡做一次硬校验</p>
-                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
-                    默认关闭。开启后会额外消耗一次 LLM 调用；若同时未开启纠偏，校验失败会直接终止当前批次。
-                  </p>
-                </div>
-              </label>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="auto_plan_guard_fix" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                执行卡纠偏
-              </Label>
-              <label
-                htmlFor="auto_plan_guard_fix"
-                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
-              >
-                <input
-                  id="auto_plan_guard_fix"
-                  type="checkbox"
-                  checked={novelSettingsDraft.auto_plan_guard_fix}
-                  onChange={(e) =>
-                    setNovelSettingsDraft({
-                      ...novelSettingsDraft,
-                      auto_plan_guard_fix: e.target.checked,
-                      auto_plan_guard_check: e.target.checked
-                        ? true
-                        : novelSettingsDraft.auto_plan_guard_check,
-                    })
-                  }
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">硬校验失败时，自动按执行卡重写纠偏</p>
-                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
-                    默认关闭。开启后会自动联动硬校验，并在失败时追加一次纠偏调用，进一步增加耗时与 token。
-                  </p>
-                </div>
-              </label>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="auto_style_polish" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">
-                AI 润色
-              </Label>
-              <label
-                htmlFor="auto_style_polish"
-                className="flex cursor-pointer items-start gap-3 rounded-xl border border-border/70 bg-muted/30 px-3 py-3"
-              >
-                <input
-                  id="auto_style_polish"
-                  type="checkbox"
-                  checked={novelSettingsDraft.auto_style_polish}
-                  onChange={(e) =>
-                    setNovelSettingsDraft({
-                      ...novelSettingsDraft,
-                      auto_style_polish: e.target.checked,
-                    })
-                  }
-                  className="mt-0.5 h-4 w-4"
-                />
-                <div className="space-y-1">
-                  <p className="text-sm font-semibold text-foreground">保存前追加一次去 AI 味风格润色</p>
-                  <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
-                    默认关闭。开启后会在正文初稿完成后再做一轮风格整理，速度更慢但文面更细。
-                  </p>
-                </div>
-              </label>
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="novel_style" className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">文风描述 (简要)</Label>
-              <Input
-                id="novel_style"
-                value={novelSettingsDraft.style}
-                onChange={(e) => setNovelSettingsDraft({ ...novelSettingsDraft, style: e.target.value })}
-                className="field-shell text-foreground font-bold"
-                placeholder="例如：硬核推理、轻快幽默..."
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">简单描述文风关键词，会注入所有生成环节。</p>
-            </div>
-            <div className="space-y-2">
-              <Label className="text-sm font-semibold text-foreground/90 dark:text-foreground/70">写作风格 (深度定制)</Label>
-              <WritingStyleSelect
-                value={novelSettingsDraft.writing_style_id}
-                onChange={(id) => setNovelSettingsDraft({ ...novelSettingsDraft, writing_style_id: id })}
-              />
-              <p className="text-[11px] text-foreground/60 dark:text-muted-foreground font-medium italic">
-                切换深度定制的文风，系统将按新文风进行后续章节创作。
-              </p>
-            </div>
-          </div>
-          <DialogFooter>
-            <Button variant="outline" className="font-semibold" onClick={() => setNovelSettingsOpen(false)} disabled={novelSettingsBusy}>
-              取消
-            </Button>
-            <Button className="font-bold" onClick={handleSaveNovelSettings} disabled={novelSettingsBusy}>
-              {novelSettingsBusy ? "保存中..." : "保存设置"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={Boolean(memoryEditor)} onOpenChange={(open) => !open && closeMemoryEditor()}>
-        <DialogContent className="max-h-[85vh] max-w-xl overflow-y-auto text-foreground">
-          <DialogHeader>
-            <DialogTitle>{memoryEditor?.title || "结构化记忆编辑"}</DialogTitle>
-            <DialogDescription>{memoryEditor?.subtitle || "编辑结构化记忆。"}</DialogDescription>
-          </DialogHeader>
-          {memoryEditor ? (
-            memoryEditor.mode === "delete" ? (
-              <div className="rounded-[1.2rem] border border-amber-500/20 bg-amber-500/5 p-4 text-sm leading-6 text-foreground/75">
-                {memoryEditor.kind === "character"
-                  ? `将人物「${memoryEditor.name}」标记为退场。`
-                  : memoryEditor.kind === "relation"
-                    ? `将关系「${memoryEditor.from} → ${memoryEditor.to}」标记为失效。`
-                    : memoryEditor.kind === "skill"
-                      ? `删除技能「${memoryEditor.name}」。`
-                      : `删除物品「${memoryEditor.label}」。`}
-              </div>
-            ) : (
-              <div className="space-y-4 py-2">
-                {memoryEditor.kind === "character" ? (
-                  <>
-                    <div className="space-y-2">
-                      <Label>人物主名</Label>
-                      <Input value={memoryEditor.name} onChange={(e) => setMemoryEditor({ ...memoryEditor, name: e.target.value })} />
-                    </div>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-2">
-                        <Label>人物角色</Label>
-                        <Input value={memoryEditor.role} onChange={(e) => setMemoryEditor({ ...memoryEditor, role: e.target.value })} />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>人物状态</Label>
-                        <Input value={memoryEditor.status} onChange={(e) => setMemoryEditor({ ...memoryEditor, status: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="space-y-2">
-                      <Label>人物特征</Label>
-                      <Textarea value={memoryEditor.traits} onChange={(e) => setMemoryEditor({ ...memoryEditor, traits: e.target.value })} placeholder="可用逗号或换行分隔" />
-                    </div>
-                  </>
-                ) : null}
-                {memoryEditor.kind === "relation" ? (
-                  <>
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <div className="space-y-2">
-                        <Label>起点人物</Label>
-                        <Input value={memoryEditor.from} onChange={(e) => setMemoryEditor({ ...memoryEditor, from: e.target.value })} />
-                      </div>
-                      <div className="space-y-2">
-                        <Label>终点人物</Label>
-                        <Input value={memoryEditor.to} onChange={(e) => setMemoryEditor({ ...memoryEditor, to: e.target.value })} />
-                      </div>
-                    </div>
-                    <div className="space-y-2">
-                      <Label>关系描述</Label>
-                      <Textarea value={memoryEditor.relation} onChange={(e) => setMemoryEditor({ ...memoryEditor, relation: e.target.value })} />
-                    </div>
-                  </>
-                ) : null}
-                {memoryEditor.kind === "skill" ? (
-                  <>
-                    <div className="space-y-2">
-                      <Label>技能名称</Label>
-                      <Input value={memoryEditor.name} onChange={(e) => setMemoryEditor({ ...memoryEditor, name: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>技能描述</Label>
-                      <Textarea value={memoryEditor.description} onChange={(e) => setMemoryEditor({ ...memoryEditor, description: e.target.value })} />
-                    </div>
-                  </>
-                ) : null}
-                {memoryEditor.kind === "item" ? (
-                  <>
-                    <div className="space-y-2">
-                      <Label>物品名称</Label>
-                      <Input value={memoryEditor.label} onChange={(e) => setMemoryEditor({ ...memoryEditor, label: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>持有人</Label>
-                      <Input value={memoryEditor.owner} onChange={(e) => setMemoryEditor({ ...memoryEditor, owner: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>物品描述</Label>
-                      <Textarea value={memoryEditor.description} onChange={(e) => setMemoryEditor({ ...memoryEditor, description: e.target.value })} />
-                    </div>
-                  </>
-                ) : null}
-                {memoryEditor.kind !== "relation" ? (
-                  <div className="grid gap-4 sm:grid-cols-2">
-                    <div className="space-y-2">
-                      <Label>影响力</Label>
-                      <Input type="number" min={0} max={100} value={memoryEditor.influence} onChange={(e) => setMemoryEditor({ ...memoryEditor, influence: e.target.value })} />
-                    </div>
-                    <div className="space-y-2">
-                      <Label>当前状态</Label>
-                      <div className="flex gap-2">
-                        <Button type="button" size="sm" variant={memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: true })}>活跃</Button>
-                        <Button type="button" size="sm" variant={!memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: false })}>非活跃</Button>
-                      </div>
-                    </div>
-                  </div>
-                ) : (
-                  <div className="space-y-2">
-                    <Label>关系状态</Label>
-                    <div className="flex gap-2">
-                      <Button type="button" size="sm" variant={memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: true })}>生效</Button>
-                      <Button type="button" size="sm" variant={!memoryEditor.isActive ? "default" : "outline"} onClick={() => setMemoryEditor({ ...memoryEditor, isActive: false })}>失效</Button>
-                    </div>
-                  </div>
-                )}
-              </div>
-            )
-          ) : null}
-          <DialogFooter>
-            <Button type="button" variant="outline" onClick={closeMemoryEditor} disabled={memoryEditorBusy}>
-              取消
-            </Button>
-            <Button type="button" onClick={() => void submitMemoryEditor()} disabled={memoryEditorBusy}>
-              {memoryEditorBusy ? "处理中..." : memoryEditor?.confirmLabel || "确认"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={normDetailOpen} onOpenChange={setNormDetailOpen}>
-        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto text-foreground">
-          <DialogHeader>
-            <DialogTitle className="text-left text-base leading-snug">
-              {normDetailTitle}
-            </DialogTitle>
-            <DialogDescription className="sr-only">
-              结构化记忆条目完整内容
-            </DialogDescription>
-          </DialogHeader>
-          <pre className="soft-scroll max-h-[min(60vh,520px)] overflow-auto whitespace-pre-wrap break-words rounded-[1.2rem] border border-border/70 bg-muted/30 p-3 text-[11px] leading-relaxed text-muted-foreground">
-            {normDetailBody}
-          </pre>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setNormDetailOpen(false)}
-            >
-              关闭
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={historyDialogOpen} onOpenChange={setHistoryDialogOpen}>
-        <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto text-foreground">
-          <DialogHeader>
-            <DialogTitle className="text-left text-base leading-snug">
-              记忆版本历史
-            </DialogTitle>
-            <DialogDescription>
-              选择一个历史版本进行回退。回退操作会产生一个包含该版本内容的新快照，并覆盖当前结构化记忆表。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-3 py-2">
-            {memoryHistory.length === 0 ? (
-              <p className="py-8 text-center text-sm text-muted-foreground">暂无历史记录</p>
-            ) : (
-              memoryHistory.map((item) => (
-                <div
-                  key={item.version}
-                  className="flex items-center justify-between gap-4 rounded-[1.25rem] border border-border/50 bg-background/40 p-4 transition-all hover:border-primary/30 hover:bg-background/60"
-                >
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex items-center gap-2">
-                      <span className="font-bold text-primary">v{item.version}</span>
-                      <span className="text-[10px] text-muted-foreground">
-                        {item.created_at
-                          ? parseBackendUtcIso(item.created_at).toLocaleString("zh-CN", {
-                              timeZone: "Asia/Shanghai",
-                            })
-                          : "-"}
-                      </span>
-                    </div>
-                    <p className="line-clamp-2 text-xs text-muted-foreground">
-                      {item.summary || "（无摘要）"}
-                    </p>
-                    <div className="flex flex-wrap gap-2 pt-1">
-                      {diffChangedTypes(item.diff_summary).slice(0, 4).map((tag) => (
-                        <span
-                          key={`history-tag-${item.version}-${tag}`}
-                          className="rounded-full border border-primary/15 bg-primary/8 px-2 py-0.5 text-[10px] font-medium text-primary/90"
-                        >
-                          {tag}
-                        </span>
-                      ))}
-                      {item.source_summary?.chapter_nos?.length ? (
-                        <span className="rounded-full border border-border/60 bg-background/70 px-2 py-0.5 text-[10px] text-muted-foreground">
-                          来源章：{item.source_summary.chapter_nos.slice(0, 4).join(" / ")}
-                        </span>
-                      ) : null}
-                    </div>
-                  </div>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="outline"
-                    className="h-8 shrink-0"
-                    onClick={() => void runRollbackMemory(item.version)}
-                  >
-                    回退到此版本
-                  </Button>
-                </div>
-              ))
-            )}
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setHistoryDialogOpen(false)}
-            >
-              取消
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={refreshRangeOpen} onOpenChange={setRefreshRangeOpen}>
-        <DialogContent className="max-w-md overflow-hidden flex flex-col text-foreground">
-          <DialogHeader>
-            <DialogTitle>刷新记忆范围选择</DialogTitle>
-            <DialogDescription>
-              请选择用于汇总记忆的已审定章节范围。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-4 py-2">
-            <div className="flex flex-col gap-2">
-              <Label className="text-sm font-semibold">选择模式</Label>
-              <div className="grid grid-cols-3 gap-2">
-                <Button
-                  variant={refreshRangeMode === "recent" ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setRefreshRangeMode("recent")}
-                  className="text-xs"
-                >
-                  最近 15 章
-                </Button>
-                <Button
-                  variant={refreshRangeMode === "full" ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setRefreshRangeMode("full")}
-                  className="text-xs"
-                >
-                  全量刷新
-                </Button>
-                <Button
-                  variant={refreshRangeMode === "custom" ? "default" : "outline"}
-                  size="sm"
-                  onClick={() => setRefreshRangeMode("custom")}
-                  className="text-xs"
-                >
-                  自定义范围
-                </Button>
-              </div>
-            </div>
-
-            {refreshRangeMode === "custom" && (
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label className="text-xs">起始章号</Label>
-                  <Input
-                    type="number"
-                    value={refreshFromNo}
-                    onChange={(e) => setRefreshFromNo(Number(e.target.value))}
-                    className="h-9"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label className="text-xs">结束章号</Label>
-                  <Input
-                    type="number"
-                    value={refreshToNo}
-                    onChange={(e) => setRefreshToNo(Number(e.target.value))}
-                    className="h-9"
-                  />
-                </div>
-              </div>
-            )}
-
-            <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-3 space-y-2">
-              <div className="flex items-center gap-2 text-amber-700 dark:text-amber-400">
-                <div className="h-1.5 w-1.5 rounded-full bg-amber-500" />
-                <p className="text-xs font-bold text-amber-600 dark:text-amber-400">温馨提示</p>
-              </div>
-              <ul className="list-disc list-inside text-[11px] text-amber-700/80 dark:text-amber-400/80 space-y-1">
-                <li>汇总的章节越多，AI 处理速度越慢。</li>
-                <li>刷新操作会消耗较多积分（按汇总字数计费）。</li>
-                <li>建议仅在产生重大剧情变更或由于逻辑偏移需要“纠偏”时进行全量刷新。</li>
-              </ul>
-            </div>
-          </div>
-          <DialogFooter className="mt-4">
-            <Button variant="outline" onClick={() => setRefreshRangeOpen(false)}>
-              取消
-            </Button>
-            <Button
-              onClick={() => {
-                const opts: {
-                  is_full?: boolean;
-                  from_chapter_no?: number;
-                  to_chapter_no?: number;
-                } = {};
-                if (refreshRangeMode === "full") opts.is_full = true;
-                else if (refreshRangeMode === "custom") {
-                  opts.from_chapter_no = refreshFromNo;
-                  opts.to_chapter_no = refreshToNo;
-                }
-                void executeRefreshMemory(opts);
-              }}
-              disabled={busy}
-            >
-              开始刷新
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={planEditorOpen} onOpenChange={setPlanEditorOpen}>
-        <DialogContent className="max-h-[90vh] max-w-3xl overflow-hidden text-foreground">
-          <DialogHeader>
-            <DialogTitle>
-              编辑执行卡
-              {planEditorChapterNo != null ? ` · 第${planEditorChapterNo}章` : ""}
-            </DialogTitle>
-            <DialogDescription>
-              这里修改的是当前章计划的执行卡。保存后会覆盖本章计划内容，但仍兼容旧版计划结构和正文生成链路。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="soft-scroll max-h-[62vh] space-y-4 overflow-y-auto pr-1">
-            <div className="space-y-2">
-              <Label>章节标题</Label>
-              <Input
-                value={planEditorTitle}
-                onChange={(e) => setPlanEditorTitle(e.target.value)}
-                placeholder="例如：暗潮初显"
-              />
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label>本章目标</Label>
-                <textarea
-                  value={planEditorGoal}
-                  onChange={(e) => setPlanEditorGoal(e.target.value)}
-                  className="field-shell-textarea min-h-[110px] text-sm"
-                  placeholder="这一章必须完成的核心目标"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>核心冲突</Label>
-                <textarea
-                  value={planEditorConflict}
-                  onChange={(e) => setPlanEditorConflict(e.target.value)}
-                  className="field-shell-textarea min-h-[110px] text-sm"
-                  placeholder="这一章最主要的对抗、阻碍或张力"
-                />
-              </div>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label>关键转折</Label>
-                <textarea
-                  value={planEditorTurn}
-                  onChange={(e) => setPlanEditorTurn(e.target.value)}
-                  className="field-shell-textarea min-h-[104px] text-sm"
-                  placeholder="本章中段或后段发生的关键变化"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>章末钩子</Label>
-                <textarea
-                  value={planEditorEndingHook}
-                  onChange={(e) => setPlanEditorEndingHook(e.target.value)}
-                  className="field-shell-textarea min-h-[104px] text-sm"
-                  placeholder="下一章必须自然承接的钩子"
-                />
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label>剧情梗概</Label>
-              <textarea
-                value={planEditorPlotSummary}
-                onChange={(e) => setPlanEditorPlotSummary(e.target.value)}
-                className="field-shell-textarea min-h-[140px] text-sm"
-                placeholder="用 5-12 句写清楚本章实际会发生什么"
-              />
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label>阶段位置</Label>
-                <textarea
-                  value={planEditorStagePosition}
-                  onChange={(e) => setPlanEditorStagePosition(e.target.value)}
-                  className="field-shell-textarea min-h-[96px] text-sm"
-                  placeholder="例如：第一弧 35%，本卷仍在蓄势"
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>节奏说明</Label>
-                <textarea
-                  value={planEditorPacing}
-                  onChange={(e) => setPlanEditorPacing(e.target.value)}
-                  className="field-shell-textarea min-h-[96px] text-sm"
-                  placeholder="说明为什么这一章不应越级推进"
-                />
-              </div>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label>必须发生</Label>
-                <textarea
-                  value={planEditorMustHappen}
-                  onChange={(e) => setPlanEditorMustHappen(e.target.value)}
-                  className="field-shell-textarea min-h-[120px] text-sm"
-                  placeholder={"每行一条\n例如：主角确认账册中的异常签名"}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>必须承接</Label>
-                <textarea
-                  value={planEditorCallbacks}
-                  onChange={(e) => setPlanEditorCallbacks(e.target.value)}
-                  className="field-shell-textarea min-h-[120px] text-sm"
-                  placeholder={"每行一条\n例如：承接上一章雨夜仓库的未解释异响"}
-                />
-              </div>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-2">
-                <Label>允许推进</Label>
-                <textarea
-                  value={planEditorAllowedProgress}
-                  onChange={(e) => setPlanEditorAllowedProgress(e.target.value)}
-                  className="field-shell-textarea min-h-[120px] text-sm"
-                  placeholder={"每行一条\n例如：只允许确认身份可疑，不允许直接揭穿"}
-                />
-              </div>
-              <div className="space-y-2">
-                <Label>绝对禁止</Label>
-                <textarea
-                  value={planEditorMustNot}
-                  onChange={(e) => setPlanEditorMustNot(e.target.value)}
-                  className="field-shell-textarea min-h-[120px] text-sm"
-                  placeholder={"每行一条\n例如：不能让配角知道主角真实能力"}
-                />
-              </div>
-            </div>
-            <div className="space-y-2">
-              <Label>延后解锁</Label>
-              <textarea
-                value={planEditorReserved}
-                onChange={(e) => setPlanEditorReserved(e.target.value)}
-                className="field-shell-textarea min-h-[120px] text-sm"
-                placeholder={"每行一条，格式：条目 | 最早章节 | 原因\n例如：玉佩真名 | 18 | 需要等祠堂线揭开"}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>风格护栏</Label>
-              <textarea
-                value={planEditorStyleGuardrails}
-                onChange={(e) => setPlanEditorStyleGuardrails(e.target.value)}
-                className="field-shell-textarea min-h-[120px] text-sm"
-                placeholder={"每行一条\n例如：减少解释腔，改为动作和对话落地"}
-              />
-            </div>
-          </div>
-          <DialogFooter>
-            <Button
-              type="button"
-              variant="outline"
-              onClick={() => setPlanEditorOpen(false)}
-              disabled={planEditorSaving}
-            >
-              取消
-            </Button>
-            <Button
-              type="button"
-              onClick={() => void savePlanEditor()}
-              disabled={planEditorSaving || planEditorChapterNo == null}
-            >
-              {planEditorSaving ? "保存中..." : "保存执行卡"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={exportOpen} onOpenChange={setExportOpen}>
-        <DialogContent className="max-h-[90vh] max-w-4xl overflow-hidden flex flex-col text-foreground">
-          <DialogHeader>
-            <DialogTitle>全文本导出</DialogTitle>
-            <DialogDescription>
-              选择章节范围，一键拼接所有已审定或草稿正文，方便发布或备份。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label>起始章号</Label>
-              <Input
-                type="number"
-                value={exportStartNo}
-                onChange={(e) => setExportStartNo(Number(e.target.value))}
-              />
-            </div>
-            <div className="space-y-2">
-              <Label>截止章号</Label>
-              <Input
-                type="number"
-                value={exportEndNo}
-                onChange={(e) => setExportEndNo(Number(e.target.value))}
-              />
-            </div>
-          </div>
-          <div className="flex-1 overflow-hidden flex flex-col mt-4 gap-3">
-            <div className="flex items-center justify-between">
-              <Label>导出内容预览</Label>
-              {exportContent && (
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={() => {
-                    void navigator.clipboard.writeText(exportContent);
-                    alert("已复制到剪贴板");
-                  }}
-                >
-                  复制全文本
-                </Button>
-              )}
-            </div>
-            <textarea
-              value={exportContent}
-              readOnly
-              placeholder="点击“开始导出”后在此显示内容..."
-              className="field-shell-textarea flex-1 font-sans text-sm leading-relaxed"
-            />
-          </div>
-          <DialogFooter className="mt-4">
-            <Button variant="outline" onClick={() => setExportOpen(false)}>
-              关闭
-            </Button>
-            <Button onClick={handleExport} disabled={exportBusy}>
-              {exportBusy ? "正在导出..." : "开始导出"}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
-
-      <Dialog open={chapterChatOpen} onOpenChange={setChapterChatOpen}>
-        <DialogContent className="max-h-[88vh] max-w-3xl overflow-hidden text-foreground">
-          <DialogHeader>
-            <DialogTitle>章节助手对话</DialogTitle>
-            <DialogDescription>
-              自动基于已审定章节、框架与记忆回答问题，可用于续写决策和一致性检查。
-            </DialogDescription>
-          </DialogHeader>
-          <div className="soft-scroll flex max-h-[52vh] flex-col gap-3 overflow-y-auto rounded-[1.4rem] border border-border/70 bg-muted/20 p-3 text-sm">
-            {chapterChatTurns.length === 0 ? (
-              <p className="text-muted-foreground">
-                例如：\"第 7 章应该先回收哪个伏笔？和主线冲突怎么排优先级？\"
-              </p>
-            ) : null}
-            {chapterChatTurns.map((t, i) => (
-              <div
-                key={`${i}-${t.role}`}
-                className={
-                  t.role === "user"
-                    ? "ml-8 rounded-[1.25rem] border border-primary/20 bg-primary/10 px-3.5 py-3 shadow-sm"
-                    : "mr-4 rounded-[1.25rem] border border-border/60 bg-background/80 px-3.5 py-3 shadow-sm"
-                }
-              >
-                <span className="text-xs font-medium text-muted-foreground">
-                  {t.role === "user" ? "你" : "章节助手"}
-                </span>
-                <pre className="mt-1 whitespace-pre-wrap font-sans text-xs">{t.content}</pre>
-              </div>
-            ))}
-          </div>
-          <div className="space-y-2">
-            <p className="text-xs text-muted-foreground">快捷提问</p>
-            <div className="flex flex-wrap gap-2">
-              {chapterQuickPrompts.map((p) => (
-                <Button
-                  key={p.label}
-                  type="button"
-                  size="sm"
-                  variant="outline"
-                  disabled={chapterChatBusy}
-                  onClick={() => confirmSendChapterQuickPrompt(p.prompt)}
-                  className="text-xs"
-                  title={p.prompt}
-                >
-                  {p.label}
-                </Button>
-              ))}
-            </div>
-            <div className="soft-scroll max-h-20 overflow-auto rounded-2xl border border-border/60 bg-muted/30 px-3 py-2 text-[11px] text-muted-foreground">
-              {chapterQuickPrompts.map((p) => (
-                <p key={`desc-${p.label}`} className="truncate">
-                  <span className="font-medium">{p.label}：</span>
-                  {p.prompt}
-                </p>
-              ))}
-            </div>
-          </div>
-          {chapterChatErr ? <p className="text-xs text-destructive">{chapterChatErr}</p> : null}
-          {chapterChatThinking ? (
-            <div className="rounded-[1.25rem] border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-              <div className="flex items-center justify-between gap-2">
-                <p className="font-medium text-amber-700 dark:text-amber-300">
-                  Think
-                </p>
-                <Button
-                  type="button"
-                  size="sm"
-                  variant="ghost"
-                  className="h-7 px-2 text-[11px]"
-                  onClick={() => setChapterThinkExpanded((v) => !v)}
-                >
-                  {chapterThinkExpanded ? "折叠" : "展开"}
-                </Button>
-              </div>
-              <pre
-                className={`mt-1 overflow-auto whitespace-pre-wrap font-sans text-[11px] text-amber-800 dark:text-amber-200 ${
-                  chapterThinkExpanded ? "max-h-72" : "max-h-24"
-                }`}
-              >
-                {chapterChatThinking}
-              </pre>
-            </div>
-          ) : null}
-          <textarea
-            value={chapterChatInput}
-            onChange={(e) => setChapterChatInput(e.target.value)}
-            placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"
-            className="field-shell-textarea min-h-[104px]"
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
-                e.preventDefault();
-                confirmSendChapterChat();
-              }
-            }}
-            disabled={chapterChatBusy}
+      <NovelSettingsDialog
+        open={novelSettingsOpen}
+        onOpenChange={setNovelSettingsOpen}
+        draft={novelSettingsDraft}
+        onDraftChange={(partial) => setNovelSettingsDraft({ ...novelSettingsDraft, ...partial })}
+        busy={novelSettingsBusy}
+        onSave={handleSaveNovelSettings}
+        writingStyleSlot={
+          <WritingStyleSelect
+            value={novelSettingsDraft.writing_style_id}
+            onChange={(id) => setNovelSettingsDraft({ ...novelSettingsDraft, writing_style_id: id })}
           />
-          <div className="flex flex-wrap gap-2">
-            <Button
-              type="button"
-              size="sm"
-              disabled={chapterChatBusy || !chapterChatInput.trim()}
-              onClick={() => confirmSendChapterChat()}
-            >
-              {chapterChatBusy ? "思考中…" : "发送"}
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="secondary"
-              disabled={!chapterChatBusy || !chapterChatAbort}
-              onClick={() => chapterChatAbort?.abort()}
-            >
-              取消生成
-            </Button>
-            <Button
-              type="button"
-              size="sm"
-              variant="outline"
-              disabled={chapterChatBusy || chapterChatTurns.length === 0}
-              onClick={() => {
-                setChapterChatTurns([]);
-                setChapterChatErr(null);
-                setChapterChatThinking("");
-                setChapterThinkExpanded(false);
-              }}
-            >
-              清空会话
-            </Button>
-          </div>
-        </DialogContent>
-      </Dialog>
+        }
+      />
+
+      <MemoryEditorDialog
+        editor={memoryEditor}
+        onChange={(partial) => memoryEditor && setMemoryEditor({ ...memoryEditor, ...partial })}
+        busy={memoryEditorBusy}
+        onClose={closeMemoryEditor}
+        onSubmit={() => void submitMemoryEditor()}
+      />
+
+      <NormDetailDialog
+        open={normDetailOpen}
+        onOpenChange={setNormDetailOpen}
+        title={normDetailTitle}
+        body={normDetailBody}
+      />
+
+      <HistoryDialog
+        open={historyDialogOpen}
+        onOpenChange={setHistoryDialogOpen}
+        entries={memoryHistory}
+        onRollback={(version) => void runRollbackMemory(version)}
+      />
+
+      <RefreshRangeDialog
+        open={refreshRangeOpen}
+        onOpenChange={setRefreshRangeOpen}
+        mode={refreshRangeMode}
+        onModeChange={setRefreshRangeMode}
+        fromNo={refreshFromNo}
+        toNo={refreshToNo}
+        onFromNoChange={setRefreshFromNo}
+        onToNoChange={setRefreshToNo}
+        busy={busy}
+        onConfirm={(opts) => void executeRefreshMemory(opts)}
+      />
+
+      <PlanEditorDialog
+        open={planEditorOpen}
+        onOpenChange={setPlanEditorOpen}
+        draft={{
+          chapterNo: planEditorChapterNo,
+          title: planEditorTitle,
+          goal: planEditorGoal,
+          conflict: planEditorConflict,
+          turn: planEditorTurn,
+          plotSummary: planEditorPlotSummary,
+          stagePosition: planEditorStagePosition,
+          pacing: planEditorPacing,
+          mustHappen: planEditorMustHappen,
+          callbacks: planEditorCallbacks,
+          allowedProgress: planEditorAllowedProgress,
+          mustNot: planEditorMustNot,
+          reserved: planEditorReserved,
+          endingHook: planEditorEndingHook,
+          styleGuardrails: planEditorStyleGuardrails,
+        }}
+        onChange={(p) => {
+          if (p.title !== undefined) setPlanEditorTitle(p.title);
+          if (p.goal !== undefined) setPlanEditorGoal(p.goal);
+          if (p.conflict !== undefined) setPlanEditorConflict(p.conflict);
+          if (p.turn !== undefined) setPlanEditorTurn(p.turn);
+          if (p.plotSummary !== undefined) setPlanEditorPlotSummary(p.plotSummary);
+          if (p.stagePosition !== undefined) setPlanEditorStagePosition(p.stagePosition);
+          if (p.pacing !== undefined) setPlanEditorPacing(p.pacing);
+          if (p.mustHappen !== undefined) setPlanEditorMustHappen(p.mustHappen);
+          if (p.callbacks !== undefined) setPlanEditorCallbacks(p.callbacks);
+          if (p.allowedProgress !== undefined) setPlanEditorAllowedProgress(p.allowedProgress);
+          if (p.mustNot !== undefined) setPlanEditorMustNot(p.mustNot);
+          if (p.reserved !== undefined) setPlanEditorReserved(p.reserved);
+          if (p.endingHook !== undefined) setPlanEditorEndingHook(p.endingHook);
+          if (p.styleGuardrails !== undefined) setPlanEditorStyleGuardrails(p.styleGuardrails);
+        }}
+        saving={planEditorSaving}
+        onSave={() => void savePlanEditor()}
+      />
+
+      <ExportDialog
+        open={exportOpen}
+        onOpenChange={setExportOpen}
+        startNo={exportStartNo}
+        endNo={exportEndNo}
+        content={exportContent}
+        busy={exportBusy}
+        onStartNoChange={setExportStartNo}
+        onEndNoChange={setExportEndNo}
+        onExport={handleExport}
+      />
+
+      <ChapterChatDialog
+        open={chapterChatOpen}
+        onOpenChange={setChapterChatOpen}
+        turns={chapterChatTurns}
+        input={chapterChatInput}
+        onInputChange={setChapterChatInput}
+        busy={chapterChatBusy}
+        err={chapterChatErr}
+        thinking={chapterChatThinking}
+        thinkExpanded={chapterThinkExpanded}
+        onThinkExpandedChange={setChapterThinkExpanded}
+        onSend={confirmSendChapterChat}
+        onAbort={() => chapterChatAbort?.abort()}
+        onClear={() => {
+          setChapterChatTurns([]);
+          setChapterChatErr(null);
+          setChapterChatThinking("");
+          setChapterThinkExpanded(false);
+        }}
+        canAbort={Boolean(chapterChatAbort)}
+        quickPrompts={chapterQuickPrompts}
+        onQuickPrompt={confirmSendChapterQuickPrompt}
+      />
+      <FocusMode
+        open={focusModeOpen}
+        onExit={() => setFocusModeOpen(false)}
+        chapters={chapters}
+        selectedChapterId={selectedChapterId}
+        onSelectChapter={setSelectedChapterId}
+        editTitle={editTitle}
+        editContent={editContent}
+        onEditTitleChange={setEditTitle}
+        onEditContentChange={setEditContent}
+        onSave={() => void runSaveSelectedChapter()}
+        busy={busy}
+        novelId={id}
+        volumes={volumes}
+        onChapterCreated={(chapterId) => {
+          setSelectedChapterId(chapterId);
+        }}
+        onReloadChapters={async () => {
+          if (!id) return;
+          const c = await listChapters(id);
+          setChapters(c);
+        }}
+      />
     </div>
   );
 }

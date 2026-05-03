@@ -142,8 +142,14 @@ class Settings(BaseSettings):
     novel_volume_plan_batch_size: int = 10
     # 单批 LLM 超时（秒）
     novel_volume_plan_batch_timeout: float = 480.0
-    # AI 一键建书：头脑风暴（书名/简介/背景 JSON）单次请求超时（秒），长输出易超过 3 分钟
-    novel_ai_create_brainstorm_timeout: float = 720.0
+    # AI 一键建书：头脑风暴（书名/简介/背景 JSON）单次请求超时（秒）
+    novel_ai_create_brainstorm_timeout: float = 900.0
+    # AI 一键建书头脑风暴：瞬时网络波动时的额外重试次数（总尝试次数=1+该值）
+    novel_ai_create_brainstorm_max_retries: int = 0
+    # AI 一键建书任务软超时（秒）：触发后会走失败收敛并提示用户
+    novel_ai_create_task_soft_time_limit: int = 1500
+    # AI 一键建书任务硬超时（秒）：超过后强制终止，避免长时间占用 worker
+    novel_ai_create_task_time_limit: int = 1560
     # 记忆刷新分批：每批摘要最大字符数（0表示不分批）
     novel_memory_refresh_batch_chars: int = 15000
     # 记忆刷新单批超时（秒）
@@ -172,6 +178,10 @@ class Settings(BaseSettings):
     novel_open_plot_stale_grace_chapters: int = 3
     # 已收束剧情线日志保留：超过「当前最新章号 − 收束章号」则丢弃，避免列表无限增长
     novel_resolved_open_plots_log_retention_chapters: int = 20
+    # 记忆校准：每隔 N 章对热层记忆做一次全量校准，修正 LLM 累积误差（0 表示关闭）
+    novel_memory_calibration_interval: int = 10
+    # 冷层 RAG 自动启用阈值：已审定章节数 ≥ 该值时自动开启冷层召回（0 表示始终关闭）
+    novel_cold_recall_auto_threshold: int = 30
 
 
 settings = Settings()

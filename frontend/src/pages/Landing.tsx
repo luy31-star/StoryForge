@@ -61,7 +61,7 @@ function LandingSignalBoard() {
           ))}
         </svg>
 
-        <div className="absolute left-[1%] top-4 hidden w-[36%] max-w-[190px] rounded-[1.2rem] border border-primary/18 bg-background/90 p-3 shadow-lg backdrop-blur-xl sm:block">
+        <div className="absolute left-[1%] top-4 hidden w-[36%] max-w-[190px] rounded-lg border border-primary/18 bg-background/90 p-3 shadow-lg sm:block">
           <div className="flex items-center justify-between gap-2">
             <span className="rounded-full border border-primary/25 bg-primary/10 px-2 py-0.5 text-[9px] font-bold text-primary">
               热记忆层
@@ -81,7 +81,7 @@ function LandingSignalBoard() {
           </div>
         </div>
 
-        <div className="absolute right-[1%] top-10 hidden w-[32%] max-w-[170px] rounded-[1.2rem] border border-accent/20 bg-background/90 p-3 shadow-lg backdrop-blur-xl sm:block">
+        <div className="absolute right-[1%] top-10 hidden w-[32%] max-w-[170px] rounded-lg border border-accent/20 bg-background/90 p-3 shadow-lg sm:block">
           <div className="flex items-center justify-between gap-2">
             <span className="rounded-full border border-accent/30 bg-accent/10 px-2 py-0.5 text-[9px] font-bold text-accent">
               冷层归档
@@ -101,7 +101,7 @@ function LandingSignalBoard() {
           </div>
         </div>
 
-        <div className="absolute inset-x-4 bottom-4 rounded-[1.5rem] border border-slate-800/70 bg-slate-900/95 p-4 text-slate-50 shadow-2xl sm:bottom-auto sm:left-[12%] sm:right-[12%] sm:top-[44%] sm:inset-x-auto">
+        <div className="absolute inset-x-4 bottom-4 rounded-lg border border-slate-800/70 bg-slate-900/95 p-4 text-slate-50 shadow-2xl sm:bottom-auto sm:left-[12%] sm:right-[12%] sm:top-[44%] sm:inset-x-auto">
           <div className="flex items-center justify-between gap-3">
             <div>
               <p className="text-[9px] font-bold uppercase tracking-[0.2em] text-slate-400">
@@ -163,7 +163,7 @@ export function Landing() {
       </div>
 
       <div className="novel-container h-full pt-0">
-        <section className="grid h-full gap-8 rounded-[2.2rem] border border-border/40 bg-background/40 p-5 sm:p-8 lg:grid-cols-[0.98fr_1.02fr] lg:items-center">
+        <section className="grid h-full gap-8 rounded-xl border border-border/40 bg-background/40 p-5 sm:p-8 lg:grid-cols-[0.98fr_1.02fr] lg:items-center">
           <div className="flex flex-col space-y-10 py-2 sm:py-6">
             <div className="space-y-6">
               <div className="flex flex-wrap items-center gap-2">
@@ -171,7 +171,7 @@ export function Landing() {
                   <span className="mr-1.5 inline-block h-1.5 w-1.5 rounded-full bg-primary" />
                   STORYFORGE
                 </span>
-                <span className="glass-chip border-border/60 bg-muted/30 text-muted-foreground uppercase">
+                <span className="glass-chip border-border bg-muted text-muted-foreground uppercase">
                   AI Serialized Writing OS
                 </span>
               </div>
@@ -188,7 +188,7 @@ export function Landing() {
                 </h1>
               </div>
 
-              <p className="max-w-[480px] text-sm leading-relaxed text-foreground/72 sm:text-base">
+              <p className="max-w-[480px] text-sm leading-relaxed text-foreground/70 sm:text-base">
                 面向连载创作的 AI 小说工作台，把热/冷双层记忆、卷计划执行卡和章节审定闭环压进同一个界面。重点不是更花，而是更稳、更清楚。
               </p>
 
@@ -217,7 +217,7 @@ export function Landing() {
             </div>
           </div>
 
-          <div className="relative overflow-hidden rounded-[1.8rem] border border-border/50 bg-background/40 shadow-inner">
+          <div className="relative overflow-hidden rounded-lg border border-border/50 bg-background/40 shadow-inner">
             <LandingSignalBoard />
           </div>
         </section>

@@ -251,7 +251,7 @@ export function Recharge() {
               </div>
             </div>
             <div className="grid gap-3 md:min-w-[290px]">
-              <div className="rounded-[1.4rem] border border-white/20 bg-white/70 px-5 py-4 shadow-[0_16px_40px_rgba(15,23,42,0.08)] backdrop-blur-xl dark:bg-white/[0.06]">
+              <div className="rounded-lg border border-white/20 bg-white/70 px-5 py-4 shadow-[0_16px_40px_rgba(15,23,42,0.08)] dark:bg-white/[0.06]">
                 <div className="text-xs uppercase tracking-[0.22em] text-muted-foreground">当前余额</div>
                 <div className="mt-2 flex items-end gap-2">
                   <span className="text-4xl font-semibold tabular-nums text-foreground">
@@ -269,7 +269,7 @@ export function Recharge() {
 
         <div className="grid gap-6 xl:grid-cols-[1.45fr_0.9fr]">
           <Card className="overflow-hidden">
-            <CardHeader className="border-b border-border/60">
+            <CardHeader className="border-b border-border">
               <CardTitle>选择充值方案</CardTitle>
               <CardDescription>
                 选择套餐或输入自定义积分。
@@ -304,7 +304,7 @@ export function Recharge() {
                 })}
               </div>
 
-              <div className="rounded-[1.5rem] border border-border/70 bg-background/60 p-5 shadow-[inset_0_1px_0_rgba(255,255,255,0.3)]">
+              <div className="rounded-lg border border-border bg-background p-5">
                 <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
                   <div>
                     <div className="text-base font-semibold text-foreground">自定义积分</div>
@@ -330,9 +330,9 @@ export function Recharge() {
                       setMode("custom");
                       setCustomPoints(e.target.value.replace(/[^\d]/g, ""));
                     }}
-                    className="h-12 rounded-2xl border-border/70 bg-background/80 px-4 text-base"
+                    className="h-12 rounded-2xl border-border bg-background px-4 text-base"
                   />
-                  <div className="flex items-center rounded-2xl border border-border/70 bg-secondary/40 px-4 text-sm text-muted-foreground">
+                  <div className="flex items-center rounded-2xl border border-border bg-secondary/40 px-4 text-sm text-muted-foreground">
                     {customAmountPreview ? `应付 ${formatPrice(customAmountPreview)}` : "输入后自动换算"}
                   </div>
                 </div>
@@ -372,7 +372,7 @@ export function Recharge() {
                 <CardDescription>确认金额后发起支付。</CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
-                <div className="rounded-[1.4rem] border border-border/70 bg-background/55 p-4">
+                <div className="rounded-lg border border-border bg-background p-4">
                   <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">充值方案</div>
                   <div className="mt-2 text-lg font-semibold text-foreground">{summary?.title || "请选择方案"}</div>
                   <div className="mt-4 flex items-center justify-between text-sm">
@@ -405,16 +405,16 @@ export function Recharge() {
                       <Badge variant={statusMeta(order.status).tone}>{statusMeta(order.status).label}</Badge>
                     </div>
                     <div className="grid gap-3 sm:grid-cols-2">
-                      <div className="rounded-2xl border border-border/70 bg-background/55 p-4">
+                      <div className="rounded-2xl border border-border bg-background p-4">
                         <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">订单金额</div>
                         <div className="mt-2 text-2xl font-semibold text-foreground">{formatPrice(order.amount_cny)}</div>
                       </div>
-                      <div className="rounded-2xl border border-border/70 bg-background/55 p-4">
+                      <div className="rounded-2xl border border-border bg-background p-4">
                         <div className="text-xs uppercase tracking-[0.18em] text-muted-foreground">订单积分</div>
                         <div className="mt-2 text-2xl font-semibold text-foreground">{order.points}</div>
                       </div>
                     </div>
-                    <div className="rounded-2xl border border-border/70 bg-secondary/35 px-4 py-3 text-sm text-muted-foreground">
+                    <div className="rounded-2xl border border-border bg-secondary/35 px-4 py-3 text-sm text-muted-foreground">
                       {orderMessage || statusMeta(order.status).description}
                     </div>
                     <div className="flex gap-3">
@@ -446,7 +446,7 @@ export function Recharge() {
                     </div>
                   </>
                 ) : (
-                  <div className="rounded-[1.4rem] border border-dashed border-border/80 bg-background/45 p-5 text-sm leading-6 text-muted-foreground">
+                  <div className="rounded-lg border border-dashed border-border bg-background/45 p-5 text-sm leading-6 text-muted-foreground">
                     暂无待查询订单。
                   </div>
                 )}

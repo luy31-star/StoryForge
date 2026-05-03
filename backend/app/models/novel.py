@@ -28,7 +28,11 @@ class Novel(Base):
     title: Mapped[str] = mapped_column(String(512))
     intro: Mapped[str] = mapped_column(LONGTEXT, default="")
     background: Mapped[str] = mapped_column(LONGTEXT, default="")
-    style: Mapped[str] = mapped_column(String(255), default="")
+    style: Mapped[str] = mapped_column(LONGTEXT, default="")
+    # 选择的大模型
+    framework_model: Mapped[str] = mapped_column(String(128), default="")
+    plan_model: Mapped[str] = mapped_column(String(128), default="")
+    chapter_model: Mapped[str] = mapped_column(String(128), default="")
     writing_style_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("writing_styles.id"), nullable=True
     )

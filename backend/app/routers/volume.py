@@ -5,9 +5,11 @@ import logging
 import re
 import time
 import uuid
+from types import SimpleNamespace
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -27,8 +29,8 @@ from app.services.novel_generation_common import (
     has_pending_volume_plan_batch,
     recover_stale_volume_plan_batches,
 )
-from app.services.novel_repo import latest_memory_json
-from app.services.novel_llm_service import NovelLLMService
+from app.services.novel_repo import effective_framework_json_for_prompt, latest_memory_json
+from app.services.novel_llm_service import NovelLLMService, coerce_novel_outline_base_fields
 from app.services.user_task_service import create_user_task
 from app.tasks.novel_tasks import novel_volume_plan_batch_for_volume
 
@@ -39,6 +41,24 @@ router = APIRouter(prefix="/api/novels/{novel_id}/volumes", tags=["novel-volumes
 
 def _novel_llm(user: User) -> NovelLLMService:
     return NovelLLMService(billing_user_id=user.id)
+
+
+def _snapshot_novel_plan_view(novel: Novel, db: Session | None = None) -> Any:
+    fw_md, _ = coerce_novel_outline_base_fields(novel.framework_markdown, novel.framework_json)
+    fw_j = (
+        effective_framework_json_for_prompt(db, novel)
+        if db is not None
+        else effective_framework_json_for_prompt(None, novel)
+    )
+    return SimpleNamespace(
+        id=str(novel.id),
+        title=str(novel.title or ""),
+        framework_markdown=fw_md,
+        background=str(novel.background or ""),
+        framework_json=fw_j,
+        plan_model=str(getattr(novel, "plan_model", "") or ""),
+        target_chapters=int(getattr(novel, "target_chapters", 0) or 0),
+    )
 
 
 class VolumesGenerateBody(BaseModel):
@@ -60,6 +80,10 @@ class PlanGenerateBody(BaseModel):
     batch_size: int | None = Field(default=None, ge=1, le=50)
     # 手动指定从哪一章开始生成（默认：从当前已存在计划的下一章开始；force_regen 时从卷起始章）
     from_chapter: int | None = Field(default=None, ge=1, le=20000)
+
+
+class PlanGenerateStreamBody(BaseModel):
+    chapter_no: int = Field(ge=1, le=20000)
 
 
 def _extract_total_chapters_from_framework(framework_json: str) -> int | None:
@@ -407,6 +431,63 @@ def generate_volume_chapter_plan(
     }
 
 
+def _sse(event: str, data: dict[str, Any]) -> str:
+    payload = json.dumps(data, ensure_ascii=False)
+    return f"event: {event}\ndata: {payload}\n\n"
+
+@router.post("/{volume_id}/chapter-plan/generate-stream")
+async def generate_chapter_plan_stream_endpoint(
+    novel_id: str,
+    volume_id: str,
+    body: PlanGenerateStreamBody,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> StreamingResponse:
+    n = require_novel_access(db, novel_id, user)
+    v = db.get(NovelVolume, volume_id)
+    if not v or v.novel_id != novel_id:
+        raise HTTPException(404, "卷不存在")
+
+    from app.services.novel_llm_stream_utils import stream_chapter_plan
+    llm = _novel_llm(user)
+    novel_prompt_view = _snapshot_novel_plan_view(n, db)
+    mem = latest_memory_json(db, novel_id)
+
+    # Extract scalar values before entering the async generator (session closes after return)
+    volume_no = v.volume_no
+    volume_title = v.title or "未命名"
+
+    # 简单获取一下 prev_batch_context（如果需要更精确，可以实现获取前置章节信息的逻辑，这里简化处理）
+    prev_batch_context = ""
+
+    async def event_iter():
+        try:
+            async for evt in stream_chapter_plan(
+                llm,
+                novel=novel_prompt_view,
+                volume_no=volume_no,
+                volume_title=volume_title,
+                chapter_no=body.chapter_no,
+                memory_json=mem,
+                prev_batch_context=prev_batch_context,
+                db=db,
+            ):
+                et = evt.get("type", "text")
+                delta = evt.get("delta", "")
+                if not isinstance(delta, str) or not delta:
+                    continue
+                if et == "think":
+                    yield _sse("think", {"delta": delta})
+                else:
+                    yield _sse("text", {"delta": delta})
+            yield _sse("done", {"ok": True})
+        except Exception as e:
+            logger.exception("chapter-plan stream failed")
+            yield _sse("error", {"message": str(e)})
+
+    return StreamingResponse(event_iter(), media_type="text/event-stream")
+
+
 class ChapterPlanRegenerateBody(BaseModel):
     instruction: str = ""
 
@@ -552,7 +633,33 @@ def patch_chapter_plan(
         .first()
     )
     if not row:
-        raise HTTPException(404, "章计划不存在")
+        # Upsert: create new plan if it doesn't exist
+        row = NovelChapterPlan(
+            novel_id=novel_id,
+            volume_id=volume_id,
+            chapter_no=chapter_no,
+            chapter_title=(body.chapter_title or f"第{chapter_no}章")[:512],
+            beats_json=json.dumps(
+                merge_execution_card_patch(
+                    normalize_beats_to_v2({}),
+                    body.beats or {},
+                    editor_id=str(user.id) if getattr(user, "id", None) else None,
+                ),
+                ensure_ascii=False,
+            )
+            if body.beats
+            else json.dumps(normalize_beats_to_v2({}), ensure_ascii=False),
+            status="planned",
+        )
+        db.add(row)
+        db.commit()
+        db.refresh(row)
+        return {
+            "status": "ok",
+            "chapter_no": chapter_no,
+            "chapter_title": row.chapter_title,
+            "beats": _load_plan_beats(row),
+        }
     if row.status == "locked":
         raise HTTPException(400, "该章节计划已锁定，无法编辑执行卡")
 

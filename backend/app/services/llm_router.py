@@ -130,82 +130,31 @@ class LLMRouter:
         web_search: bool = False,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        max_retries: int | None = None,
         billing_user_id: str | None = None,
         billing_db: Session | None = None,
     ) -> str:
-        start = time.perf_counter()
-        billing_session: Session | None = None
-        if billing_user_id:
-            billing_session = SessionLocal()
-
-        try:
-            model = self._require_model()
-            url = _join_url(settings.ai302_base_url, "/chat/completions")
-            logger.info("LLM Request: POST %s | model=%s | user_id=%s", url, model, billing_user_id)
-            body2: dict[str, Any] = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-            }
-            if max_tokens is not None:
-                body2["max_tokens"] = max_tokens
-            if web_search:
-                body2["web-search"] = True
-            if response_format is not None:
-                body2["response_format"] = response_format
-
-            max_retries = 3
-            data2 = None
-            for attempt in range(max_retries + 1):
-                try:
-                    async with httpx.AsyncClient(timeout=timeout) as client:
-                        r = await client.post(url, headers=self._ai302_headers(), json=body2)
-                        r.raise_for_status()
-                        data2 = r.json()
-                        break
-                except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                    is_transient = False
-                    if isinstance(e, httpx.HTTPStatusError):
-                        if e.response.status_code in (429, 500, 502, 503, 504):
-                            is_transient = True
-                    else:
-                        is_transient = True
-
-                    if is_transient and attempt < max_retries:
-                        wait = (2 ** attempt) + random.uniform(0, 1)
-                        logger.warning(
-                            "ai302 chat attempt %d failed (%s), retrying in %.2fs... | model=%s",
-                            attempt + 1, e, wait, model
-                        )
-                        await asyncio.sleep(wait)
-                        continue
-
-                    logger.exception("ai302 chat failed after %d attempts | url=%s model=%s", attempt + 1, url, model)
-                    raise
-
-            if data2 is None:
-                raise RuntimeError("ai302 chat failed to return data")
-
-            if billing_session is not None:
-                from app.services.billing_service import assert_sufficient_balance
-
-                assert_sufficient_balance(billing_session, billing_user_id, min_points=1)
-                _apply_llm_billing(billing_session, billing_user_id, model, data2)
-                billing_session.commit()
-            try:
-                return data2["choices"][0]["message"]["content"]
-            except Exception:
-                return json.dumps(data2, ensure_ascii=False)
-            finally:
-                elapsed = time.perf_counter() - start
-                logger.info("ai302 chat done | elapsed=%.2fs", elapsed)
-        except Exception:
-            if billing_session is not None:
-                billing_session.rollback()
-            raise
-        finally:
-            if billing_session is not None:
-                billing_session.close()
+        # 内部强制使用 stream 流式请求，在内存中拼接，解决 Nginx/API Gateway 长时间等待导致的 504/超时问题
+        chunks: list[str] = []
+        async for chunk in self.chat_text_stream(
+            messages=messages,
+            temperature=temperature,
+            timeout=timeout,
+            web_search=web_search,
+            max_tokens=max_tokens,
+            max_retries=max_retries,
+            response_format=response_format,
+            billing_user_id=billing_user_id,
+            billing_db=billing_db,
+        ):
+            if chunk.get("type") == "text":
+                chunks.append(chunk.get("delta", ""))
+        
+        full_text = "".join(chunks)
+        if not full_text:
+            raise RuntimeError("ai302 chat stream returned empty text")
+        
+        return full_text
 
     async def chat_text_stream(
         self,
@@ -215,6 +164,8 @@ class LLMRouter:
         timeout: float = 600.0,
         web_search: bool = False,
         max_tokens: int | None = None,
+        max_retries: int | None = None,
+        response_format: dict[str, Any] | None = None,
         billing_user_id: str | None = None,
         billing_db: Session | None = None,
     ) -> AsyncIterator[dict[str, str]]:
@@ -246,9 +197,11 @@ class LLMRouter:
                 body["max_tokens"] = max_tokens
             if web_search:
                 body["web-search"] = True
+            if response_format is not None:
+                body["response_format"] = response_format
 
-            max_retries = 3
-            for attempt in range(max_retries + 1):
+            retry_n = max(0, int(3 if max_retries is None else max_retries))
+            for attempt in range(retry_n + 1):
                 try:
                     collected_usage: dict[str, Any] | None = None
                     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -296,7 +249,7 @@ class LLMRouter:
                     else:
                         is_transient = True
 
-                    if is_transient and attempt < max_retries:
+                    if is_transient and attempt < retry_n:
                         wait = (2 ** attempt) + random.uniform(0, 1)
                         logger.warning(
                             "ai302 chat stream attempt %d failed (%s), retrying in %.2fs... | model=%s",
@@ -324,6 +277,7 @@ class LLMRouter:
         web_search: bool = False,
         max_tokens: int | None = None,
         response_format: dict[str, Any] | None = None,
+        max_retries: int | None = None,
         billing_user_id: str | None = None,
         billing_db: Session | None = None,
     ) -> str:
@@ -341,7 +295,7 @@ class LLMRouter:
 
             url = _join_url(settings.ai302_base_url, "/chat/completions")
             logger.info(
-                "LLM Request (Sync): POST %s | model=%s | user_id=%s",
+                "LLM Request (Sync Stream): POST %s | model=%s | user_id=%s",
                 url,
                 model,
                 billing_user_id,
@@ -350,6 +304,8 @@ class LLMRouter:
                 "model": model,
                 "messages": messages,
                 "temperature": temperature,
+                "stream": True,
+                "stream_options": {"include_usage": True},
             }
             if max_tokens is not None:
                 body2["max_tokens"] = max_tokens
@@ -358,15 +314,43 @@ class LLMRouter:
             if response_format is not None:
                 body2["response_format"] = response_format
 
-            max_retries = 3
-            data2 = None
-            for attempt in range(max_retries + 1):
+            retry_n = max(0, int(3 if max_retries is None else max_retries))
+            for attempt in range(retry_n + 1):
                 try:
+                    collected_usage: dict[str, Any] | None = None
+                    chunks = []
                     with httpx.Client(timeout=timeout) as client:
-                        r = client.post(url, headers=self._ai302_headers(), json=body2)
-                        r.raise_for_status()
-                        data2 = r.json()
-                        break
+                        with client.stream("POST", url, headers=self._ai302_headers(), json=body2) as resp:
+                            resp.raise_for_status()
+                            for line in resp.iter_lines():
+                                if not line or not line.startswith("data:"):
+                                    continue
+                                payload = line[5:].strip()
+                                if not payload:
+                                    continue
+                                if payload == "[DONE]":
+                                    break
+                                evt = _safe_json_loads(payload)
+                                if not isinstance(evt, dict):
+                                    continue
+                                if "usage" in evt and evt["usage"]:
+                                    collected_usage = evt["usage"]
+                                delta = (evt.get("choices") or [{}])[0].get("delta") or {}
+                                if not isinstance(delta, dict):
+                                    continue
+                                txt = delta.get("content")
+                                if isinstance(txt, str) and txt:
+                                    chunks.append(txt)
+
+                    if billing_session is not None and collected_usage is not None:
+                        _apply_llm_billing(billing_session, billing_user_id, model, {"usage": collected_usage})
+                        billing_session.commit()
+                    
+                    full_text = "".join(chunks)
+                    if not full_text:
+                        raise RuntimeError("ai302 chat stream returned empty text")
+                    return full_text
+
                 except (httpx.HTTPStatusError, httpx.RequestError) as e:
                     is_transient = False
                     if isinstance(e, httpx.HTTPStatusError):
@@ -375,10 +359,10 @@ class LLMRouter:
                     else:
                         is_transient = True
 
-                    if is_transient and attempt < max_retries:
+                    if is_transient and attempt < retry_n:
                         wait = (2 ** attempt) + random.uniform(0, 1)
                         logger.warning(
-                            "ai302 chat(sync) attempt %d failed (%s), retrying in %.2fs... | model=%s",
+                            "ai302 chat(sync stream) attempt %d failed (%s), retrying in %.2fs... | model=%s",
                             attempt + 1,
                             e,
                             wait,
@@ -388,24 +372,14 @@ class LLMRouter:
                         continue
 
                     logger.exception(
-                        "ai302 chat(sync) failed after %d attempts | url=%s model=%s",
+                        "ai302 chat(sync stream) failed after %d attempts | url=%s model=%s",
                         attempt + 1,
                         url,
                         model,
                     )
                     raise
 
-            if data2 is None:
-                raise RuntimeError("ai302 chat(sync) failed to return data")
-
-            if billing_session is not None:
-                _apply_llm_billing(billing_session, billing_user_id, model, data2)
-                billing_session.commit()
-
-            try:
-                return data2["choices"][0]["message"]["content"]
-            except Exception:
-                return json.dumps(data2, ensure_ascii=False)
+            raise RuntimeError("ai302 chat(sync stream) failed to return data")
         except Exception:
             if billing_session is not None:
                 billing_session.rollback()
